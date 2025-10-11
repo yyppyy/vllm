@@ -1,13 +1,29 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# cd ~/vllm
+incremental=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --incremental) incremental=true; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--incremental]"
+      echo "  --incremental   Only run the final build+install step"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+if "$incremental"; then
+  source .venv/bin/activate
+  cmake --build --preset release --target install
+  exit 0
+fi
+
 git checkout v0.11.0-gcp
 
-# uv venv --python 3.12 --seed
+uv venv --python 3.12 --seed
 source .venv/bin/activate
-
-# module load CUDA/12.8.0
-# module load GCC/13.3.0
 
 VLLM_USE_PRECOMPILED=1 uv pip install -U -e ".[bench]" --torch-backend=auto
 
