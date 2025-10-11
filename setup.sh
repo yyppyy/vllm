@@ -1,8 +1,9 @@
 #!/bin/bash
 
-cd ~/vllm
+# cd ~/vllm
 git checkout v0.11.0-gcp
 
+# uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # module load CUDA/12.8.0
@@ -10,6 +11,6 @@ source .venv/bin/activate
 
 VLLM_USE_PRECOMPILED=1 uv pip install -U -e ".[bench]" --torch-backend=auto
 
-python tools/generate_cmake_presets.py
+python3 tools/generate_cmake_presets.py
 cmake --preset release
 cmake --build --preset release --target install
