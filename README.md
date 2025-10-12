@@ -57,13 +57,21 @@ Join us at the [PyTorch Conference, October 22-23](https://events.linuxfoundatio
 
 ---
 
-## About
+## Usage
+
+- first-time setup: ```./setup.sh```
+- incremental setup: ```./setup.sh --incremental```
+- run benchmark: ```./bench_serve.sh 2 2 8 32```
+
+## Links
 
 - [incremental compilation workflow](https://docs.vllm.ai/en/stable/contributing/incremental_build.html#prerequisites)
 - [vllm bench serve](https://docs.vllm.ai/en/latest/cli/bench/serve.html#options)
 - [EPLB routing](https://github.com/vllm-project/vllm/blob/8bf8f4582208ac7af230512ff5f3ac1dc36d5222/vllm/model_executor/layers/fused_moe/fused_moe.py#L1110)
 - [supported models](https://docs.vllm.ai/en/v0.10.2/models/supported_models.html)
 - [dataset:humaneval](https://huggingface.co/datasets/openai/openai_humaneval)
+
+## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 
