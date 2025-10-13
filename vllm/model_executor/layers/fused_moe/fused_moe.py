@@ -1108,6 +1108,7 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+@vllm.utils.cprofile()
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def eplb_map_to_physical_and_record(
         topk_ids: torch.Tensor,

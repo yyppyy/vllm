@@ -528,7 +528,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         else:
             return FUSED_MOE_UNQUANTIZED_CONFIG
 
-    @vllm.utils.cprofile()
     def forward_cuda(
         self,
         layer: torch.nn.Module,
@@ -1660,7 +1659,6 @@ class FusedMoE(CustomOp):
             self.quant_method.moe_quant_config = (
                 self.quant_method.get_fused_moe_quant_config(self))
 
-    @vllm.utils.cprofile()
     @staticmethod
     def select_experts(
         hidden_states: torch.Tensor,
