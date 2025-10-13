@@ -598,6 +598,8 @@ class FusedMoEParallelConfig:
     ep_rank: int
 
     use_ep: bool  # whether to use EP or not
+    
+    mem_bound_aware_routing: Optional[str] = None
 
     @property
     def use_all2all_kernels(self):
@@ -727,7 +729,8 @@ class FusedMoEParallelConfig:
                                       dp_rank=dp_rank,
                                       ep_size=ep_size,
                                       ep_rank=ep_rank,
-                                      use_ep=True)
+                                      use_ep=True,
+                                      mem_bound_aware_routing=vllm_parallel_config.mem_bound_aware_routing)
 
 
 # Adapted from pplx-kernels tests/all_to_all_utils.py

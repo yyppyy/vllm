@@ -574,7 +574,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             logical_replica_count=logical_replica_count,
             global_num_experts=global_num_experts,
             zero_expert_num=zero_expert_num,
-            zero_expert_type=zero_expert_type)
+            zero_expert_type=zero_expert_type,
+            mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing)
 
         if self.rocm_aiter_moe_enabled:
             assert self.fused_experts is None
@@ -1678,6 +1679,7 @@ class FusedMoE(CustomOp):
         global_num_experts: Optional[int] = None,
         zero_expert_num: Optional[int] = None,
         zero_expert_type: Optional[str] = None,
+        mem_bound_aware_routing: Optional[str] = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -1759,6 +1761,7 @@ class FusedMoE(CustomOp):
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
                 indices_type=indices_type,
+                mem_bound_aware_routing=mem_bound_aware_routing
             )
 
         assert topk_ids.dtype == indices_type or indices_type is None

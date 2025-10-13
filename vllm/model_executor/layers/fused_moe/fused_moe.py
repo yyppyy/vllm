@@ -1112,7 +1112,8 @@ def eplb_map_to_physical_and_record(
         expert_load_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
-        indices_type: Optional[torch.dtype] = None) -> torch.Tensor:
+        indices_type: Optional[torch.dtype] = None,
+        mem_bound_aware_routing: Optional[str] = None) -> torch.Tensor:
     '''
     Map the logical expert ids to physical expert ids
     and record the expert load metrics.

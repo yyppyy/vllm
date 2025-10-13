@@ -113,6 +113,7 @@ class ParallelConfig:
       with 4 experts and 2 ranks, rank 0 will have experts [0, 2] and rank 1
       will have experts [1, 3]. This strategy can help improve load balancing
       for grouped expert models with no redundant experts."""
+    mem_bound_aware_routing: Optional[str] = None
     num_redundant_experts: Optional[int] = None
     """`num_redundant_experts` is deprecated and has been replaced with
     `eplb_config.num_redundant_experts`. This will be removed in v0.12.0.

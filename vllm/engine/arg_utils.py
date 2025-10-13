@@ -338,6 +338,8 @@ class EngineArgs:
     enable_eplb: bool = ParallelConfig.enable_eplb
     expert_placement_strategy: ExpertPlacementStrategy = \
         ParallelConfig.expert_placement_strategy
+    mem_bound_aware_routing: str = \
+        ParallelConfig.mem_bound_aware_routing
     _api_process_count: int = ParallelConfig._api_process_count
     _api_process_rank: int = ParallelConfig._api_process_rank
     num_redundant_experts: int = EPLBConfig.num_redundant_experts
@@ -735,6 +737,10 @@ class EngineArgs:
             help=
             "[DEPRECATED] --eplb-log-balancedness will be removed in v0.12.0.",
             deprecated=True)
+        parallel_group.add_argument(
+            "--mem-bound-aware-routing",
+            **parallel_kwargs["mem_bound_aware_routing"]
+        )
 
         parallel_group.add_argument(
             "--max-parallel-loading-workers",
@@ -1331,6 +1337,7 @@ class EngineArgs:
             enable_eplb=self.enable_eplb,
             eplb_config=self.eplb_config,
             expert_placement_strategy=self.expert_placement_strategy,
+            mem_bound_aware_routing=self.mem_bound_aware_routing,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,
             ray_workers_use_nsight=self.ray_workers_use_nsight,
