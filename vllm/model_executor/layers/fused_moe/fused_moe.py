@@ -42,6 +42,8 @@ from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
 from .rocm_aiter_fused_moe import is_rocm_aiter_moe_enabled
 
+import vllm.utils
+
 logger = init_logger(__name__)
 
 
@@ -973,7 +975,7 @@ def dispatch_topk_func() -> Callable[..., tuple[torch.Tensor, ...]]:
         return rocm_aiter_topk_softmax
     return vllm_topk_softmax
 
-
+@vllm.utils.cprofile()
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1009,7 +1011,7 @@ def fused_topk(
 
     return topk_weights, topk_ids, token_expert_indices
 
-
+@vllm.utils.cprofile()
 def fused_topk_bias(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
