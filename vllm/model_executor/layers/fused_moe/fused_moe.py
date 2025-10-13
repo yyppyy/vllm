@@ -975,7 +975,6 @@ def dispatch_topk_func() -> Callable[..., tuple[torch.Tensor, ...]]:
         return rocm_aiter_topk_softmax
     return vllm_topk_softmax
 
-@vllm.utils.cprofile()
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1011,7 +1010,6 @@ def fused_topk(
 
     return topk_weights, topk_ids, token_expert_indices
 
-@vllm.utils.cprofile()
 def fused_topk_bias(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1108,7 +1106,6 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-@vllm.utils.cprofile()
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def eplb_map_to_physical_and_record(
         topk_ids: torch.Tensor,
