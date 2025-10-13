@@ -44,6 +44,7 @@ from vllm.utils import (cdiv, direct_register_custom_op, has_deep_ep, has_pplx,
                         round_up)
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+import vllm.utils
 
 if current_platform.is_cuda_alike():
     from .fused_batched_moe import BatchedTritonExperts
@@ -527,6 +528,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         else:
             return FUSED_MOE_UNQUANTIZED_CONFIG
 
+    @vllm.utils.cprofile()
     def forward_cuda(
         self,
         layer: torch.nn.Module,
@@ -577,57 +579,58 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             zero_expert_type=zero_expert_type,
             mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing)
 
-        if self.rocm_aiter_moe_enabled:
-            assert self.fused_experts is None
-            result = self.rocm_aiter_fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                expert_map=expert_map,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input)
-        elif self.flashinfer_cutlass_moe_enabled:
-            return self.flashinfer_cutlass_moe(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input)
-        elif self.fused_experts is not None:
-            if self.moe.has_bias:
-                raise ValueError(
-                    "FusedMoEModularKernel does not support bias.")
-            result = self.fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=True,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-            )
-        else:
-            assert fused_experts is not None
-            result = fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=True,
-                activation=activation,
-                quant_config=self.moe_quant_config,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-            )
+        with vllm.utils.cprofile_context():
+            if self.rocm_aiter_moe_enabled:
+                assert self.fused_experts is None
+                result = self.rocm_aiter_fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    expert_map=expert_map,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input)
+            elif self.flashinfer_cutlass_moe_enabled:
+                return self.flashinfer_cutlass_moe(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input)
+            elif self.fused_experts is not None:
+                if self.moe.has_bias:
+                    raise ValueError(
+                        "FusedMoEModularKernel does not support bias.")
+                result = self.fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    inplace=True,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                )
+            else:
+                assert fused_experts is not None
+                result = fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    inplace=True,
+                    activation=activation,
+                    quant_config=self.moe_quant_config,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                )
 
         if zero_expert_num != 0 and zero_expert_type is not None:
             assert not isinstance(result, tuple), \
@@ -1657,6 +1660,7 @@ class FusedMoE(CustomOp):
             self.quant_method.moe_quant_config = (
                 self.quant_method.get_fused_moe_quant_config(self))
 
+    @vllm.utils.cprofile()
     @staticmethod
     def select_experts(
         hidden_states: torch.Tensor,
