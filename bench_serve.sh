@@ -30,6 +30,7 @@ vllm serve Qwen/Qwen3-30B-A3B \
     --max-num-batched-tokens $BATCH_SIZE \
     --enable-chunked-prefill \
     -O.level=3 \
+    --max-model-len 4096 \
     >$RES_DIR/server.log 2>&1 &
 SERVER_PID=$!
 
