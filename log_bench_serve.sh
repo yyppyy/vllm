@@ -40,7 +40,7 @@ if (( NUM_REPLICAS > 0 )); then
   args+=( --eplb-config "{\"window_size\":1000,\"step_interval\":3000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
 fi
 
-TOPK_DUMP_PREFIX=./results/topk_tensor_$RUN_HASH TOPK_DUMP_THROTTLE=10 vllm "${args[@]}" >"$RES_DIR/server_$RUN_HASH.log" 2>&1 &
+TOPK_DUMP_PREFIX=./results/topk_tensor_$RUN_HASH vllm "${args[@]}" >"$RES_DIR/server_$RUN_HASH.log" 2>&1 &
 SERVER_PID=$!
 
 # Ensure we always stop the server on exit (success or failure)
