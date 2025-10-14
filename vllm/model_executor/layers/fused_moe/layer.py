@@ -45,6 +45,7 @@ from vllm.utils import (cdiv, direct_register_custom_op, has_deep_ep, has_pplx,
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 import vllm.utils
+import log_tensor
 
 if current_platform.is_cuda_alike():
     from .fused_batched_moe import BatchedTritonExperts
@@ -577,6 +578,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             zero_expert_num=zero_expert_num,
             zero_expert_type=zero_expert_type,
             mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing)
+
+        log_tensor.record_topk_for_batch(
+            ep_rank=self.moe.moe_parallel_config.ep_rank,
+            topk_tensor=topk_ids
+        )
 
         if self.rocm_aiter_moe_enabled:
             assert self.fused_experts is None
