@@ -6,6 +6,8 @@ NUM_REPLICAS=$3
 BATCH_SIZE=$4
 RES_DIR=./results
 
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}
+
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
 
 source .venv/bin/activate
@@ -20,18 +22,25 @@ export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
 
-VLLM_TORCH_PROFILER_DIR=./results vllm serve Qwen/Qwen3-30B-A3B \
-    --port $PORT \
-    --data-parallel-size $EP_DEGREE \
-    --tensor-parallel-size 1 \
-    --enable-expert-parallel \
-    --enable-eplb \
-    --eplb-config "{\"window_size\":1000,\"step_interval\":3000,\"num_redundant_experts\":$NUM_REPLICAS}" \
-    --max-num-batched-tokens $BATCH_SIZE \
-    --enable-chunked-prefill \
-    -O.level=3 \
-    --max-model-len 4096 \
-    >$RES_DIR/server.log 2>&1 &
+args=(
+  serve Qwen/Qwen3-30B-A3B
+  --port "$PORT"
+  --data-parallel-size "$EP_DEGREE"
+  --tensor-parallel-size 1
+  --enable-expert-parallel
+  --max-num-batched-tokens "$BATCH_SIZE"
+  --enable-chunked-prefill
+  -O.level=3
+  --max-model-len 4096
+)
+
+# Only add EPLB flags if NUM_REPLICAS > 0 (or whatever your condition is)
+if (( NUM_REPLICAS > 0 )); then
+  args+=( --enable-eplb )
+  args+=( --eplb-config "{\"window_size\":1000,\"step_interval\":3000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
+fi
+
+VLLM_TORCH_PROFILER_DIR=./results vllm "${args[@]}" >"$RES_DIR/server_$RUN_HASH.log" 2>&1 &
 SERVER_PID=$!
 
 # Ensure we always stop the server on exit (success or failure)
@@ -53,10 +62,11 @@ vllm bench serve \
     --dataset-path philschmid/mt-bench \
     --backend vllm \
     --save-result \
-    --result-dir $RES_DIR \
+    --result-filename $RES_DIR/bench_result_$RUN_HASH.json \
     --percentile-metrics ttft,tpot,itl,e2el \
     --metric-percentiles 50,95,99 \
-    --ready-check-timeout-sec 120 \
+    --ready-check-timeout-sec 150 \
     --port $PORT \
-    --profile
+    --profile \
+    --num-prompts 5000
     # --hf-output-len use this to increase decode ratio?
