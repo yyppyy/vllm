@@ -22,7 +22,8 @@ export NCCL_P2P_LEVEL=NVL
 
 vllm serve Qwen/Qwen3-30B-A3B \
     --port $PORT \
-    --tensor-parallel-size $EP_DEGREE \
+    --data-parallel-size $EP_DEGREE \
+    --tensor-parallel-size 1 \
     --enable-expert-parallel \
     --enable-eplb \
     --eplb-config "{\"window_size\":1000,\"step_interval\":3000,\"num_redundant_experts\":$NUM_REPLICAS}" \
