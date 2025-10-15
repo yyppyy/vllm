@@ -11,7 +11,7 @@ logger = init_logger(__name__)
 _PREFIX_ENV = "TOPK_DUMP_PREFIX"
 
 _prefix: Optional[str] = os.getenv(_PREFIX_ENV) or None
-_throttle: int = 10
+_throttle: int = 1000
 _ep_rank: Optional[int] = None
 _buffer: List[torch.Tensor] = []
 
