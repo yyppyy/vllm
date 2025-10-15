@@ -3,6 +3,10 @@ import atexit
 from typing import List, Optional
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 # Env var for file prefix, e.g. "/tmp/myrun" -> "/tmp/myrun.ep3.pt"
 _PREFIX_ENV = "TOPK_DUMP_PREFIX"
 
@@ -26,10 +30,10 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 def _atomic_save(obj, out_path: str) -> None:
-    tmp_path = out_path + ".tmp"
+    # tmp_path = out_path + ".tmp"
     _ensure_parent_dir(out_path)
-    torch.save(obj, tmp_path)
-    os.replace(tmp_path, out_path)
+    torch.save(obj, out_path)
+    # os.replace(tmp_path, out_path)
 
 def record_topk_for_batch(ep_rank: int, topk_tensor: torch.Tensor) -> Optional[str]:
     """
@@ -54,6 +58,7 @@ def record_topk_for_batch(ep_rank: int, topk_tensor: torch.Tensor) -> Optional[s
 def flush() -> Optional[str]:
     """Write the buffered list to disk atomically. Returns path or None if no-op."""
     if _prefix is None or _ep_rank is None or not _buffer:
+        logger.warning("not logging topk tensor on this rank")
         return None
     out_path = _out_path()
     _atomic_save(_buffer, out_path)

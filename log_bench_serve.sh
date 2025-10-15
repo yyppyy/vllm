@@ -50,7 +50,7 @@ cleanup() {
     # SIGINT lets vLLM shut down cleanly
     kill -INT "$SERVER_PID" 2>/dev/null || true
     # wait a bit; if it's still around, escalate to SIGTERM
-    sleep 10
+    sleep 30
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     # final fallback after a short wait
     sleep 10
@@ -70,5 +70,5 @@ vllm bench serve \
     --ready-check-timeout-sec 150 \
     --port $PORT \
     --profile \
-    --num-prompts 5000
+    --num-prompts 2000
     # --hf-output-len use this to increase decode ratio?
