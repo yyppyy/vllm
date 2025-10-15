@@ -40,6 +40,7 @@ if (( NUM_REPLICAS > 0 )); then
   args+=( --eplb-config "{\"window_size\":1000,\"step_interval\":3000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
 fi
 
+unset VLLM_TORCH_PROFILER_DIR
 unset TOPK_DUMP_PREFIX
 vllm "${args[@]}" >"$RES_DIR/server_$RUN_HASH.log" 2>&1 &
 SERVER_PID=$!
