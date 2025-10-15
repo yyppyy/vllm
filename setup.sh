@@ -28,6 +28,6 @@ source .venv/bin/activate
 VLLM_USE_PRECOMPILED=1 uv pip install -U -e ".[bench]" --torch-backend=auto
 
 python3 tools/generate_cmake_presets.py
-# python -m pip install cmake ninja
+python -m pip install cmake ninja
 cmake --preset release
 cmake --build --preset release --target install

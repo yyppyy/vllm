@@ -28,8 +28,8 @@ args=(
   --data-parallel-size "$EP_DEGREE"
   --tensor-parallel-size 1
   --enable-expert-parallel
-  --max-num-batched-tokens "$BATCH_SIZE"
-  --enable-chunked-prefill
+  --max-num-seqs "$BATCH_SIZE"
+  --no-enable-chunked-prefill
   -O.level=3
   --max-model-len 4096
   --enforce-eager
@@ -38,7 +38,7 @@ args=(
 # Only add EPLB flags if NUM_REPLICAS > 0 (or whatever your condition is)
 if (( NUM_REPLICAS > 0 )); then
   args+=( --enable-eplb )
-  args+=( --eplb-config "{\"window_size\":1000,\"step_interval\":3000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
+  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
 fi
 
 unset VLLM_TORCH_PROFILER_DIR
@@ -67,8 +67,8 @@ vllm bench serve \
     --result-filename $RES_DIR/bench_result_$RUN_HASH.json \
     --percentile-metrics ttft,tpot,itl,e2el \
     --metric-percentiles 50,95,99 \
-    --ready-check-timeout-sec 150 \
+    --ready-check-timeout-sec 240 \
     --port $PORT \
     --profile \
-    --num-prompts 2000
+    --num-prompts 1024
     # --hf-output-len use this to increase decode ratio?

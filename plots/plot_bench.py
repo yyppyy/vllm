@@ -15,7 +15,8 @@ FILENAME_RE = re.compile(
 METRICS = [
     "total_token_throughput",
     "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
-    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
+    "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
+    "mean_tpot__ms", "p95_tpot__ms", "p99_tpot_ms",
 ]
 
 def parse_list(arg):
@@ -43,10 +44,12 @@ def parse_list(arg):
 def load_results(results_dir, filters):
     """
     Scan results_dir for matching files and load JSON.
-    Group by (num_gpus, ep_degree, num_replicas).
-    Within each group, store per-batch_size records.
+
+    Group by (num_gpus, ep_degree), and within each group
+    store a mapping: num_replicas -> {batch_size -> data}.
     """
-    results = defaultdict(dict)  # {(g, ep, rep): {batch_size: data}}
+    # results[(g, ep)][rep][batch_size] = data
+    results = defaultdict(lambda: defaultdict(dict))
     missing_metrics = set()
 
     for path in Path(results_dir).glob("bench_result_*.json"):
@@ -75,58 +78,56 @@ def load_results(results_dir, filters):
             print(f"Failed to read {path}: {e}")
             continue
 
-        # Track missing metrics (optional, helpful for debugging)
         for metric in METRICS:
             if metric not in data:
                 missing_metrics.add(metric)
 
-        results[(num_gpus, ep_degree, num_replicas)][batch_size] = data
+        results[(num_gpus, ep_degree)][num_replicas][batch_size] = data
 
     if missing_metrics:
         print("Warning: some files lacked metrics:", ", ".join(sorted(missing_metrics)))
     return results
 
-def plot_group(group_key, bs_to_data, outdir):
+def plot_group(group_key, rep_to_bsdata, outdir):
     """
-    For a specific (num_gpus, ep_degree, num_replicas) group,
-    plot each metric vs BATCH_SIZE.
+    For a specific (num_gpus, ep_degree) group, plot each metric vs BATCH_SIZE.
+    Each NUM_REPLICAS value becomes a separate line.
     """
-    num_gpus, ep_degree, num_replicas = group_key
-    # Sort by batch size
-    batch_sizes = sorted(bs_to_data.keys())
-    if not batch_sizes:
-        return
+    num_gpus, ep_degree = group_key
 
-    # Prepare arrays per metric
-    series = {metric: [] for metric in METRICS}
-    for bs in batch_sizes:
-        record = bs_to_data[bs]
-        for metric in METRICS:
-            series[metric].append(record.get(metric, float("nan")))
+    # Skip empty groups
+    if not rep_to_bsdata:
+        return
 
     # One plot per metric
     for metric in METRICS:
         plt.figure()
-        plt.plot(batch_sizes, series[metric], marker="o")
+
+        # Plot one line per num_replicas
+        for rep, bs_to_data in sorted(rep_to_bsdata.items()):
+            if not bs_to_data:
+                continue
+            batch_sizes = sorted(bs_to_data.keys())
+            y = [bs_to_data[bs].get(metric, float("nan")) for bs in batch_sizes]
+            plt.plot(batch_sizes, y, marker="o", label=f"NUM_REPLICAS={rep}")
+
         plt.xlabel("BATCH_SIZE")
         plt.ylabel(metric)
         plt.title(
             f"{metric} vs BATCH_SIZE\n"
-            f"NUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}, NUM_REPLICAS={num_replicas}"
+            f"NUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}"
         )
         plt.grid(True, linestyle="--", alpha=0.4)
+        plt.legend(title="Replica lines", frameon=False)
 
-        outpath = (
-            Path(outdir)
-            / f"{metric}_g{num_gpus}_ep{ep_degree}_rep{num_replicas}.png"
-        )
+        outpath = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}.png"
         outpath.parent.mkdir(parents=True, exist_ok=True)
         plt.tight_layout()
         plt.savefig(outpath, dpi=150)
         plt.close()
 
 def main():
-    ap = argparse.ArgumentParser(description="Plot vLLM benchmark JSONs vs BATCH_SIZE.")
+    ap = argparse.ArgumentParser(description="Plot vLLM benchmark JSONs vs BATCH_SIZE, one line per NUM_REPLICAS.")
     ap.add_argument("--results-dir", type=str, required=True,
                     help="Directory containing bench_result_*.json files")
     ap.add_argument("--output-dir", type=str, default="plots",
@@ -136,7 +137,7 @@ def main():
     ap.add_argument("--ep-degree", type=str, default="",
                     help='Filter EP_DEGREE (e.g. "1,2,4"); empty = all')
     ap.add_argument("--num-replicas", type=str, default="",
-                    help='Filter NUM_REPLICAS (e.g. "0,1,2"); empty = all')
+                    help='Filter NUM_REPLICAS lines to include (e.g. "0,1,2"); empty = all')
     ap.add_argument("--batch-size", type=str, default="",
                     help='Filter BATCH_SIZE (e.g. "256,512,1024" or "256..4096:256"); empty = all')
     args = ap.parse_args()
@@ -153,8 +154,9 @@ def main():
         print("No matching files found.")
         return
 
-    for group_key, bs_to_data in results.items():
-        plot_group(group_key, bs_to_data, args.output_dir)
+    # Now groups are (g, ep) only; each plot shows lines for different replicas
+    for group_key, rep_to_bsdata in results.items():
+        plot_group(group_key, rep_to_bsdata, args.output_dir)
 
     print(f"Done. Plots written to: {args.output_dir}")
 
