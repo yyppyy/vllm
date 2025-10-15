@@ -32,6 +32,7 @@ args=(
   --enable-chunked-prefill
   -O.level=3
   --max-model-len 4096
+  --enforce-eager
 )
 
 # Only add EPLB flags if NUM_REPLICAS > 0 (or whatever your condition is)
