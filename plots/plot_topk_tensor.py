@@ -62,9 +62,15 @@ def load_batches_from_rank_file(path: str) -> List[torch.Tensor]:
     """
     data = torch.load(path, map_location="cpu")
     # fixme. dummy fix to jump over dummy tokens and tokens before first rebalance
-    data = data[:len(data) // 5 * 4]
+    # print(len(data))
+    while torch.equal(data[0][0], data[0][1]):
+        data = data[1:]
+    # print(len(data))
+    size_dict = defaultdict(int)
+    for tpk in data:
+        size_dict[tpk.shape[0]] += 1
+    print(size_dict)
     # Be tolerant if someone saved a single tensor (older dump): wrap it
-    # print(path, len(data), data[len(data) // 2])
     # due to vLLM dummy all-gather + reduce-scatter MoE all2all impl, each rank holds
     # the global (all-GPU) topk logits. So technically we only need data in rank 0
     if isinstance(data, torch.Tensor):
@@ -179,7 +185,7 @@ def main():
 
         for bs in filters["batch_size"]:
             prefix = prefix_for_run(args.results_dir, ng, ep, reps, bs)
-            rank_files = find_rank_files(prefix)
+            rank_files = {0: find_rank_files(prefix)[0]}
             if not rank_files:
                 continue
 

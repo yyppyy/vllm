@@ -11,6 +11,7 @@ logger = init_logger(__name__)
 _PREFIX_ENV = "TOPK_DUMP_PREFIX"
 
 _prefix: Optional[str] = os.getenv(_PREFIX_ENV) or None
+_throttle: int = 10
 _ep_rank: Optional[int] = None
 _buffer: List[torch.Tensor] = []
 
@@ -53,6 +54,10 @@ def record_topk_for_batch(ep_rank: int, topk_tensor: torch.Tensor) -> Optional[s
 
     t = topk_tensor.detach().cpu().clone()
     _buffer.append(t)
+    
+    if len(_buffer) % _throttle == 0:
+        flush()
+    
     return _out_path()
 
 def flush() -> Optional[str]:
@@ -65,4 +70,4 @@ def flush() -> Optional[str]:
     return out_path
 
 # Always flush at process exit so you don't lose the tail.
-atexit.register(flush)
+# atexit.register(flush)
