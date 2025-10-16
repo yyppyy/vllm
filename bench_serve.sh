@@ -66,6 +66,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+N=$(( BATCH_SIZE * NUM_GPUS ))
+MC=$(( PREFILL_ONLY > 0 ? 1 : N ))
 
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
@@ -78,8 +80,8 @@ cli_args=(
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 240
     --port "$PORT"
-    --num-prompts 1024
-    --max-concurrency $((BATCH_SIZE * NUM_GPUS))
+    --num-prompts $N
+    --max-concurrency $MC
 )
 
 if (( PREFILL_ONLY > 0 )); then
