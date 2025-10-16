@@ -16,7 +16,7 @@ METRICS = [
     "total_token_throughput",
     "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
     "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
-    "mean_tpot__ms", "p95_tpot__ms", "p99_tpot_ms",
+    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
 ]
 
 def parse_list(arg):

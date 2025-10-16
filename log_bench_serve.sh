@@ -61,7 +61,7 @@ trap cleanup EXIT
 vllm bench serve \
     --model Qwen/Qwen3-30B-A3B \
     --dataset-name hf \
-    --dataset-path philschmid/mt-bench \
+    --dataset-path likaixin/InstructCoder \
     --backend vllm \
     --save-result \
     --result-filename $RES_DIR/bench_result_$RUN_HASH.json \
@@ -70,5 +70,5 @@ vllm bench serve \
     --ready-check-timeout-sec 240 \
     --port $PORT \
     --profile \
-    --num-prompts 1024
-    # --hf-output-len use this to increase decode ratio?
+    --num-prompts 1024 \
+    ----max-concurrency $((BATCH_SIZE * NUM_GPUS))

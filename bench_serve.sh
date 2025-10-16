@@ -32,6 +32,7 @@ args=(
   --no-enable-chunked-prefill
   -O.level=3
   --max-model-len 4096
+  --enforce-eager
 )
 
 # Only add EPLB flags if NUM_REPLICAS > 0 (or whatever your condition is)
@@ -61,7 +62,7 @@ trap cleanup EXIT
 vllm bench serve \
     --model Qwen/Qwen3-30B-A3B \
     --dataset-name hf \
-    --dataset-path philschmid/mt-bench \
+    --dataset-path likaixin/InstructCoder \
     --backend vllm \
     --save-result \
     --result-filename $RES_DIR/bench_result_$RUN_HASH.json \
@@ -69,5 +70,6 @@ vllm bench serve \
     --metric-percentiles 50,95,99 \
     --ready-check-timeout-sec 240 \
     --port $PORT \
-    --num-prompts 1024
+    --num-prompts 1024 \
+    ----max-concurrency $((BATCH_SIZE * NUM_GPUS))
     # --hf-output-len use this to increase decode ratio?
