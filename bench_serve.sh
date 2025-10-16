@@ -83,7 +83,7 @@ cli_args=(
 )
 
 if (( PREFILL_ONLY > 0 )); then
-  args+=( --hf-output-len 1 )
+  cli_args+=( --hf-output-len 1 )
 fi
 
 vllm bench serve "${cli_args[@]}"
