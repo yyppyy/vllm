@@ -173,7 +173,8 @@ class EplbState:
         """
         global_physical_to_logical_map = list(range(num_routed_experts))
         global_physical_to_logical_map += [
-            i % num_routed_experts for i in range(num_redundant_experts)
+            (i + 1) % num_routed_experts for i in range(num_redundant_experts)
+            # + 1 to avoid repeated experts on a single rank with round_robin placement
         ]
         return global_physical_to_logical_map
 
