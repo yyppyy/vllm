@@ -72,5 +72,5 @@ vllm bench serve \
     --ready-check-timeout-sec 240 \
     --port $PORT \
     --num-prompts 1024 \
-    ----max-concurrency $((BATCH_SIZE * NUM_GPUS))
+    --max-concurrency $((BATCH_SIZE * NUM_GPUS))
     # --hf-output-len use this to increase decode ratio?

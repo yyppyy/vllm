@@ -72,4 +72,4 @@ vllm bench serve \
     --port $PORT \
     --profile \
     --num-prompts 1024 \
-    ----max-concurrency $((BATCH_SIZE * NUM_GPUS))
+    --max-concurrency $((BATCH_SIZE * NUM_GPUS))
