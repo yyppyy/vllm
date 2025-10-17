@@ -34,6 +34,7 @@ args=(
   --no-enable-chunked-prefill
   -O.level=3
   --max-model-len 4096
+  --max-num-batched-tokens 8192
   --enforce-eager
   --expert-placement-strategy linear
 )
@@ -67,12 +68,12 @@ cleanup() {
 trap cleanup EXIT
 
 N=$(( BATCH_SIZE * NUM_GPUS ))
-MC=$(( PREFILL_ONLY > 0 ? 1 : N ))
+MC=$(( PREFILL_ONLY > 0 ? 256 : N ))
 
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
     --dataset-name hf
-    --dataset-path likaixin/InstructCoder
+    --dataset-path vdaita/edit_5k_char
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/bench_result_"$RUN_HASH".json
