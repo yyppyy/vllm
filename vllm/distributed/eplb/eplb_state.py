@@ -201,7 +201,7 @@ class EplbState:
         
         logger.info(
             'Customized EPLB mapping %d log to %d phi experts with %d ranks'
-            'phiscal to logical map:', num_routed_experts, num_redundant_experts, num_ranks,
+            'phiscal to logical map: %s', num_routed_experts, num_redundant_experts, num_ranks,
             global_physical_to_logical_map
         )
         
