@@ -231,7 +231,7 @@ class EplbState:
             cls.build_initial_global_physical_to_logical_map(
                 model.num_routed_experts,
                 model.num_redundant_experts,
-                ep_group.size()
+                get_ep_group().device_group.size()
             ))
         physical_to_logical_map = torch.tensor(
             physical_to_logical_map_list,
