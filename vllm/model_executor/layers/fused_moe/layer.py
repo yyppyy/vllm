@@ -2107,7 +2107,7 @@ class FusedMoE(CustomOp):
         # So that we should map the expert id to logical in `weight_name`
         physical_to_logical_map = \
             EplbState.build_initial_global_physical_to_logical_map(
-            num_experts, num_redundant_experts)
+            num_experts, num_redundant_experts, get_ep_group().world_size)
 
         return [
             # (param_name, weight_name, expert_id, shard_id)

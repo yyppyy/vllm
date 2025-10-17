@@ -33,7 +33,7 @@ args=(
   -O.level=3
   --max-model-len 4096
   --enforce-eager
-  --expert-placement-strategy round_robin
+  --expert-placement-strategy linear
 )
 
 # Only add EPLB flags if NUM_REPLICAS > 0 (or whatever your condition is)

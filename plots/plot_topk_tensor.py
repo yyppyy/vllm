@@ -60,6 +60,7 @@ def load_batches_from_rank_file(path: str) -> List[torch.Tensor]:
     """
     File contains a list of tensors (one per batch). Each tensor is [M, topk] of expert IDs.
     """
+    print(path)
     data = torch.load(path, map_location="cpu")
     # fixme. dummy fix to jump over dummy tokens and tokens before first rebalance
     # print(len(data))
