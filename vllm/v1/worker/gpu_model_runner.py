@@ -2295,6 +2295,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ), record_function_or_nullcontext("Forward"),
               self.maybe_get_kv_connector_output(scheduler_output) as
               kv_connector_output):
+            time_before_model = time.perf_counter()
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -2302,6 +2303,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            logger.info(f'Batch size[{num_input_tokens}], across dp size[{num_tokens_across_dp}], takes [{time.perf_counter() - time_before_model}s]')
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
