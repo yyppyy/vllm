@@ -23,8 +23,7 @@ export NCCL_P2P_DISABLE=0
 export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
-
-CS=$(( CHUNKED_PREFILL > 0 ? BATCH_SIZE : 8192 ))
+CS=$(( CHUNKED_PREFILL > 0 ? BATCH_SIZE : 4096 ))
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -37,7 +36,6 @@ args=(
   -O.level=3
   --max-model-len 4096
   --max-num-batched-tokens $CS
-  --enforce-eager
   --expert-placement-strategy linear
 )
 

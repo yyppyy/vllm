@@ -419,9 +419,9 @@ class Qwen3MoeModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            time_before_layer = time.perf_counter()
+            # time_before_layer = time.perf_counter()
             hidden_states, residual = layer(positions, hidden_states, residual)
-            logger.info(f'Layer[{layer.__class__.__name__}] takes [{time.perf_counter() - time_before_layer}s]')
+            # logger.info(f'Layer[{layer.__class__.__name__}] takes [{time.perf_counter() - time_before_layer}s]')
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
