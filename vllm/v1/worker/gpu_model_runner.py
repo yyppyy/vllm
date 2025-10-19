@@ -2295,6 +2295,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ), record_function_or_nullcontext("Forward"),
               self.maybe_get_kv_connector_output(scheduler_output) as
               kv_connector_output):
+            
+            if not hasattr(self, "_bs_stats"):
+                self._bs_stats = defaultdict(lambda: {"total_s": 0.0, "count": 0})
+                self._bs_iter = 0
+                self._bs_print_every = 10
+            
             time_before_model = time.perf_counter()
             model_output = self.model(
                 input_ids=input_ids,
@@ -2303,8 +2309,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
-            logger.info(f'Batch size[{num_input_tokens}], across dp size[{num_tokens_across_dp}], takes [{time.perf_counter() - time_before_model}s]')
+            elapsed = time.perf_counter() - time_before_model
+            
+            bs = int(num_input_tokens)  # batch size proxy you already log
+            self._bs_stats[bs]["total_s"] += elapsed
+            self._bs_stats[bs]["count"]   += 1
+            self._bs_iter += 1
 
+            # # fine-grained per-iteration log (kept)
+            # logger.info(
+            #     f"Batch size[{bs}], across dp size[{num_tokens_across_dp}], "
+            #     f"takes [{elapsed:.6f}s]"
+            # )
+
+            # periodic averages
+            if self._bs_iter % self._bs_print_every == 0:
+                # print in ascending batch size for readability
+                for k in sorted(self._bs_stats.keys()):
+                    tot = self._bs_stats[k]["total_s"]
+                    cnt = self._bs_stats[k]["count"]
+                    avg = tot / max(cnt, 1)
+                    logger.info(
+                        f"[AVG last {cnt:>4} iters] batch size {k:>4} → {avg:.6f}s "
+                        f"(total {tot:.3f}s)"
+                    )
+            
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
