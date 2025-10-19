@@ -69,7 +69,7 @@ MC=$(( PREFILL_ONLY > 0 ? 256 : N ))
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
     --dataset-name hf
-    --dataset-path vdaita/edit_5k_char
+    --dataset-path likaixin/InstructCoder \
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/bench_result_"$RUN_HASH".json
