@@ -1130,10 +1130,13 @@ def build_active_and_csr(
                             torch.full_like(phys, -1, dtype=torch.int32))
 
     valid = (ranks >= 0)
-    rank_indices = ranks[valid].to(torch.int32)              # [nnz]
-    counts = valid.sum(dim=1, dtype=torch.int32)             # [n]
-    rank_offsets = torch.cat([torch.zeros(1, dtype=torch.int32, device=counts.device),
-                              counts.cumsum(0)], dim=0)      # [n+1]
+    rank_indices = ranks[valid].to(torch.int32).contiguous()
+    counts = valid.sum(dim=1, dtype=torch.int32)
+    rank_offsets = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=counts.device),
+        counts.cumsum(0)],
+        dim=0,
+    ).contiguous()
     return act, rank_offsets, rank_indices
 
 def _route_exact_or_greedy_gpu(
@@ -1148,9 +1151,9 @@ def _route_exact_or_greedy_gpu(
 ):
     act, off, idx = build_active_and_csr(topk_ids_logical, l2p, lrc, phys2rank, P)
     if algo == "exact":
-        chosen_rank, _L = torch.ops._moe_C.eplb_route_exact(off, idx, P)  # _L is a Tensor scalar
+        chosen_rank, _L = torch.ops._moe_C.eplb_route_exact(off, idx, int(P))
     else:
-        chosen_rank = torch.ops._moe_C.eplb_route_greedy(off, idx, P)
+        chosen_rank = torch.ops._moe_C.eplb_route_greedy(off, idx, int(P))
 
     chosen_replica = torch.ops._moe_C.eplb_select_replica(l2p, lrc, act, chosen_rank, P)
     physical_ids = torch.ops._moe_C.eplb_map_tokens(topk_ids_logical.long(), act, chosen_replica)
