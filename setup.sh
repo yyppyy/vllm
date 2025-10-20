@@ -16,6 +16,8 @@ done
 
 if "$incremental"; then
   source .venv/bin/activate
+  python3 tools/generate_cmake_presets.py
+  cmake --preset release
   cmake --build --preset release --target install
   exit 0
 fi
