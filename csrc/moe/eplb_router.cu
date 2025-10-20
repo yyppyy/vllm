@@ -1,5 +1,10 @@
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include <ATen/ops/cat.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/full.h>
+#include <ATen/ops/max.h>
+#include <ATen/ops/zeros.h>
 #include <cuda_runtime.h>
 #include <limits>
 
@@ -19,19 +24,16 @@ __global__ void greedy_kernel(
   for (i32 e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += blockDim.x * gridDim.x) {
     i32 s = off[e], t = off[e+1];
     i32 best_p = -1, best_l = INT_MAX;
-    // read-only scan of candidate ranks
     for (i32 j = s; j < t; ++j) {
       i32 p = idx[j];
       i32 l = __ldg(rank_loads + p);
       if (l < best_l || (l == best_l && p < best_p)) { best_l = l; best_p = p; }
     }
-    // CAS loop (few retries) to commit the chosen rank
     #pragma unroll 4
     for (int attempt = 0; attempt < 4; ++attempt) {
       i32 expected = __ldg(rank_loads + best_p);
       i32 old = atomicCAS(rank_loads + best_p, expected, expected + 1);
       if (old == expected) { chosen[e] = best_p; break; }
-      // re-evaluate with updated loads
       best_p = -1; best_l = INT_MAX;
       for (i32 j = s; j < t; ++j) {
         i32 p = idx[j];
@@ -56,14 +58,13 @@ void greedy_smallest_choice_first_cuda(
                                                 chosen.data_ptr<i32>(), loads.data_ptr<i32>(), n);
 }
 
-// --------------- Exact: device-only CSR + fixed-iter HK ---------------
-__global__ void build_slot_offsets_kernel(const i32* __restrict__ off, i32* __restrict__ degL, int n, int L) {
+// --------------- Exact: device-only CSR + fixed-iter matching ---------------
+__global__ void build_slot_degrees_kernel(const i32* __restrict__ off, i32* __restrict__ degL, int n, int L) {
   for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += blockDim.x * gridDim.x) {
     degL[e] = (off[e+1] - off[e]) * L;
   }
 }
 
-// Expand expert->rank edges to expert->rank-slot edges
 __global__ void expand_e2slot_kernel(const i32* __restrict__ off, const i32* __restrict__ idx,
                                      const i32* __restrict__ slot_off, i32* __restrict__ slot_idx,
                                      int n, int L) {
@@ -76,7 +77,6 @@ __global__ void expand_e2slot_kernel(const i32* __restrict__ off, const i32* __r
   }
 }
 
-// Simple fixed-iteration matching: try to greedily claim free slots with atomicCAS; repeat.
 __global__ void try_match_kernel(const i32* __restrict__ off, const i32* __restrict__ idx,
                                  i32* __restrict__ pairU, i32* __restrict__ pairV, int n) {
   for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += blockDim.x * gridDim.x) {
@@ -108,16 +108,16 @@ static void device_build_e2slot_csr(const at::Tensor& off, const at::Tensor& idx
 {
   const int n = (int)off.size(0) - 1;
   auto opts_i32 = off.options().dtype(at::kInt);
-  auto degL = at::empty({n}, opts_i32);
   auto stream = at::cuda::getCurrentCUDAStream();
   const int threads = 256;
   const int blocks  = std::min((n + threads - 1)/threads, 1024);
 
-  build_slot_offsets_kernel<<<blocks, threads, 0, stream>>>(off.data_ptr<i32>(), degL.data_ptr<i32>(), n, L);
-  slot_off = at::empty({n+1}, opts_i32);
-  slot_off.index_put_({0}, 0);
-  slot_off.index_put_({at::indexing::Slice(1, n+1)}, degL.cumsum(0));
-  const int nnzL = slot_off.index({n}).item<i32>(); // NOTE: single scalar read at end of op is acceptable
+  auto degL = at::empty({n}, opts_i32);
+  build_slot_degrees_kernel<<<blocks, threads, 0, stream>>>(off.data_ptr<i32>(), degL.data_ptr<i32>(), n, L);
+
+  // slot_off = cat([0], cumsum(degL))
+  slot_off = at::cat({at::zeros({1}, opts_i32), degL.cumsum(0)}, 0);
+  const int nnzL = slot_off.select(0, n).item<i32>();  // one scalar read inside C++ op is fine
 
   slot_idx = at::empty({nnzL}, opts_i32);
   expand_e2slot_kernel<<<blocks, threads, 0, stream>>>(off.data_ptr<i32>(), idx.data_ptr<i32>(),
@@ -129,45 +129,39 @@ at::Tensor exact_min_max_activations_cuda(
 {
   TORCH_CHECK(off.is_cuda() && idx.is_cuda() && chosen_rank.is_cuda(), "CUDA tensors required");
   const int n = (int)off.size(0) - 1;
-  // bounds
   int low = (n + P - 1) / P, high = n, best = n;
+
   auto opts_i32 = off.options().dtype(at::kInt);
   auto stream = at::cuda::getCurrentCUDAStream();
   const int threads = 256;
   const int blocksU = std::min((n + threads - 1)/threads, 1024);
 
-  // Fixed number of outer iterations (stable launches for CUDA graphs)
-  const int MAX_BS_ITERS = 32; // >= ceil(log2(n)) for practical n
+  const int MAX_BS_ITERS = 32;     // fixed outer iters (stable launches)
+  const int HK_ITERS     = 8;      // fixed inner rounds
 
-  // Persistent buffers
   at::Tensor e_off, e_idx, pairU, pairV, ranks;
 
   for (int it = 0; it < MAX_BS_ITERS; ++it) {
     int mid = (low + high) >> 1;
-    if (mid < low || mid > high) mid = low; // clamp, keep iteration stable
+    if (mid < low || mid > high) mid = low;
 
-    // Build expanded CSR for this L on device
+    // Build expanded graph for this L
     device_build_e2slot_csr(off, idx, mid, e_off, e_idx);
-
     const int Vslots = (int)(P * mid);
     pairU = at::full({n}, -1, opts_i32);
     pairV = at::full({Vslots}, -1, opts_i32);
 
-    // Fixed HK-ish rounds
-    const int HK_ITERS = 8;
     for (int k = 0; k < HK_ITERS; ++k) {
       try_match_kernel<<<blocksU, threads, 0, stream>>>(e_off.data_ptr<i32>(), e_idx.data_ptr<i32>(),
                                                         pairU.data_ptr<i32>(), pairV.data_ptr<i32>(), n);
       clear_if_conflict_kernel<<<blocksU, threads, 0, stream>>>(pairU.data_ptr<i32>(), pairV.data_ptr<i32>(), n);
     }
 
-    // Count matched on device, move single scalar at end of op (avoids graph breaks in Python)
-    auto matched_t = (pairU != -1).sum(); // int32 tensor scalar
-    int matched = matched_t.item<int>();  // single sync inside op (OK; still stable kernel launches)
+    auto matched_t = (pairU != -1).sum();   // Tensor scalar
+    int matched = matched_t.item<int>();    // host read inside C++ op (launch pattern is fixed)
 
-    if (matched == n) { // feasible
+    if (matched == n) {
       best = mid; high = mid - 1;
-      // fill chosen_rank = slot//L
       ranks = at::empty_like(chosen_rank);
       fill_ranks_from_slots_kernel<<<blocksU, threads, 0, stream>>>(pairU.data_ptr<i32>(), ranks.data_ptr<i32>(), n, mid);
       chosen_rank.copy_(ranks);
@@ -192,7 +186,7 @@ __global__ void pick_replica_kernel_ok(
     i64 pick = -1;
     for (int r = 0; r < rnum; ++r) {
       i64 phys = l2p[e * (i64)Rmax + r];
-      int p = (int)(phys % P); // replace if you have explicit phys2rank
+      int p = (int)(phys % P); // replace if explicit phys2rank exists
       if (p == want_p) { pick = phys; break; }
     }
     chosen_replica[i] = pick;
@@ -217,9 +211,16 @@ void map_tokens_to_chosen_replica_cuda(
     const at::Tensor& topk_ids_logical, const at::Tensor& active,
     const at::Tensor& chosen_replica, at::Tensor& out_physical_ids)
 {
-  // Dense LUT on device: lut[logical] = replica
-  const i64 E = 1 + at::max(active).item<i64>();  // scalar read at end of op is OK
-  auto lut = at::full({E}, (i64)-1, topk_ids_logical.options().dtype(at::kLong));
-  lut.index_put_({active}, chosen_replica);                 // device scatter
-  out_physical_ids.copy_(lut.index(topk_ids_logical));      // device gather
+  // Build dense LUT on device: lut[logical] = replica
+  const i64 E = 1 + at::max(active).item<i64>();    // scalar read inside C++ op
+  auto opts = topk_ids_logical.options().dtype(at::kLong);
+  auto lut = at::full({E}, (i64)-1, opts);
+  // scatter: lut[active] = chosen_replica
+  lut.index_put_({active}, chosen_replica);
+
+  // gather: out = lut[topk_ids_logical]
+  auto flat_in  = topk_ids_logical.reshape({-1}).contiguous();
+  auto gathered = lut.index_select(0, flat_in);
+  auto flat_out = gathered.reshape_as(flat_in);
+  out_physical_ids.copy_(flat_out.reshape_as(topk_ids_logical));
 }
