@@ -84,6 +84,43 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "topk_group, int topk, bool renormalize, float "
       "routed_scaling_factor) -> (Tensor, Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
+
+  // -------- NEW: EPLB routing ops (CUDA) --------
+  m.def("eplb_route_greedy(Tensor rank_offsets, Tensor rank_indices, int P) -> Tensor");
+  m.impl("eplb_route_greedy", torch::kCUDA,
+         [](const at::Tensor& off, const at::Tensor& idx, int64_t P) {
+           auto n = (int)off.size(0) - 1;
+           auto chosen = at::empty({n}, off.options().dtype(at::kInt));
+           greedy_smallest_choice_first_cuda(off, idx, chosen, (int)P);
+           return chosen;
+         });
+
+  // Returns (chosen_rank:int32[n], L:int32 scalar Tensor)
+  m.def("eplb_route_exact(Tensor rank_offsets, Tensor rank_indices, int P) -> (Tensor, Tensor)");
+  m.impl("eplb_route_exact", torch::kCUDA,
+         [](const at::Tensor& off, const at::Tensor& idx, int64_t P) {
+           auto n = (int)off.size(0) - 1;
+           auto chosen = at::empty({n}, off.options().dtype(at::kInt));
+           auto L_tensor = exact_min_max_activations_cuda(off, idx, chosen, (int)P);
+           return std::make_tuple(chosen, L_tensor);
+         });
+
+  m.def("eplb_select_replica(Tensor l2p, Tensor lrc, Tensor active, Tensor chosen_rank, int P) -> Tensor");
+  m.impl("eplb_select_replica", torch::kCUDA,
+         [](const at::Tensor& l2p, const at::Tensor& lrc, const at::Tensor& active,
+            const at::Tensor& chosen_rank, int64_t P) {
+           auto chosen_rep = at::empty({active.size(0)}, l2p.options().dtype(at::kLong));
+           select_replica_on_rank_cuda(l2p, lrc, active, chosen_rank, chosen_rep, (int)P);
+           return chosen_rep;
+         });
+
+  m.def("eplb_map_tokens(Tensor topk_ids_logical, Tensor active, Tensor chosen_replica) -> Tensor");
+  m.impl("eplb_map_tokens", torch::kCUDA,
+         [](const at::Tensor& topk_ids_logical, const at::Tensor& active, const at::Tensor& chosen_replica) {
+           auto out = at::empty_like(topk_ids_logical, topk_ids_logical.options().dtype(at::kLong));
+           map_tokens_to_chosen_replica_cuda(topk_ids_logical, active, chosen_replica, out);
+           return out;
+         });
 #endif
 }
 

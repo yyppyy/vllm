@@ -34,3 +34,35 @@ bool moe_permute_unpermute_supported();
 void shuffle_rows(const torch::Tensor& input_tensor,
                   const torch::Tensor& dst2src_map,
                   torch::Tensor& output_tensor);
+
+
+// Greedy: smallest-choice-first (device-only)
+void greedy_smallest_choice_first_cuda(
+    const at::Tensor& rank_offsets,   // int32 [n+1]
+    const at::Tensor& rank_indices,   // int32 [nnz]
+    at::Tensor& chosen_rank,          // int32 [n]
+    int32_t P);
+
+// Exact: binary search on L + capacity-bounded matching (device-only CSR)
+// Returns optimal L as a Tensor scalar (int32) for graph-friendliness.
+at::Tensor exact_min_max_activations_cuda(
+    const at::Tensor& rank_offsets,
+    const at::Tensor& rank_indices,
+    at::Tensor& chosen_rank,
+    int32_t P);
+
+// Pick a physical replica that resides on chosen rank for each active expert
+void select_replica_on_rank_cuda(
+    const at::Tensor& logical_to_physical_map,  // int64 [E, Rmax], -1 padded
+    const at::Tensor& logical_replica_count,    // int32 [E]
+    const at::Tensor& active_experts,           // int64 [n]
+    const at::Tensor& chosen_rank,              // int32 [n]
+    at::Tensor& chosen_replica,                 // int64 [n]
+    int32_t P);
+
+// Map logical expert ids -> chosen physical ids, device-only (dense LUT)
+void map_tokens_to_chosen_replica_cuda(
+    const at::Tensor& topk_ids_logical,         // int64 [T,K]
+    const at::Tensor& active_experts,           // int64 [n]
+    const at::Tensor& chosen_replica,           // int64 [n]
+    at::Tensor& out_physical_ids);              // int64 [T,K]

@@ -11,6 +11,7 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -1106,78 +1107,121 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def build_active_and_csr(
+    topk_ids_logical: Tensor,
+    l2p: Tensor,          # [E, Rmax] int64 (-1 padded)
+    lrc: Tensor,          # [E] int32
+    phys2rank: Tensor | None,
+    P: int,
+):
+    act = torch.unique(topk_ids_logical.long())              # [n]
+    E, Rmax = l2p.shape
+    rows = l2p.index_select(0, act)                          # [n,Rmax]
+    rcs  = lrc.index_select(0, act).to(torch.int32)          # [n]
+    mask = torch.arange(Rmax, device=rows.device).unsqueeze(0) < rcs.unsqueeze(1)
+    phys = rows.masked_fill(~mask, -1)
+
+    if phys2rank is not None:
+        ranks = torch.where(phys >= 0,
+                            phys2rank.index_select(0, phys.clamp_min(0)),
+                            torch.full_like(phys, -1, dtype=torch.int32))
+    else:
+        ranks = torch.where(phys >= 0, (phys % P).to(torch.int32),
+                            torch.full_like(phys, -1, dtype=torch.int32))
+
+    valid = (ranks >= 0)
+    rank_indices = ranks[valid].to(torch.int32)              # [nnz]
+    counts = valid.sum(dim=1, dtype=torch.int32)             # [n]
+    rank_offsets = torch.cat([torch.zeros(1, dtype=torch.int32, device=counts.device),
+                              counts.cumsum(0)], dim=0)      # [n+1]
+    return act, rank_offsets, rank_indices
+
+def _route_exact_or_greedy_gpu(
+    algo: str,
+    topk_ids_logical: Tensor,
+    expert_load_view: Tensor,
+    l2p: Tensor,
+    lrc: Tensor,
+    indices_type=None,
+    phys2rank: Tensor | None = None,
+    P: int = 1,
+):
+    act, off, idx = build_active_and_csr(topk_ids_logical, l2p, lrc, phys2rank, P)
+    if algo == "exact":
+        chosen_rank, _L = ops.eplb_route_exact(off, idx, P)  # _L is a Tensor scalar
+    else:
+        chosen_rank = ops.eplb_route_greedy(off, idx, P)
+
+    chosen_replica = ops.eplb_select_replica(l2p, lrc, act, chosen_rank, P)
+    physical_ids = ops.eplb_map_tokens(topk_ids_logical.long(), act, chosen_replica)
+    if indices_type is not None:
+        physical_ids = physical_ids.to(dtype=indices_type)
+
+    topk_flat = physical_ids.reshape(-1)
+    expert_load_view.scatter_add_(0, topk_flat.long(), torch.ones_like(topk_flat, dtype=expert_load_view.dtype))
+    return physical_ids
+
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def eplb_map_to_physical_and_record(
-        topk_ids: torch.Tensor,
-        expert_load_view: torch.Tensor,
-        logical_to_physical_map: torch.Tensor,
-        logical_replica_count: torch.Tensor,
-        indices_type: Optional[torch.dtype] = None,
-        mem_bound_aware_routing: Optional[str] = None) -> torch.Tensor:
-    '''
-    Map the logical expert ids to physical expert ids
-    and record the expert load metrics.
-
-    This will select a pseudo-random replica for each logical expert.
-    Only used for EPLB.
-
-    Args:
-        topk_ids: The logical expert ids.
-        expert_load_view: The expert load view.
-        logical_to_physical_map: The logical to physical map.
-        logical_replica_count: The logical replica count.
-        indices_type: The indices type.
+    topk_ids: torch.Tensor,
+    expert_load_view: torch.Tensor,
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+    indices_type: Optional[torch.dtype] = None,
+    mem_bound_aware_routing: str | None = None,   # 'exact' | 'greedy' | None
+    # new knobs:
+    routing_small_batch_threshold: int = 1024,    # if T > threshold => original routing
+    phys2rank: torch.Tensor | None = None,        # [num_phys], optional explicit mapping
+    P_hint: int | None = None,                    # if None, infer from l2p (linear phys%P assumed)
+):
+    """
+    Logic:
+    - If num_tokens (T = topk_ids.shape[0]) > routing_small_batch_threshold:
+            use ORIGINAL vLLM replica selection (modulo pattern) exactly as before.
+    - Else if mem_bound_aware_routing == 'exact' or 'greedy':
+            run the corresponding GPU router.
+    - Else:
+            fallback to ORIGINAL vLLM routing.
 
     Returns:
-        The physical expert ids.
-    '''
+        physical_ids: Tensor same shape as topk_ids with physical expert ids (dtype indices_type if provided)
+    """
+    T = int(topk_ids.shape[0])  # Python int
+    P = int(P_hint if P_hint is not None else max(1, int(logical_to_physical_map.size(1))))
 
-    # 1. Convert the logical expert ids to physical expert ids
-    # Directly select a random replica for each logical expert
+    if T > routing_small_batch_threshold or mem_bound_aware_routing is None:
+        # Original vLLM modulo routing (unchanged)
+        topk_ids_long = topk_ids.long()
+        replica_count = logical_replica_count[topk_ids_long]
+        pos_indices = torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.long).reshape_as(topk_ids)
+        replica_indices = (pos_indices % replica_count).unsqueeze(-1)
+        physical_ids = logical_to_physical_map[topk_ids_long].gather(-1, replica_indices).squeeze(-1)
 
-    # In case `indices_type` is not `torch.long` or `torch.int`,
-    # e.g. `torch.uint32` as required by dispatch/combine kernels
+        topk_flat = physical_ids.reshape(-1)
+        expert_load_view.scatter_add_(0, topk_flat.long(), torch.ones_like(topk_flat, dtype=expert_load_view.dtype))
+        if indices_type is not None:
+            physical_ids = physical_ids.to(dtype=indices_type)
+        return physical_ids
+
+    algo = mem_bound_aware_routing.lower()
+    if algo in ("exact", "greedy"):
+        return _route_exact_or_greedy_gpu(
+            algo, topk_ids, expert_load_view,
+            logical_to_physical_map, logical_replica_count,
+            indices_type=indices_type, phys2rank=phys2rank, P=P
+        )
+
+    # Fallback
     topk_ids_long = topk_ids.long()
-    # Use (token position) modulo (replica count)
-    # to deterministically choose a replica
     replica_count = logical_replica_count[topk_ids_long]
-    # Flatten-position based index, reshaped back to `topk_ids` shape
-    pos_indices = torch.arange(topk_ids.numel(),
-                               device=topk_ids.device,
-                               dtype=torch.long).reshape_as(topk_ids)
-    # Compute pseudo-random indices by modulo
+    pos_indices = torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.long).reshape_as(topk_ids)
     replica_indices = (pos_indices % replica_count).unsqueeze(-1)
-    physical_ids = logical_to_physical_map[topk_ids_long].gather(
-        -1, replica_indices).squeeze(-1)
-
-    topk_ids = physical_ids
-
-    # 2. Record expert load metrics.
-
-    # TODO(bowen): When using `FusedMoEModularKernel`, this
-    # can be done in a more unified way, since
-    # `FusedMoEPrepareAndFinalize` will return the expert
-    # token count, in some cases directly from the kernel.
-    # However, now there are many code paths not using
-    # the modular kernel, e.g. calling `fused_experts`,
-    # so we decide to keep the logic here.
-    #
-    # If later refactor moved all the MoE kernel calls
-    # to the modular kernel, we can move this logic there
-    # to achieve better efficiency.
-
-    # `expert_load_view`: (num_physical_experts,)
-
-    # `torch.bincount` is not compilable, so use `scatter_add_` instead.
-    topk_ids_flatten = topk_ids.flatten()
-    expert_load_view.scatter_add_(
-        dim=0,
-        index=topk_ids_flatten.long(),
-        src=torch.ones_like(topk_ids_flatten).to(expert_load_view))
-
+    physical_ids = logical_to_physical_map[topk_ids_long].gather(-1, replica_indices).squeeze(-1)
+    topk_flat = physical_ids.reshape(-1)
+    expert_load_view.scatter_add_(0, topk_flat.long(), torch.ones_like(topk_flat, dtype=expert_load_view.dtype))
     if indices_type is not None:
-        topk_ids = topk_ids.to(dtype=indices_type)
-    return topk_ids
+        physical_ids = physical_ids.to(dtype=indices_type)
+    return physical_ids
 
 
 def fused_grouped_topk(
