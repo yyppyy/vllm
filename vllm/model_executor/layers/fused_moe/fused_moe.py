@@ -1134,7 +1134,7 @@ def build_active_and_csr(
     counts = valid.sum(dim=1, dtype=torch.int32)
     rank_offsets = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=counts.device),
-        counts.cumsum(0)],
+        counts.cumsum(0, dtype=torch.int32)],
         dim=0,
     ).contiguous()
     return act, rank_offsets, rank_indices
