@@ -1148,12 +1148,12 @@ def _route_exact_or_greedy_gpu(
 ):
     act, off, idx = build_active_and_csr(topk_ids_logical, l2p, lrc, phys2rank, P)
     if algo == "exact":
-        chosen_rank, _L = ops.eplb_route_exact(off, idx, P)  # _L is a Tensor scalar
+        chosen_rank, _L = torch.ops._moe_C.eplb_route_exact(off, idx, P)  # _L is a Tensor scalar
     else:
-        chosen_rank = ops.eplb_route_greedy(off, idx, P)
+        chosen_rank = torch.ops._moe_C.eplb_route_greedy(off, idx, P)
 
-    chosen_replica = ops.eplb_select_replica(l2p, lrc, act, chosen_rank, P)
-    physical_ids = ops.eplb_map_tokens(topk_ids_logical.long(), act, chosen_replica)
+    chosen_replica = torch.ops._moe_C.eplb_select_replica(l2p, lrc, act, chosen_rank, P)
+    physical_ids = torch.ops._moe_C.eplb_map_tokens(topk_ids_logical.long(), act, chosen_replica)
     if indices_type is not None:
         physical_ids = physical_ids.to(dtype=indices_type)
 
