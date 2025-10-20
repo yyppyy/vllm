@@ -4,12 +4,14 @@ import json
 import re
 from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
+import numpy as np
 
 import matplotlib.pyplot as plt
 
 # Filename pattern: bench_result_${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}.json
 FILENAME_RE = re.compile(
-    r"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_(?P<batch_size>\d+)\.json$"
+    r"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_(?P<batch_size>\d+)_0_0\.json$"
 )
 
 METRICS = [
@@ -91,54 +93,67 @@ def load_results(results_dir, filters):
 def plot_group(group_key, rep_to_bsdata, outdir):
     """
     For a specific (num_gpus, ep_degree) group, plot each metric vs BATCH_SIZE.
-    Each NUM_REPLICAS value becomes a separate line.
+    Each NUM_REPLICAS value becomes a separate bar within each BATCH_SIZE group.
+    Saves both PNG and PDF.
     """
     num_gpus, ep_degree = group_key
-
-    # Skip empty groups
     if not rep_to_bsdata:
         return
 
-    # One plot per metric
+    # All batch sizes across replicas (union)
+    all_batch_sizes = sorted({bs for d in rep_to_bsdata.values() for bs in d.keys()})
+    if not all_batch_sizes:
+        return
+
+    reps = sorted(rep_to_bsdata.keys())
+    x = np.arange(len(all_batch_sizes), dtype=float)
+
+    total_width = 0.8
+    n_rep = max(1, len(reps))
+    bar_w = total_width / n_rep
+    # center bars around tick
+    offsets = (-total_width / 2) + (np.arange(n_rep) + 0.5) * bar_w
+
     for metric in METRICS:
         plt.figure()
 
-        # Plot one line per num_replicas
-        for rep, bs_to_data in sorted(rep_to_bsdata.items()):
-            if not bs_to_data:
-                continue
-            batch_sizes = sorted(bs_to_data.keys())
-            y = [bs_to_data[bs].get(metric, float("nan")) for bs in batch_sizes]
-            plt.plot(batch_sizes, y, marker="o", label=f"NUM_REPLICAS={rep}")
+        for i, rep in enumerate(reps):
+            bs_to_data = rep_to_bsdata.get(rep, {})
+            heights = []
+            for bs in all_batch_sizes:
+                v = bs_to_data.get(bs, {}).get(metric, float("nan"))
+                heights.append(v)
+            heights = np.array(heights, dtype=float)
+
+            # Draw bars; NaNs will be skipped by matplotlib
+            plt.bar(x + offsets[i], heights, width=bar_w, label=f"NUM_REPLICAS={rep}")
 
         plt.xlabel("BATCH_SIZE")
         plt.ylabel(metric)
-        plt.title(
-            f"{metric} vs BATCH_SIZE\n"
-            f"NUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}"
-        )
-        plt.grid(True, linestyle="--", alpha=0.4)
-        plt.legend(title="Replica lines", frameon=False)
-
-        outpath = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}.png"
-        outpath.parent.mkdir(parents=True, exist_ok=True)
+        plt.title(f"{metric} vs BATCH_SIZE\nNUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}")
+        plt.xticks(x, all_batch_sizes, rotation=0)
+        plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+        plt.legend(title="Replicas", frameon=False)
         plt.tight_layout()
-        plt.savefig(outpath, dpi=150)
+
+        base = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}"
+        base.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(f"{base}.pdf")
         plt.close()
 
 def main():
     ap = argparse.ArgumentParser(description="Plot vLLM benchmark JSONs vs BATCH_SIZE, one line per NUM_REPLICAS.")
-    ap.add_argument("--results-dir", type=str, required=True,
+    ap.add_argument("--results-dir", type=str, default='../results',
                     help="Directory containing bench_result_*.json files")
-    ap.add_argument("--output-dir", type=str, default="plots",
+    ap.add_argument("--output-dir", type=str, default=".",
                     help="Where to save figures (default: plots)")
-    ap.add_argument("--num-gpus", type=str, default="",
+    ap.add_argument("--num-gpus", type=str, default="8",
                     help='Filter NUM_GPUS (e.g. "2,4" or "2..8:2"); empty = all')
-    ap.add_argument("--ep-degree", type=str, default="",
+    ap.add_argument("--ep-degree", type=str, default="8",
                     help='Filter EP_DEGREE (e.g. "1,2,4"); empty = all')
-    ap.add_argument("--num-replicas", type=str, default="",
+    ap.add_argument("--num-replicas", type=str, default="0,32,64",
                     help='Filter NUM_REPLICAS lines to include (e.g. "0,1,2"); empty = all')
-    ap.add_argument("--batch-size", type=str, default="",
+    ap.add_argument("--batch-size", type=str, default="16",
                     help='Filter BATCH_SIZE (e.g. "256,512,1024" or "256..4096:256"); empty = all')
     args = ap.parse_args()
 
