@@ -1114,7 +1114,14 @@ def build_active_and_csr(
     phys2rank: Tensor | None,
     P: int,
 ):
-    act = torch.unique(topk_ids_logical.long())                   # [n] long
+    # New (capture-friendly): sort + dedup
+    flat = topk_ids_logical.reshape(-1).to(dtype=torch.long)
+    s, _ = torch.sort(flat)                      # [T*K]
+    # keep first occurrence of each run
+    keep = torch.ones_like(s, dtype=torch.bool)
+    keep[1:] = s[1:] != s[:-1]
+    act = s[keep]                                # [n] unique, sorted
+    
     E, Rmax = l2p.shape
     rows = l2p.index_select(0, act)                               # [n,Rmax] long
     rcs  = lrc.index_select(0, act).to(torch.long)                # [n] long
