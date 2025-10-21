@@ -34,7 +34,8 @@ __global__ void greedy_kernel(
         i64 l = __ldg(rank_loads + p);
         if (l < best_l || (l == best_l && p < best_p)) { best_l = l; best_p = p; }
       }
-      if (attempt == 3) { atomicAdd(rank_loads + best_p, (i64)1); chosen[e] = best_p; }
+      if (attempt == 3) { atomicAdd(reinterpret_cast<unsigned long long*>(rank_loads + best_p),
+          static_cast<unsigned long long>(1)); chosen[e] = best_p; }
     }
   }
 }
