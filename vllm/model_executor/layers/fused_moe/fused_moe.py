@@ -1108,34 +1108,39 @@ def grouped_topk(
 
 
 def build_active_and_csr(
-    topk_ids_logical: Tensor,
-    l2p: Tensor,          # [E, Rmax] int64 (-1 padded)
-    lrc: Tensor,          # [E] int32
+    topk_ids_logical: Tensor,   # [T,K] long
+    l2p: Tensor,                # [E, Rmax] long (-1 padded)
+    lrc: Tensor,                # [E] long
     phys2rank: Tensor | None,
     P: int,
 ):
-    act = torch.unique(topk_ids_logical.long())              # [n]
+    act = torch.unique(topk_ids_logical.long())                   # [n] long
     E, Rmax = l2p.shape
-    rows = l2p.index_select(0, act)                          # [n,Rmax]
-    rcs  = lrc.index_select(0, act).to(torch.int32)          # [n]
-    mask = torch.arange(Rmax, device=rows.device).unsqueeze(0) < rcs.unsqueeze(1)
+    rows = l2p.index_select(0, act)                               # [n,Rmax] long
+    rcs  = lrc.index_select(0, act).to(torch.long)                # [n] long
+    mask = torch.arange(Rmax, device=rows.device, dtype=torch.long).unsqueeze(0) < rcs.unsqueeze(1)
     phys = rows.masked_fill(~mask, -1)
 
     if phys2rank is not None:
-        ranks = torch.where(phys >= 0,
-                            phys2rank.index_select(0, phys.clamp_min(0)),
-                            torch.full_like(phys, -1, dtype=torch.int32))
+        ranks = torch.where(
+            phys >= 0,
+            phys2rank.index_select(0, phys.clamp_min(0)),
+            torch.full_like(phys, -1, dtype=torch.long),
+        )
     else:
-        ranks = torch.where(phys >= 0, (phys % P).to(torch.int32),
-                            torch.full_like(phys, -1, dtype=torch.int32))
+        ranks = torch.where(
+            phys >= 0,
+            (phys % P).to(torch.long),
+            torch.full_like(phys, -1, dtype=torch.long),
+        )
 
     valid = (ranks >= 0)
-    rank_indices = ranks[valid].to(torch.int32).contiguous()
-    counts = valid.sum(dim=1, dtype=torch.int32)
+    rank_indices = ranks[valid].to(torch.long).contiguous()       # [nnz] long
+    counts = valid.sum(dim=1, dtype=torch.long)                   # [n] long
 
-    rank_offsets = torch.empty(counts.numel() + 1, dtype=torch.int32, device=counts.device)
+    rank_offsets = torch.empty(counts.numel() + 1, dtype=torch.long, device=counts.device)
     rank_offsets[0] = 0
-    torch.cumsum(counts, dim=0, out=rank_offsets[1:])  # stays int32 end-to-end
+    torch.cumsum(counts, dim=0, out=rank_offsets[1:])             # [n+1] long
     return act, rank_offsets, rank_indices
 
 def _route_exact_or_greedy_gpu(
@@ -1154,6 +1159,7 @@ def _route_exact_or_greedy_gpu(
     else:
         chosen_rank = torch.ops._moe_C.eplb_route_greedy(off, idx, int(P))
 
+    # all long
     chosen_replica = torch.ops._moe_C.eplb_select_replica(l2p, lrc, act, chosen_rank, P)
     physical_ids = torch.ops._moe_C.eplb_map_tokens(topk_ids_logical.long(), act, chosen_replica)
     if indices_type is not None:
@@ -1167,34 +1173,20 @@ def _route_exact_or_greedy_gpu(
 def eplb_map_to_physical_and_record(
     topk_ids: torch.Tensor,
     expert_load_view: torch.Tensor,
-    logical_to_physical_map: torch.Tensor,
-    logical_replica_count: torch.Tensor,
-    indices_type: Optional[torch.dtype] = None,
-    mem_bound_aware_routing: str | None = None,   # 'exact' | 'greedy' | None
-    # new knobs:
-    routing_small_batch_threshold: int = 1024,    # if T > threshold => original routing
-    phys2rank: torch.Tensor | None = None,        # [num_phys], optional explicit mapping
-    P_hint: int | None = None,                    # if None, infer from l2p (linear phys%P assumed)
+    logical_to_physical_map: torch.Tensor,  # long
+    logical_replica_count: torch.Tensor,    # long
+    indices_type: torch.dtype | None = None,
+    mem_bound_aware_routing: str | None = None,
+    routing_small_batch_threshold: int = 1024,
+    phys2rank: torch.Tensor | None = None,
+    P_hint: int | None = None,
 ):
-    """
-    Logic:
-    - If num_tokens (T = topk_ids.shape[0]) > routing_small_batch_threshold:
-            use ORIGINAL vLLM replica selection (modulo pattern) exactly as before.
-    - Else if mem_bound_aware_routing == 'exact' or 'greedy':
-            run the corresponding GPU router.
-    - Else:
-            fallback to ORIGINAL vLLM routing.
-
-    Returns:
-        physical_ids: Tensor same shape as topk_ids with physical expert ids (dtype indices_type if provided)
-    """
-    T = int(topk_ids.shape[0])  # Python int
+    T = int(topk_ids.shape[0])
     P = int(P_hint if P_hint is not None else max(1, int(logical_to_physical_map.size(1))))
 
     if T > routing_small_batch_threshold or mem_bound_aware_routing is None:
-        # Original vLLM modulo routing (unchanged)
         topk_ids_long = topk_ids.long()
-        replica_count = logical_replica_count[topk_ids_long]
+        replica_count = logical_replica_count[topk_ids_long]  # long
         pos_indices = torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.long).reshape_as(topk_ids)
         replica_indices = (pos_indices % replica_count).unsqueeze(-1)
         physical_ids = logical_to_physical_map[topk_ids_long].gather(-1, replica_indices).squeeze(-1)
@@ -1213,7 +1205,7 @@ def eplb_map_to_physical_and_record(
             indices_type=indices_type, phys2rank=phys2rank, P=P
         )
 
-    # Fallback
+    # Fallback (same as large-T path)
     topk_ids_long = topk_ids.long()
     replica_count = logical_replica_count[topk_ids_long]
     pos_indices = torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.long).reshape_as(topk_ids)
