@@ -1,7 +1,9 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-using i64 = long long;
+#include <cstdint>
+
+using i64 = int64_t;
 
 #define CUDA_CHECK(expr) do { auto _e = (expr); if (_e != cudaSuccess) { printf("CUDA error %s @ %s:%d\n", cudaGetErrorString(_e), __FILE__, __LINE__); asm("trap;"); } } while(0)
 
@@ -54,7 +56,7 @@ void greedy_smallest_choice_first_cuda(
   const int blocks  = launch_blocks_1d(n, threads);
   auto stream = at::cuda::getCurrentCUDAStream();
   greedy_kernel<<<blocks, threads, 0, stream>>>(
-      off.data_ptr<i64>(), idx.data_ptr<i64>(), chosen.data_ptr<i64>(), loads.data_ptr<i64>(), n);
+      static_cast<const i64*>(off.data_ptr()), static_cast<const i64*>(idx.data_ptr()), static_cast<i64*>(chosen.data_ptr()), static_cast<i64*>(loads.data_ptr()), n);
 }
 
 // --------------- Exact (all int64) ---------------
@@ -113,7 +115,7 @@ static void device_build_e2slot_csr(const at::Tensor& off, const at::Tensor& idx
   const int blocks  = launch_blocks_1d(n, threads);
 
   auto degL = at::empty({n}, opts_i64);
-  build_slot_degrees_kernel<<<blocks, threads, 0, stream>>>(off.data_ptr<i64>(), degL.data_ptr<i64>(), n, L);
+  build_slot_degrees_kernel<<<blocks, threads, 0, stream>>>(static_cast<const i64*>(off.data_ptr()), static_cast<i64*>(degL.data_ptr()), n, L);
 
   // slot_off = cat([0], cumsum(degL))  // all long
   slot_off = at::cat({at::zeros({1}, opts_i64), degL.cumsum(0)}, 0);
@@ -121,7 +123,7 @@ static void device_build_e2slot_csr(const at::Tensor& off, const at::Tensor& idx
 
   slot_idx = at::empty({nnzL}, opts_i64);
   expand_e2slot_kernel<<<blocks, threads, 0, stream>>>(
-      off.data_ptr<i64>(), idx.data_ptr<i64>(), slot_off.data_ptr<i64>(), slot_idx.data_ptr<i64>(), n, L);
+      static_cast<const i64*>(off.data_ptr()), static_cast<const i64*>(idx.data_ptr()), static_cast<const i64*>(slot_off.data_ptr()), static_cast<i64*>(slot_idx.data_ptr()), n, L);
 }
 
 at::Tensor exact_min_max_activations_cuda(
@@ -151,9 +153,9 @@ at::Tensor exact_min_max_activations_cuda(
     pairV = at::full({Vslots}, (i64)-1, opts_i64);
 
     for (int k = 0; k < HK_ITERS; ++k) {
-      try_match_kernel<<<blocksU, threads, 0, stream>>>(e_off.data_ptr<i64>(), e_idx.data_ptr<i64>(),
-                                                        pairU.data_ptr<i64>(), pairV.data_ptr<i64>(), n);
-      clear_if_conflict_kernel<<<blocksU, threads, 0, stream>>>(pairU.data_ptr<i64>(), pairV.data_ptr<i64>(), n);
+      try_match_kernel<<<blocksU, threads, 0, stream>>>(static_cast<const i64*>(e_off.data_ptr()), static_cast<const i64*>(e_idx.data_ptr()),
+                                                        static_cast<i64*>(pairU.data_ptr()), static_cast<i64*>(pairV.data_ptr()), n);
+      clear_if_conflict_kernel<<<blocksU, threads, 0, stream>>>( static_cast<i64*>(pairU.data_ptr()), static_cast<i64*>(pairV.data_ptr()), n);
     }
 
     auto matched_t = (pairU != -1).sum();        // long scalar
@@ -162,7 +164,7 @@ at::Tensor exact_min_max_activations_cuda(
     if (matched == n) {
       best = mid; high = mid - 1;
       ranks = at::empty_like(chosen_rank);
-      fill_ranks_from_slots_kernel<<<blocksU, threads, 0, stream>>>(pairU.data_ptr<i64>(), ranks.data_ptr<i64>(), n, mid);
+      fill_ranks_from_slots_kernel<<<blocksU, threads, 0, stream>>>(static_cast<const i64*>(pairU.data_ptr()) , static_cast<i64*>(ranks.data_ptr()) , n, mid);
       chosen_rank.copy_(ranks);
     } else {
       low = mid + 1;
@@ -201,8 +203,8 @@ void select_replica_on_rank_cuda(
   const int blocks  = launch_blocks_1d(n, threads);
   auto stream = at::cuda::getCurrentCUDAStream();
   pick_replica_kernel_ok<<<blocks, threads, 0, stream>>>(
-      l2p.data_ptr<i64>(), lrc.data_ptr<i64>(), active.data_ptr<i64>(),
-      chosen_rank.data_ptr<i64>(), chosen_replica.data_ptr<i64>(),
+      static_cast<const i64*>(l2p.data_ptr()), static_cast<const i64*>(lrc.data_ptr()), static_cast<const i64*>(active.data_ptr()),
+      static_cast<const i64*>(chosen_rank.data_ptr()), static_cast<i64*>(chosen_replica.data_ptr()),
       n, (i64)l2p.size(1), P);
 }
 
