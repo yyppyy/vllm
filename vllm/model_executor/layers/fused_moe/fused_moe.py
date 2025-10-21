@@ -1132,11 +1132,10 @@ def build_active_and_csr(
     valid = (ranks >= 0)
     rank_indices = ranks[valid].to(torch.int32).contiguous()
     counts = valid.sum(dim=1, dtype=torch.int32)
-    rank_offsets = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=counts.device),
-        counts.cumsum(0, dtype=torch.int32)],
-        dim=0,
-    ).contiguous()
+
+    rank_offsets = torch.empty(counts.numel() + 1, dtype=torch.int32, device=counts.device)
+    rank_offsets[0] = 0
+    torch.cumsum(counts, dim=0, out=rank_offsets[1:])  # stays int32 end-to-end
     return act, rank_offsets, rank_indices
 
 def _route_exact_or_greedy_gpu(
