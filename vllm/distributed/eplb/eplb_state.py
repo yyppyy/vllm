@@ -249,6 +249,7 @@ class EplbState:
             (model.num_logical_experts, max_slots_per_logical_expert),
             -1,
             device=device,
+            dtype=torch.int32,
         )
         logical_replica_count = torch.zeros(
             (model.num_logical_experts, ),

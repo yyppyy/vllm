@@ -46,6 +46,84 @@ import vllm.utils
 
 logger = init_logger(__name__)
 
+class RouterWS:
+
+    def __init__(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+        max_tokens: int = 65536,
+        max_topk: int = 16,
+        max_logical_experts: int = 8192,
+        max_slots_per_logical: int = 1056,
+        max_physical_experts: int = 16384,
+        ep_size: int = 1,
+        physical_experts_per_rank: int = 1,
+    ) -> None:
+        if device is None:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "RouterWS requires a CUDA device for mem-bound routing.")
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.device = torch.device(device)
+        self.max_tokens = max_tokens
+        self.max_topk = max_topk
+        self.max_pairs = max_tokens * max_topk
+        self.max_logical_experts = max_logical_experts
+        self.max_slots_per_logical = max_slots_per_logical
+        self.max_physical_experts = max(max_physical_experts,
+                                        physical_experts_per_rank * max(1,
+                                                                        ep_size))
+        self.ep_size = max(1, ep_size)
+        self.physical_experts_per_rank = max(1, physical_experts_per_rank)
+
+        self.logical_ids_flat = torch.empty(self.max_pairs,
+                                            dtype=torch.int32,
+                                            device=self.device)
+        self.physical_ids_flat = torch.empty_like(self.logical_ids_flat)
+        self.physical_token_counts = torch.empty(self.max_physical_experts,
+                                                 dtype=torch.int32,
+                                                 device=self.device)
+        self.rank_active_counts = torch.empty(self.ep_size,
+                                              dtype=torch.int32,
+                                              device=self.device)
+        self.physical_active = torch.empty(self.max_physical_experts,
+                                           dtype=torch.uint8,
+                                           device=self.device)
+
+    def can_support(self, topk_ids: torch.Tensor,
+                    logical_to_physical_map: torch.Tensor) -> bool:
+        if topk_ids.device != self.device:
+            return False
+        if logical_to_physical_map.device != self.device:
+            return False
+        if not logical_to_physical_map.is_contiguous():
+            return False
+        if topk_ids.dtype != torch.int32:
+            return False
+        if logical_to_physical_map.dtype != torch.int32:
+            return False
+        if logical_to_physical_map.size(0) > self.max_logical_experts:
+            return False
+        if logical_to_physical_map.size(1) > self.max_slots_per_logical:
+            return False
+        if topk_ids.dim() != 2:
+            return False
+        num_tokens, topk = topk_ids.shape
+        if num_tokens > self.max_tokens:
+            return False
+        if topk > self.max_topk:
+            return False
+        if topk_ids.is_contiguous(memory_format=torch.contiguous_format):
+            return True
+        # Require contiguous storage to avoid extra allocations.
+        return False
+
+    def flatten_logical_ids(self, num_pairs: int) -> torch.Tensor:
+        return self.logical_ids_flat.narrow(0, 0, num_pairs)
+
+    def flatten_physical_ids(self, num_pairs: int) -> torch.Tensor:
+        return self.physical_ids_flat.narrow(0, 0, num_pairs)
 
 @triton.jit
 def write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N, offs_token,
@@ -1113,7 +1191,8 @@ def eplb_map_to_physical_and_record(
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         indices_type: Optional[torch.dtype] = None,
-        mem_bound_aware_routing: Optional[str] = None) -> torch.Tensor:
+        mem_bound_aware_routing: Optional[str] = None,
+        router_ws: Optional[RouterWS] = None) -> torch.Tensor:
     '''
     Map the logical expert ids to physical expert ids
     and record the expert load metrics.
@@ -1137,20 +1216,44 @@ def eplb_map_to_physical_and_record(
 
     # In case `indices_type` is not `torch.long` or `torch.int`,
     # e.g. `torch.uint32` as required by dispatch/combine kernels
-    topk_ids_long = topk_ids.long()
-    # Use (token position) modulo (replica count)
-    # to deterministically choose a replica
-    replica_count = logical_replica_count[topk_ids_long]
-    # Flatten-position based index, reshaped back to `topk_ids` shape
-    pos_indices = torch.arange(topk_ids.numel(),
-                               device=topk_ids.device,
-                               dtype=torch.long).reshape_as(topk_ids)
-    # Compute pseudo-random indices by modulo
-    replica_indices = (pos_indices % replica_count).unsqueeze(-1)
-    physical_ids = logical_to_physical_map[topk_ids_long].gather(
-        -1, replica_indices).squeeze(-1)
+    greedy_used = False
+    if mem_bound_aware_routing == "greedy":
+        num_pairs = topk_ids.numel()
+        if (num_pairs > 0 and router_ws.can_support(
+                topk_ids, logical_to_physical_map)
+                and logical_replica_count.is_contiguous()
+                and logical_replica_count.dtype == torch.int64):
+            logical_buffer = router_ws.flatten_logical_ids(num_pairs)
+            physical_buffer = router_ws.flatten_physical_ids(num_pairs)
+            logical_buffer.copy_(topk_ids.reshape(-1))
+            ops.mem_bound_router_greedy(
+                logical_buffer,
+                logical_to_physical_map,
+                logical_replica_count,
+                physical_buffer,
+                router_ws.physical_token_counts,
+                router_ws.rank_active_counts,
+                router_ws.physical_active,
+                router_ws.physical_experts_per_rank,
+                router_ws.ep_size)
+            topk_ids = physical_buffer.view_as(topk_ids)
+            greedy_used = True
 
-    topk_ids = physical_ids
+    if not greedy_used:
+        topk_ids_long = topk_ids.long()
+        # Use (token position) modulo (replica count)
+        # to deterministically choose a replica
+        replica_count = logical_replica_count[topk_ids_long]
+        # Flatten-position based index, reshaped back to `topk_ids` shape
+        pos_indices = torch.arange(topk_ids.numel(),
+                                   device=topk_ids.device,
+                                   dtype=torch.long).reshape_as(topk_ids)
+        # Compute pseudo-random indices by modulo
+        replica_indices = (pos_indices % replica_count).unsqueeze(-1)
+        physical_ids = logical_to_physical_map[topk_ids_long].gather(
+            -1, replica_indices).squeeze(-1)
+
+        topk_ids = physical_ids
 
     # 2. Record expert load metrics.
 

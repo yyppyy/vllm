@@ -84,6 +84,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "topk_group, int topk, bool renormalize, float "
       "routed_scaling_factor) -> (Tensor, Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
+
+  m.def(
+      "mem_bound_router_greedy(Tensor logical_ids, Tensor logical_to_physical_map, "
+      "Tensor logical_replica_count, Tensor! output, Tensor! physical_token_counts, "
+      "Tensor! rank_active_counts, Tensor! physical_active, int physical_experts_per_rank, "
+      "int ep_size) -> ()");
+  m.impl("mem_bound_router_greedy", torch::kCUDA, &mem_bound_router_greedy);
 #endif
 }
 

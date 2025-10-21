@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG, FusedMoEConfig, FusedMoEParallelConfig,
     FusedMoEQuantConfig, biased_moe_quant_config)
 from vllm.model_executor.layers.fused_moe.fused_moe import (
-    zero_experts_compute_triton)
+    zero_experts_compute_triton, RouterWS)
 # yapf: enable
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat, FusedMoEModularKernel,
@@ -67,7 +67,9 @@ else:
             topk_ids: torch.Tensor, expert_load_view: torch.Tensor,
             logical_to_physical_map: torch.Tensor,
             logical_replica_count: torch.Tensor,
-            indices_type: Optional[torch.dtype]) -> torch.Tensor:
+            indices_type: Optional[torch.dtype],
+            mem_bound_aware_routing: Optional[str] = None,
+            router_ws: Optional[RouterWS] = None) -> torch.Tensor:
         # CPU fallback: no EPLB so just return as is
         return topk_ids
 
@@ -335,6 +337,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     "FlashInfer CUTLASS MoE is currently not available for DP."
                 )
             self.flashinfer_cutlass_moe = None  # type: ignore
+        vllm_config = get_current_vllm_config()
+        parallel_cfg = vllm_config.parallel_config
+        redundant_experts = (
+            parallel_cfg.eplb_config.num_redundant_experts
+            if parallel_cfg.eplb_config is not None else 0)
+        expected_physical_experts = moe.num_experts + redundant_experts
+        ep_size = max(1, self.moe.moe_parallel_config.ep_size)
+        physical_per_rank = max(
+            expected_physical_experts // ep_size if ep_size > 0 else
+            expected_physical_experts, 1)
+        self.router_ws = RouterWS(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            max_tokens=4096,
+            max_topk=8,
+            max_logical_experts=128,
+            max_slots_per_logical=2,
+            max_physical_experts=256,
+            ep_size=ep_size,
+            physical_experts_per_rank=physical_per_rank)
 
     def maybe_make_prepare_finalize(
             self) -> Optional[FusedMoEPrepareAndFinalize]:
@@ -577,7 +598,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             global_num_experts=global_num_experts,
             zero_expert_num=zero_expert_num,
             zero_expert_type=zero_expert_type,
-            mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing)
+            mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing,
+            router_ws=self.router_ws)
 
         record_topk_for_batch(
             ep_rank=self.moe.moe_parallel_config.ep_rank,
@@ -1686,7 +1708,8 @@ class FusedMoE(CustomOp):
         global_num_experts: Optional[int] = None,
         zero_expert_num: Optional[int] = None,
         zero_expert_type: Optional[str] = None,
-        mem_bound_aware_routing: Optional[str] = None
+        mem_bound_aware_routing: Optional[str] = None,
+        router_ws: Optional[RouterWS] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -1768,7 +1791,8 @@ class FusedMoE(CustomOp):
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
                 indices_type=indices_type,
-                mem_bound_aware_routing=mem_bound_aware_routing
+                mem_bound_aware_routing=mem_bound_aware_routing,
+                router_ws=router_ws
             )
 
         assert topk_ids.dtype == indices_type or indices_type is None

@@ -13,6 +13,16 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           torch::Tensor experts_ids,
                           torch::Tensor num_tokens_post_pad);
 #ifndef USE_ROCM
+void mem_bound_router_greedy(torch::Tensor logical_ids,
+                             torch::Tensor logical_to_physical_map,
+                             torch::Tensor logical_replica_count,
+                             torch::Tensor output,
+                             torch::Tensor physical_token_counts,
+                             torch::Tensor rank_active_counts,
+                             torch::Tensor physical_active,
+                             int64_t physical_experts_per_rank,
+                             int64_t ep_size);
+
 torch::Tensor moe_wna16_gemm(torch::Tensor input, torch::Tensor output,
                              torch::Tensor b_qweight, torch::Tensor b_scales,
                              std::optional<torch::Tensor> b_qzeros,
