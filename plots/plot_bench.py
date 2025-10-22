@@ -21,6 +21,14 @@ METRICS = [
     "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
 ]
 
+def metric_to_ylabel(metric):
+    if 'ms' in metric:
+        return ' '.join(metric.split('_')[:-1]) + ' (ms)'
+    elif metric == 'total_token_throughput':
+        return 'Throughput (tokens/s)'
+    else:
+        raise RuntimeError('unsupported metric')
+
 def parse_list(arg):
     """
     Accepts values like:
@@ -115,7 +123,7 @@ def plot_group(group_key, rep_to_bsdata, outdir):
     offsets = (-total_width / 2) + (np.arange(n_rep) + 0.5) * bar_w
 
     for metric in METRICS:
-        plt.figure()
+        plt.figure(figsize=(3, 5))
 
         for i, rep in enumerate(reps):
             bs_to_data = rep_to_bsdata.get(rep, {})
@@ -128,10 +136,11 @@ def plot_group(group_key, rep_to_bsdata, outdir):
             # Draw bars; NaNs will be skipped by matplotlib
             plt.bar(x + offsets[i], heights, width=bar_w, label=f"NUM_REPLICAS={rep}")
 
-        plt.xlabel("BATCH_SIZE")
-        plt.ylabel(metric)
-        plt.title(f"{metric} vs BATCH_SIZE\nNUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}")
-        plt.xticks(x, all_batch_sizes, rotation=0)
+        # plt.xlabel("BATCH_SIZE")
+        plt.ylabel(metric_to_ylabel(metric))
+        # plt.title(f"{metric} vs BATCH_SIZE\nNUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}")
+        # plt.xticks(x, all_batch_sizes, rotation=0)
+        plt.xticks(x, [])
         plt.grid(True, axis="y", linestyle="--", alpha=0.4)
         plt.legend(title="Replicas", frameon=False)
         plt.tight_layout()

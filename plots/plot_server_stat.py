@@ -149,7 +149,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, y_cut, gap_ratio=0.04):
 
     # Subplots in (TOP, BOTTOM) order
     fig, (ax_top, ax_bottom) = plt.subplots(
-        2, 1, sharex=True, figsize=(8, 6),
+        2, 1, sharex=True, figsize=(5.5, 6),
         gridspec_kw={"height_ratios": [1, 2]}
     )
     fig.subplots_adjust(hspace=0.05)
@@ -183,12 +183,12 @@ def plot_group(group_key, rep_to_bsdata, outdir, y_cut, gap_ratio=0.04):
         ax_bottom.plot((1 - d, 1 + d), (1 - d, 1 + d), **kw_bot)    # bottom-right
 
     # Labels & styling
-    ax_bottom.set_xlabel("inner batch size (y)")
-    ax_bottom.set_ylabel("avg runtime (s)")
-    fig.suptitle(
-        f"Avg runtime vs inner batch size y (broken y-axis at {y_cut})\n"
-        f"NUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}, BATCH_SIZE={outer_batch_size}"
-    )
+    ax_bottom.set_xlabel("Per-GPU batch size")
+    ax_bottom.set_ylabel("batch computation time (s)")
+    # fig.suptitle(
+    #     f"Avg runtime vs inner batch size y (broken y-axis at {y_cut})\n"
+    #     f"NUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}, BATCH_SIZE={outer_batch_size}"
+    # )
     ax_bottom.set_xticks(x, all_y)
     ax_bottom.grid(True, axis="y", linestyle="--", alpha=0.4)
     if has_top:
