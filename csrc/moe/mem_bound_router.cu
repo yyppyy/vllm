@@ -2,6 +2,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 
 #include <limits>
@@ -176,7 +177,7 @@ void mem_bound_router_greedy(torch::Tensor logical_ids,
     return;
   }
 
-  at::cuda::CUDAGuard device_guard(logical_ids.device());
+  c10::cuda::CUDAGuard device_guard(logical_ids.device());
   const auto stream = at::cuda::getCurrentCUDAStream();
 
   physical_token_counts.zero_();
