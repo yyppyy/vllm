@@ -90,6 +90,7 @@ class RouterWS:
         self.physical_active = torch.empty(self.max_physical_experts,
                                            dtype=torch.uint8,
                                            device=self.device)
+        self.mem_bound_routing_token_thres = 128 * ep_size
 
     def can_support(self, topk_ids: torch.Tensor,
                     logical_to_physical_map: torch.Tensor) -> bool:
@@ -1192,8 +1193,7 @@ def eplb_map_to_physical_and_record(
         logical_replica_count: torch.Tensor,
         indices_type: Optional[torch.dtype] = None,
         mem_bound_aware_routing: Optional[str] = None,
-        router_ws: Optional[RouterWS] = None,
-        mem_bound_routing_token_thres: int = 2048) -> torch.Tensor:
+        router_ws: Optional[RouterWS] = None) -> torch.Tensor:
     '''
     Map the logical expert ids to physical expert ids
     and record the expert load metrics.
@@ -1220,7 +1220,7 @@ def eplb_map_to_physical_and_record(
     greedy_used = False
     if mem_bound_aware_routing == "greedy":
         num_pairs = topk_ids.numel()
-        if (num_pairs > 0 and topk_ids.shape[0] <= mem_bound_routing_token_thres and router_ws.can_support(
+        if (num_pairs > 0 and topk_ids.shape[0] <= router_ws.mem_bound_routing_token_thres and router_ws.can_support(
                 topk_ids, logical_to_physical_map)
                 and logical_replica_count.is_contiguous()
                 and logical_replica_count.dtype == torch.int64):
