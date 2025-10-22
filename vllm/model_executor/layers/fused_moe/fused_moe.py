@@ -1227,7 +1227,7 @@ def eplb_map_to_physical_and_record(
             logical_buffer = router_ws.flatten_logical_ids(num_pairs)
             physical_buffer = router_ws.flatten_physical_ids(num_pairs)
             logical_buffer.copy_(topk_ids.reshape(-1))
-            ops.mem_bound_router_greedy(
+            torch.ops._moe_C.mem_bound_router_greedy(
                 logical_buffer,
                 logical_to_physical_map,
                 logical_replica_count,
