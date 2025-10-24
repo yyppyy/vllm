@@ -11,120 +11,173 @@
 
 namespace {
 
+#ifndef EXPERTS_PER_THREAD
+#define EXPERTS_PER_THREAD 2
+#endif
+
+#ifndef LOCKING_THREADS
+#define LOCKING_THREADS 32
+#endif
+
+__device__ __forceinline__ void lock_acquire_block(int* m) {
+  while (atomicCAS(m, 0, 1) != 0) { /* spin */ }
+  __threadfence_block();
+}
+
+__device__ __forceinline__ void lock_release_block(int* m) {
+  __threadfence_block();
+  atomicExch(m, 0);
+}
+
 __global__ void mem_bound_router_greedy_kernel(
     const int32_t* __restrict__ logical_ids,
     int32_t* __restrict__ out_physical_ids,
     const int32_t* __restrict__ logical_to_physical,
     const int64_t* __restrict__ logical_replica_count,
-    int32_t* __restrict__ physical_token_counts,
-    int32_t* __restrict__ rank_active_counts,
-    uint8_t* __restrict__ physical_active_flags,
+    int32_t* __restrict__ physical_token_counts, // unused
+    int32_t* __restrict__ rank_active_counts,    // ignored (using shared)
+    uint8_t* __restrict__ physical_active_flags, // unused
     int64_t num_pairs,
     int64_t num_logical_experts,
     int64_t slots_per_logical,
     int32_t physical_experts_per_rank,
     int32_t ep_size,
-    int64_t physical_capacity,
-    int64_t rank_capacity) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
+    int64_t physical_capacity, // unused
+    int64_t rank_capacity) {   // unused
+  if (blockIdx.x != 0) return;
+
+  constexpr int kMaxReplica = 2;
+
+  extern __shared__ uint8_t shared_bytes[];
+  size_t off = 0;
+
+  uint8_t*  logical_active   = reinterpret_cast<uint8_t*>(shared_bytes + off);
+  off += static_cast<size_t>(num_logical_experts) * sizeof(uint8_t);
+  off = (off + 3) & ~static_cast<size_t>(3);
+
+  int32_t*  logical_selection = reinterpret_cast<int32_t*>(shared_bytes + off);
+  off += static_cast<size_t>(num_logical_experts) * sizeof(int32_t);
+  off = (off + 3) & ~static_cast<size_t>(3);
+
+  int32_t*  rank_locks       = reinterpret_cast<int32_t*>(shared_bytes + off);
+  off += static_cast<size_t>(ep_size) * sizeof(int32_t);
+  off = (off + 3) & ~static_cast<size_t>(3);
+
+  int32_t*  rank_active_counts_smem = reinterpret_cast<int32_t*>(shared_bytes + off);
+
+  for (int64_t i = threadIdx.x; i < num_logical_experts; i += blockDim.x) {
+    logical_active[i] = 0;
+    logical_selection[i] = -1;
   }
-  for (int64_t idx = 0; idx < num_pairs; ++idx) {
-    int32_t logical_id = logical_ids[idx];
-    if (logical_id < 0 || logical_id >= num_logical_experts) {
-      out_physical_ids[idx] = -1;
-      continue;
-    }
+  for (int32_t r = threadIdx.x; r < ep_size; r += blockDim.x) {
+    rank_locks[r] = 0;
+    rank_active_counts_smem[r] = 0;
+  }
+  __syncthreads();
 
-    int64_t replica_count = logical_replica_count[logical_id];
-    if (replica_count <= 0) {
-      out_physical_ids[idx] = -1;
-      continue;
-    }
-    if (replica_count > slots_per_logical) {
-      replica_count = slots_per_logical;
-    }
+  for (int64_t idx = threadIdx.x; idx < num_pairs; idx += blockDim.x) {
+    const int32_t logical_id = logical_ids[idx];
+    logical_active[logical_id] = 1;
+  }
+  __syncthreads();
 
-    int32_t best_physical = -1;
-    int32_t best_rank = 0;
-    int32_t best_rank_cost = std::numeric_limits<int32_t>::max();
-    int32_t best_token_cost = std::numeric_limits<int32_t>::max();
+  const int participating = min<int>(LOCKING_THREADS, blockDim.x);
+  const bool participates = (threadIdx.x < participating);
 
-    for (int64_t slot = 0; slot < replica_count; ++slot) {
-      const int32_t physical_id =
-          logical_to_physical[logical_id * slots_per_logical + slot];
-      if (physical_id < 0 || physical_id >= physical_capacity) {
-        continue;
-      }
+  if (participates) {
+    for (int64_t base = (num_logical_experts - 1)
+                        - (int64_t)threadIdx.x * EXPERTS_PER_THREAD;
+         base >= 0;
+         base -= (int64_t)participating * EXPERTS_PER_THREAD) {
+      #pragma unroll
+      for (int s = 0; s < EXPERTS_PER_THREAD; ++s) {
+        const int64_t logical = base - s;
+        if (logical < 0) break;
+        if (!logical_active[logical]) continue;
 
-      int32_t rank = 0;
-      if (physical_experts_per_rank > 0) {
-        rank = physical_id / physical_experts_per_rank;
-      }
-      if (rank >= ep_size) {
-        rank = ep_size - 1;
-      }
-      if (rank < 0 || rank >= rank_capacity) {
-        continue;
-      }
+        const int64_t rc_raw = logical_replica_count[logical];
+        const int32_t replica_count = (rc_raw > kMaxReplica) ? kMaxReplica : (int32_t)rc_raw;
+        if (replica_count <= 0) continue;
 
-      const int32_t rank_cost = rank_active_counts[rank];
-      const int32_t token_cost = physical_token_counts[physical_id];
-      const int32_t new_rank_cost =
-          rank_cost + (physical_active_flags[physical_id] ? 0 : 1);
+        // Gather candidates
+        int candidate_phys[kMaxReplica];
+        int candidate_rank[kMaxReplica];
+        int candidate_count = 0;
+        #pragma unroll
+        for (int i = 0; i < replica_count; ++i) {
+          const int32_t phys = logical_to_physical[logical * slots_per_logical + i];
+          const int32_t r    = phys / physical_experts_per_rank;
+          candidate_phys[candidate_count] = phys;
+          candidate_rank[candidate_count] = r;
+          ++candidate_count;
+        }
 
-      const bool is_better =
-          (new_rank_cost < best_rank_cost) ||
-          (new_rank_cost == best_rank_cost &&
-           (token_cost < best_token_cost ||
-            (token_cost == best_token_cost &&
-             (best_physical < 0 || physical_id < best_physical))));
-
-      if (is_better) {
-        best_physical = physical_id;
-        best_rank = rank;
-        best_rank_cost = new_rank_cost;
-        best_token_cost = token_cost;
-      }
-    }
-
-    if (best_physical < 0) {
-      // Fall back to the first available replica to avoid undefined behavior.
-      for (int64_t slot = 0; slot < replica_count; ++slot) {
-        const int32_t physical_id =
-            logical_to_physical[logical_id * slots_per_logical + slot];
-        if (physical_id < 0 || physical_id >= physical_capacity) {
+        // ── FAST PATH: exactly one replica -> no locking needed
+        if (replica_count == 1) {
+          const int chosen_phys = candidate_phys[0];
+          const int chosen_rank = candidate_rank[0];
+          logical_selection[logical] = chosen_phys;
+          // Atomic add in shared memory to avoid data races without locks
+          atomicAdd(&rank_active_counts_smem[chosen_rank], 1);
           continue;
         }
-        best_physical = physical_id;
-        if (physical_experts_per_rank > 0) {
-          best_rank = physical_id / physical_experts_per_rank;
-        } else {
-          best_rank = 0;
-        }
-        if (best_rank >= ep_size) {
-          best_rank = ep_size - 1;
-        }
-        break;
-      }
-      if (best_physical < 0) {
-        out_physical_ids[idx] = -1;
-        continue;
-      }
-      best_rank_cost = rank_active_counts[best_rank] +
-                       (physical_active_flags[best_physical] ? 0 : 1);
-      best_token_cost = physical_token_counts[best_physical];
-    }
 
-    out_physical_ids[idx] = best_physical;
-    if (!physical_active_flags[best_physical]) {
-      physical_active_flags[best_physical] = 1;
-      if (best_rank >= 0 && best_rank < rank_capacity) {
-        rank_active_counts[best_rank] += 1;
+        // Build unique sorted ranks (tiny k -> simple O(k^2))
+        int uniq_rank[kMaxReplica];
+        int ucnt = 0;
+        for (int i = 0; i < candidate_count; ++i) {
+          int r = candidate_rank[i];
+          bool seen = false;
+          for (int j = 0; j < ucnt; ++j) if (uniq_rank[j] == r) { seen = true; break; }
+          if (!seen) uniq_rank[ucnt++] = r;
+        }
+        if (ucnt == 2 && uniq_rank[1] < uniq_rank[0]) {
+          int t = uniq_rank[0]; uniq_rank[0] = uniq_rank[1]; uniq_rank[1] = t;
+        }
+
+        // Lock all involved ranks (ascending order) — deadlock-safe
+        for (int j = 0; j < ucnt; ++j) {
+          lock_acquire_block(&rank_locks[uniq_rank[j]]);
+        }
+
+        // Choose by minimal active count (now stable under locks)
+        int best_idx  = 0;
+        int best_rank = candidate_rank[0];
+        int best_cost = rank_active_counts_smem[best_rank];
+        for (int i = 1; i < candidate_count; ++i) {
+          const int r = candidate_rank[i];
+          const int c = rank_active_counts_smem[r];
+          if (c < best_cost) {
+            best_cost = c;
+            best_rank = r;
+            best_idx  = i;
+          }
+        }
+
+        // Commit selection and increment chosen rank
+        const int chosen_phys = candidate_phys[best_idx];
+        logical_selection[logical] = chosen_phys;
+        ++rank_active_counts_smem[best_rank];
+
+        // Release locks in reverse order
+        for (int j = ucnt - 1; j >= 0; --j) {
+          lock_release_block(&rank_locks[uniq_rank[j]]);
+        }
       }
     }
-    physical_token_counts[best_physical] += 1;
   }
+  __syncthreads();
+
+  for (int64_t idx = threadIdx.x; idx < num_pairs; idx += blockDim.x) {
+    const int32_t logical_id = logical_ids[idx];
+    out_physical_ids[idx] = logical_selection[logical_id];
+  }
+
+  (void)physical_token_counts;
+  (void)physical_active_flags;
+  (void)physical_capacity;
+  (void)rank_capacity;
+  (void)rank_active_counts; // ignored
 }
 
 }  // namespace
@@ -205,8 +258,15 @@ void mem_bound_router_greedy(torch::Tensor logical_ids,
   }
 
   const dim3 grid(1);
-  const dim3 block(1);
-  mem_bound_router_greedy_kernel<<<grid, block, 0, stream>>>(
+  const dim3 block(1024);
+  size_t shared_bytes = static_cast<size_t>(num_logical_experts);
+  shared_bytes = (shared_bytes + 3) & ~static_cast<size_t>(3);
+  shared_bytes +=
+      sizeof(int32_t) * static_cast<size_t>(num_logical_experts);
+  const auto* device_prop = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(shared_bytes <= static_cast<size_t>(device_prop->sharedMemPerBlock),
+              "mem_bound_router_greedy shared memory requirement exceeds device limit");
+  mem_bound_router_greedy_kernel<<<grid, block, shared_bytes, stream>>>(
       logical_ids.data_ptr<int32_t>(),
       output.data_ptr<int32_t>(),
       logical_to_physical_map.data_ptr<int32_t>(),
