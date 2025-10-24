@@ -80,8 +80,10 @@ __global__ void mem_bound_router_greedy_kernel(
     logical_active[logical_id] = 1;
   }
   __syncthreads();
-
-  const int participating = min<int>(LOCKING_THREADS, blockDim.x);
+  
+  const int participating = ((int)blockDim.x < LOCKING_THREADS)
+                          ? (int)blockDim.x
+                          : LOCKING_THREADS;
   const bool participates = (threadIdx.x < participating);
 
   if (participates) {
