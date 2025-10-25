@@ -1310,7 +1310,7 @@ def eplb_map_to_physical_and_record(
                 rank = phys_id // per_rank
                 local_id = phys_id % per_rank
                 if 0 <= rank < ep_size and 0 <= local_id < per_rank:
-                    rank_phys_sets[rank].insert(local_id)
+                    rank_phys_sets[rank].add(local_id)
 
             # Count activated physical experts per rank and find max
             per_rank_counts = [len(s) for s in rank_phys_sets]
@@ -1324,7 +1324,7 @@ def eplb_map_to_physical_and_record(
                 )
             print(
                 "[eplb_map_to_physical_and_record] "
-                f"max activated physical experts across ranks = {max_active}"
+                f"max activated physical experts across ranks = {max_active} batch size = {topk_ids.shape}"
             )
         else:
             # router_ws is None -> can't infer rank layout, but we still print logical coverage
