@@ -1217,6 +1217,8 @@ def eplb_map_to_physical_and_record(
 
     # In case `indices_type` is not `torch.long` or `torch.int`,
     # e.g. `torch.uint32` as required by dispatch/combine kernels
+    logical_ids_before = topk_ids.detach().clone()
+    
     greedy_used = False
     if mem_bound_aware_routing == "greedy":
         num_pairs = topk_ids.numel()
@@ -1278,6 +1280,71 @@ def eplb_map_to_physical_and_record(
         dim=0,
         index=topk_ids_flatten.long(),
         src=torch.ones_like(topk_ids_flatten).to(expert_load_view))
+
+    try:
+        # Move routed PHYSICAL expert ids to CPU
+        phys_ids_cpu = topk_ids.detach().reshape(-1).to("cpu")
+        # Move original LOGICAL expert ids to CPU
+        logical_ids_cpu = logical_ids_before.detach().reshape(-1).to("cpu")
+
+        # Count total unique logical experts activated
+        # (i.e. how many distinct logical expert IDs appeared in this batch)
+        unique_logical = torch.unique(logical_ids_cpu)
+        total_activated_logical = int(unique_logical.numel())
+
+        if router_ws is not None:
+            ep_size = int(router_ws.ep_size)
+            per_rank = int(router_ws.physical_experts_per_rank)
+
+            # rank_phys_used[rank][local_expert_id] -> bool
+            # We'll build this as a Python list of sets for clarity.
+            rank_phys_sets = [set() for _ in range(ep_size)]
+
+            # phys_id -> (rank, local_id)
+            # rank = phys_id // per_rank
+            # local_id = phys_id % per_rank
+            phys_list = phys_ids_cpu.tolist()
+            for phys_id in phys_list:
+                if phys_id < 0:
+                    continue
+                rank = phys_id // per_rank
+                local_id = phys_id % per_rank
+                if 0 <= rank < ep_size and 0 <= local_id < per_rank:
+                    rank_phys_sets[rank].insert(local_id)
+
+            # Count activated physical experts per rank and find max
+            per_rank_counts = [len(s) for s in rank_phys_sets]
+            max_active = max(per_rank_counts) if per_rank_counts else 0
+
+            # Print per-rank stats
+            for r, cnt in enumerate(per_rank_counts):
+                print(
+                    f"[eplb_map_to_physical_and_record] rank {r} "
+                    f"activated physical experts = {cnt}"
+                )
+            print(
+                "[eplb_map_to_physical_and_record] "
+                f"max activated physical experts across ranks = {max_active}"
+            )
+        else:
+            # router_ws is None -> can't infer rank layout, but we still print logical coverage
+            print(
+                "[eplb_map_to_physical_and_record] router_ws is None; "
+                "skipping per-rank activation stats"
+            )
+
+        # Print logical expert coverage
+        print(
+            "[eplb_map_to_physical_and_record] "
+            f"total activated logical experts = {total_activated_logical}"
+        )
+
+    except Exception as e:
+        # We do NOT want debug to kill inference. Just swallow.
+        print(
+            "[eplb_map_to_physical_and_record] debug stats collection failed:",
+            str(e)
+        )
 
     if indices_type is not None:
         topk_ids = topk_ids.to(dtype=indices_type)
