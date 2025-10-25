@@ -342,7 +342,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         redundant_experts = (
             parallel_cfg.eplb_config.num_redundant_experts
             if parallel_cfg.eplb_config is not None else 0)
-        expected_physical_experts = moe.num_experts + redundant_experts
+        expected_physical_experts = moe.num_experts
         ep_size = max(1, self.moe.moe_parallel_config.ep_size)
         physical_per_rank = max(
             expected_physical_experts // ep_size if ep_size > 0 else
