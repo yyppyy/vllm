@@ -40,10 +40,10 @@ args=(
 )
 
 # Only add EPLB flags if NUM_REPLICAS > 0 (or whatever your condition is)
-if (( NUM_REPLICAS > 0 )); then
+# if (( NUM_REPLICAS > 0 )); then
   args+=( --enable-eplb )
   args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
-fi
+# fi
 
 if (( MEM_BOUND_ROUTING > 0 )); then
   args+=( --mem-bound-aware-routing greedy )
