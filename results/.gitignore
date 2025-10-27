@@ -1,4 +1,4 @@
 *
-!bench_result_8_8_*_16_0_0.json
-!server_8_8_*_16_0_0.log
+!bench_result_8_8_*_16_*_*.json
+!server_8_8_*_16_*_*.log
 !.gitignore
