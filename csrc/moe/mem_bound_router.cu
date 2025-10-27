@@ -12,11 +12,11 @@
 namespace {
 
 #ifndef EXPERTS_PER_THREAD
-#define EXPERTS_PER_THREAD 2
+#define EXPERTS_PER_THREAD 1
 #endif
 
 #ifndef LOCKING_THREADS
-#define LOCKING_THREADS 32
+#define LOCKING_THREADS 96
 #endif
 
 __device__ __forceinline__ void lock_acquire_block(int* m) {
@@ -124,23 +124,23 @@ __global__ void mem_bound_router_greedy_kernel(
           continue;
         }
 
-        // Build unique sorted ranks (tiny k -> simple O(k^2))
-        int uniq_rank[kMaxReplica];
-        int ucnt = 0;
-        for (int i = 0; i < candidate_count; ++i) {
-          int r = candidate_rank[i];
-          bool seen = false;
-          for (int j = 0; j < ucnt; ++j) if (uniq_rank[j] == r) { seen = true; break; }
-          if (!seen) uniq_rank[ucnt++] = r;
-        }
-        if (ucnt == 2 && uniq_rank[1] < uniq_rank[0]) {
-          int t = uniq_rank[0]; uniq_rank[0] = uniq_rank[1]; uniq_rank[1] = t;
-        }
+        // // Build unique sorted ranks (tiny k -> simple O(k^2))
+        // int uniq_rank[kMaxReplica];
+        // int ucnt = 0;
+        // for (int i = 0; i < candidate_count; ++i) {
+        //   int r = candidate_rank[i];
+        //   bool seen = false;
+        //   for (int j = 0; j < ucnt; ++j) if (uniq_rank[j] == r) { seen = true; break; }
+        //   if (!seen) uniq_rank[ucnt++] = r;
+        // }
+        // if (ucnt == 2 && uniq_rank[1] < uniq_rank[0]) {
+        //   int t = uniq_rank[0]; uniq_rank[0] = uniq_rank[1]; uniq_rank[1] = t;
+        // }
 
-        // Lock all involved ranks (ascending order) — deadlock-safe
-        for (int j = 0; j < ucnt; ++j) {
-          lock_acquire_block(&rank_locks[uniq_rank[j]]);
-        }
+        // // Lock all involved ranks (ascending order) — deadlock-safe
+        // for (int j = 0; j < ucnt; ++j) {
+        //   lock_acquire_block(&rank_locks[uniq_rank[j]]);
+        // }
 
         // Choose by minimal active count (now stable under locks)
         int best_idx  = 0;
@@ -149,10 +149,19 @@ __global__ void mem_bound_router_greedy_kernel(
         for (int i = 1; i < candidate_count; ++i) {
           const int r = candidate_rank[i];
           const int c = rank_active_counts_smem[r];
-          if (c < best_cost) {
-            best_cost = c;
-            best_rank = r;
-            best_idx  = i;
+          const int turn = int(logical / 8); // psuedo random to break tie
+          if ((turn % 2) == 0) {
+            if (c < best_cost) {
+              best_cost = c;
+              best_rank = r;
+              best_idx  = i;
+            }
+          } else {
+            if (c <= best_cost) {
+              best_cost = c;
+              best_rank = r;
+              best_idx  = i;
+            }            
           }
         }
 
@@ -161,10 +170,10 @@ __global__ void mem_bound_router_greedy_kernel(
         logical_selection[logical] = chosen_phys;
         ++rank_active_counts_smem[best_rank];
 
-        // Release locks in reverse order
-        for (int j = ucnt - 1; j >= 0; --j) {
-          lock_release_block(&rank_locks[uniq_rank[j]]);
-        }
+        // // Release locks in reverse order
+        // for (int j = ucnt - 1; j >= 0; --j) {
+        //   lock_release_block(&rank_locks[uniq_rank[j]]);
+        // }
       }
     }
   }

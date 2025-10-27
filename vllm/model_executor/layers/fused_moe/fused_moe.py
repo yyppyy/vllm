@@ -90,7 +90,7 @@ class RouterWS:
         self.physical_active = torch.empty(self.max_physical_experts,
                                            dtype=torch.uint8,
                                            device=self.device)
-        self.mem_bound_routing_token_thres = 128 * ep_size
+        self.mem_bound_routing_token_thres = 1024 * ep_size
 
     def can_support(self, topk_ids: torch.Tensor,
                     logical_to_physical_map: torch.Tensor) -> bool:
