@@ -143,6 +143,19 @@ __global__ void mem_bound_router_greedy_kernel(
         // }
 
         // Choose by minimal active count (now stable under locks)
+        
+        // for large replication degree (e.g., 1.5x capacity)
+        // int best_idx  = 0;
+        // int best_cost = rank_active_counts_smem[best_rank];
+        // int best_cost = candidate_phys[0] % physical_experts_per_rank;
+        // for (int i = 1; i < candidate_count; ++i) {
+        //   const int r = candidate_rank[i];
+        //   const int c = rank_active_counts_smem[r];
+        //   if (c < best_cost) {
+        //     const int c = candidate_phys[i] % physical_experts_per_rank;
+        //     if (c < best_cost) {
+        //       ...
+
         int best_idx  = 0;
         int best_rank = candidate_rank[0];
         int best_cost = rank_active_counts_smem[best_rank];

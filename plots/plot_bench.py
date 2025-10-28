@@ -11,20 +11,20 @@ import matplotlib.pyplot as plt
 
 # Filename pattern: bench_result_${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}.json
 FILENAME_RE = re.compile(
-    r"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_(?P<batch_size>\d+)_0_0\.json$"
+    r"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_(?P<batch_size>\d+)_(?P<mem_bound_routing>\d+)_0\.json$"
 )
 
 METRICS = [
-    "total_token_throughput",
-    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
+    "output_throughput",
+    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "p10_ttft_ms",
     "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
-    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
+    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms", "p10_tpot_ms"
 ]
 
 def metric_to_ylabel(metric):
     if 'ms' in metric:
         return ' '.join(metric.split('_')[:-1]) + ' (ms)'
-    elif metric == 'total_token_throughput':
+    elif metric == 'output_throughput':
         return 'Throughput (tokens/s)'
     else:
         raise RuntimeError('unsupported metric')
@@ -59,7 +59,7 @@ def load_results(results_dir, filters):
     store a mapping: num_replicas -> {batch_size -> data}.
     """
     # results[(g, ep)][rep][batch_size] = data
-    results = defaultdict(lambda: defaultdict(dict))
+    results = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     missing_metrics = set()
 
     for path in Path(results_dir).glob("bench_result_*.json"):
@@ -71,6 +71,7 @@ def load_results(results_dir, filters):
         ep_degree = int(m.group("ep_degree"))
         num_replicas = int(m.group("num_replicas"))
         batch_size = int(m.group("batch_size"))
+        mem_bound_routing_enabled = int(m.group("mem_bound_routing"))
 
         # Apply filters
         if filters["num_gpus"] is not None and num_gpus not in filters["num_gpus"]:
@@ -92,7 +93,7 @@ def load_results(results_dir, filters):
             if metric not in data:
                 missing_metrics.add(metric)
 
-        results[(num_gpus, ep_degree)][num_replicas][batch_size] = data
+        results[(num_gpus, ep_degree)][num_replicas][batch_size][mem_bound_routing_enabled] = data
 
     if missing_metrics:
         print("Warning: some files lacked metrics:", ", ".join(sorted(missing_metrics)))
@@ -123,21 +124,34 @@ def plot_group(group_key, rep_to_bsdata, outdir):
     offsets = (-total_width / 2) + (np.arange(n_rep) + 0.5) * bar_w
 
     for metric in METRICS:
-        plt.figure(figsize=(3, 5))
+        plt.figure(figsize=(6, 5))
+
+        heights_mem_bound = []
+        heights_eplb = []
+        x = []
 
         for i, rep in enumerate(reps):
             bs_to_data = rep_to_bsdata.get(rep, {})
-            heights = []
+            # heights = []
+            # print(bs_to_data.values())
             for bs in all_batch_sizes:
-                v = bs_to_data.get(bs, {}).get(metric, float("nan"))
-                heights.append(v)
-            heights = np.array(heights, dtype=float)
-
+                for routing in bs_to_data[bs].keys():
+                    v = bs_to_data.get(bs, {}).get(routing, {}).get(metric, float("nan"))
+                    if routing:
+                        heights_mem_bound.append(v)
+                    if ((not routing) or rep == 0) and not (not routing and rep == 0):
+                        heights_eplb.append(v)
+            # heights = np.array(heights, dtype=float)
+            x.append(rep)
             # Draw bars; NaNs will be skipped by matplotlib
-            plt.bar(x + offsets[i], heights, width=bar_w, label=f"NUM_REPLICAS={rep}")
+            # plt.bar(x + offsets[i], heights, width=bar_w, label=f"NUM_REPLICAS={rep}")
+        print(x, heights_mem_bound, heights_mem_bound)
+        plt.plot(x, heights_mem_bound, label=f"NUM_REPLICAS={rep}, mem-bound")
+        plt.plot(x, heights_eplb, label=f"NUM_REPLICAS={rep}, eplb")
 
         # plt.xlabel("BATCH_SIZE")
         plt.ylabel(metric_to_ylabel(metric))
+        plt.ylim(0, None)
         # plt.title(f"{metric} vs BATCH_SIZE\nNUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}")
         # plt.xticks(x, all_batch_sizes, rotation=0)
         plt.xticks(x, [])
@@ -160,7 +174,7 @@ def main():
                     help='Filter NUM_GPUS (e.g. "2,4" or "2..8:2"); empty = all')
     ap.add_argument("--ep-degree", type=str, default="8",
                     help='Filter EP_DEGREE (e.g. "1,2,4"); empty = all')
-    ap.add_argument("--num-replicas", type=str, default="0,32,64",
+    ap.add_argument("--num-replicas", type=str, default="0,16,32,48,64",
                     help='Filter NUM_REPLICAS lines to include (e.g. "0,1,2"); empty = all')
     ap.add_argument("--batch-size", type=str, default="16",
                     help='Filter BATCH_SIZE (e.g. "256,512,1024" or "256..4096:256"); empty = all')
