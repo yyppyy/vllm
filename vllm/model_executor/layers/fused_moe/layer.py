@@ -961,6 +961,9 @@ class FusedMoE(CustomOp):
         enable_eplb: Whether to enable expert parallelism load balancer.
     """
 
+    _imbalance_running_sum: float = 0.0
+    _imbalance_num_updates: int = 0
+
     def __init__(
         self,
         num_experts: int,  # Global number of experts
@@ -1794,6 +1797,63 @@ class FusedMoE(CustomOp):
                 mem_bound_aware_routing=mem_bound_aware_routing,
                 router_ws=router_ws
             )
+
+        if topk_ids.shape[0] == 4096:
+            import math
+
+            # 1. Bring topk_ids to CPU before processing (your requirement).
+            #    We also force long for bincount/indexing.
+            topk_ids_cpu = topk_ids.to("cpu", copy=True).long()
+
+            num_tokens = topk_ids_cpu.shape[0]
+            k_per_token = topk_ids_cpu.shape[1]
+            total_assignments = num_tokens * k_per_token  # python int
+
+            # 2. Flatten to 1-D list of physical expert IDs
+            flat_ids_cpu = topk_ids_cpu.reshape(-1)  # (total_assignments,)
+
+            # Try to infer experts_per_rank.
+            # If we know EP world size from router_ws, use it.
+            # Fallback: assume single EP rank (experts_per_rank = num_physical_experts).
+            ep_world_size = router_ws.ep_size
+
+            # ceil in case num_physical_experts isn't perfectly divisible
+            experts_per_rank = math.ceil(global_num_experts / ep_world_size)
+
+            # 4. Map physical expert id -> EP rank id via floor-div
+            #    ep_rank_ids[i] in [0, ep_world_size)
+            ep_rank_ids = torch.div(flat_ids_cpu, experts_per_rank, rounding_mode='floor')
+
+            # 5. Count load per EP rank
+            per_rank_counts = torch.bincount(ep_rank_ids,
+                                            minlength=ep_world_size)
+
+            max_assignments_any_rank = int(per_rank_counts.max().item())
+
+            # 6. Imbalance factor (float)
+            imbalance_factor = (
+                max_assignments_any_rank / float(total_assignments)
+            )
+
+            # Update global running average on the class (static members)
+            FusedMoE._imbalance_running_sum += imbalance_factor
+            FusedMoE._imbalance_num_updates += 1
+            running_avg = (
+                FusedMoE._imbalance_running_sum /
+                FusedMoE._imbalance_num_updates
+            )
+
+            # Print debug info every time we update
+            print(
+                "[MoE Routing] "
+                f"imbalance={imbalance_factor:.6f} "
+                f"avg_imbalance={running_avg:.6f} "
+                f"(tokens={num_tokens}, top_k={k_per_token}, "
+                f"ep_world_size={ep_world_size}, "
+                f"experts_per_rank={experts_per_rank}, "
+                f"num_physical_experts={global_num_experts})"
+            )
+            # ----------------- END NEW IMBALANCE BLOCK -----------------
 
         assert topk_ids.dtype == indices_type or indices_type is None
 
