@@ -24,7 +24,7 @@ export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
 CS=$BATCH_SIZE
-CR=512
+CR=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE ))
 
 args=(
   serve Qwen/Qwen3-30B-A3B
