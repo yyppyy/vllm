@@ -1818,7 +1818,7 @@ class FusedMoE(CustomOp):
             ep_world_size = router_ws.ep_size
 
             # ceil in case num_physical_experts isn't perfectly divisible
-            experts_per_rank = math.ceil(global_num_experts / ep_world_size)
+            experts_per_rank = router_ws.physical_experts_per_rank
 
             # 4. Map physical expert id -> EP rank id via floor-div
             #    ep_rank_ids[i] in [0, ep_world_size)
@@ -1851,7 +1851,7 @@ class FusedMoE(CustomOp):
                 f"(tokens={num_tokens}, top_k={k_per_token}, "
                 f"ep_world_size={ep_world_size}, "
                 f"experts_per_rank={experts_per_rank}, "
-                f"num_physical_experts={global_num_experts})"
+                f"num_physical_experts_per_rank={experts_per_rank})"
             )
             # ----------------- END NEW IMBALANCE BLOCK -----------------
 
