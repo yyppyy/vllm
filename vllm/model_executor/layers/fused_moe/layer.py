@@ -1835,25 +1835,26 @@ class FusedMoE(CustomOp):
                 max_assignments_any_rank / float(total_assignments)
             )
 
-            # Update global running average on the class (static members)
-            FusedMoE._imbalance_running_sum += imbalance_factor
-            FusedMoE._imbalance_num_updates += 1
-            running_avg = (
-                FusedMoE._imbalance_running_sum /
-                FusedMoE._imbalance_num_updates
-            )
+            if imbalance_factor < 0.25: # exclude initial dummy batches
+                # Update global running average on the class (static members)
+                FusedMoE._imbalance_running_sum += imbalance_factor
+                FusedMoE._imbalance_num_updates += 1
+                running_avg = (
+                    FusedMoE._imbalance_running_sum /
+                    FusedMoE._imbalance_num_updates
+                )
 
-            # Print debug info every time we update
-            print(
-                "[MoE Routing] "
-                f"imbalance={imbalance_factor:.6f} "
-                f"avg_imbalance={running_avg:.6f} "
-                f"(tokens={num_tokens}, top_k={k_per_token}, "
-                f"ep_world_size={ep_world_size}, "
-                f"experts_per_rank={experts_per_rank}, "
-                f"num_physical_experts_per_rank={experts_per_rank})"
-            )
-            # ----------------- END NEW IMBALANCE BLOCK -----------------
+                # Print debug info every time we update
+                print(
+                    "[MoE Routing] "
+                    f"imbalance={imbalance_factor:.6f} "
+                    f"avg_imbalance={running_avg:.6f} "
+                    f"(tokens={num_tokens}, top_k={k_per_token}, "
+                    f"ep_world_size={ep_world_size}, "
+                    f"experts_per_rank={experts_per_rank}, "
+                    f"num_physical_experts_per_rank={experts_per_rank})"
+                )
+                # ----------------- END NEW IMBALANCE BLOCK -----------------
 
         assert topk_ids.dtype == indices_type or indices_type is None
 
