@@ -67,7 +67,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-N=$(( BATCH_SIZE * NUM_GPUS ))
+N=$(( 128 ))
 
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
