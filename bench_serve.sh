@@ -24,6 +24,7 @@ export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
 CS=$BATCH_SIZE
+CR=512
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -31,19 +32,22 @@ args=(
   --data-parallel-size "$EP_DEGREE"
   --tensor-parallel-size 1
   --enable-expert-parallel
-  --max-num-seqs "$BATCH_SIZE"
+  --max-num-seqs $CR
   --no-enable-chunked-prefill
-  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 16, 256, 512, 4096, ${BATCH_SIZE}]}"
+  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 16, 256, 512, 4096]}"
   --max-model-len 4096
   --max-num-batched-tokens $CS
   --expert-placement-strategy linear
 )
 
-# Only add EPLB flags if NUM_REPLICAS > 0 (or whatever your condition is)
 # if (( NUM_REPLICAS > 0 )); then
   args+=( --enable-eplb )
   args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
 # fi
+
+if (( BATCH_SIZE > 16 )); then
+  args+=( --enforce-eager )
+fi
 
 if (( MEM_BOUND_ROUTING > 0 )); then
   args+=( --mem-bound-aware-routing greedy )
@@ -67,8 +71,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-N=$(( 128 ))
-
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
     --dataset-name hf
@@ -80,8 +82,8 @@ cli_args=(
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 240
     --port "$PORT"
-    --num-prompts $N
-    --max-concurrency $N
+    --num-prompts $CR
+    --max-concurrency $CR
 )
 
 # decode
