@@ -87,7 +87,7 @@ cli_args=(
 )
 
 # decode
-if (( BATCH_SIZE < 17 )); then
+if (( BATCH_SIZE > 16 )); then
   cli_args+=( --hf-output-len 1 )
 fi
 
