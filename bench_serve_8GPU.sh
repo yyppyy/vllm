@@ -1,22 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# token_max[0] = x, token_max[1] = y, token_max[2] = z
-token_max=(x y z)
+# declare associative array
+declare -A token_max
 
-# loops:
-#   dataset in (0 1 2) 0=humaneval; 1=gpqa; 2=gsm8k
-#   routing_scheme in (1 0)
-#   replication in (0 16 32 64)
+# Fill it: token_max["<dataset>,<replication>"]=<value>
+token_max["0,0"]=AAA
+token_max["0,16"]=BBB
+token_max["0,32"]=CCC
+token_max["0,64"]=DDD
+
+token_max["1,0"]=EEE
+token_max["1,16"]=FFF
+token_max["1,32"]=GGG
+token_max["1,64"]=HHH
+
+token_max["2,0"]=III
+token_max["2,16"]=JJJ
+token_max["2,32"]=KKK
+token_max["2,64"]=LLL
+
 for dataset in 0 1 2; do
     for routing_scheme in 1 0; do
         for replication in 0 16 32 64; do
 
-            # decode run (batch size = 16)
-            ./bench_serve.sh 8 8 "$replication" 16 "$routing_scheme" "$dataset"
+            decode_bs=16
+            prefill_bs=${token_max["$dataset,$replication"]}
 
-            # prefill run (batch size = token_max[dataset])
-            ./bench_serve.sh 8 8 "$replication" "${token_max[$dataset]}" "$routing_scheme" "$dataset"
+            # decode
+            ./bench_serve.sh 8 8 "$replication" "$decode_bs" "$routing_scheme" "$dataset"
+
+            # prefill
+            ./bench_serve.sh 8 8 "$replication" "$prefill_bs" "$routing_scheme" "$dataset"
 
         done
     done

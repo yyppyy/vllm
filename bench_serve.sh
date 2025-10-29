@@ -41,8 +41,9 @@ args=(
 )
 
 # if (( NUM_REPLICAS > 0 )); then
+  USED_REPLICAS=$(( BATCH_SIZE > 16 ? 0 : NUM_REPLICAS )) # for decode only
   args+=( --enable-eplb )
-  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
+  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${USED_REPLICAS}}" )
 # fi
 
 if (( BATCH_SIZE > 16 )); then
