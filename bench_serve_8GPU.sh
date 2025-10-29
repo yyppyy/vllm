@@ -1,20 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# mem_bound_routing=False, chunked_prefill=False
-./bench_serve.sh 8 8 0 16 0 0
-sleep 30
+# token_max[0] = x, token_max[1] = y, token_max[2] = z
+token_max=(x y z)
 
-./bench_serve.sh 8 8 32 16 0 0
-sleep 30
+# loops:
+#   dataset in (0 1 2) 0=humaneval; 1=gpqa; 2=gsm8k
+#   routing_scheme in (1 0)
+#   replication in (0 16 32 64)
+for dataset in 0 1 2; do
+    for routing_scheme in 1 0; do
+        for replication in 0 16 32 64; do
 
-./bench_serve.sh 8 8 64 16 0 0
-sleep 30
+            # decode run (batch size = 16)
+            ./bench_serve.sh 8 8 "$replication" 16 "$routing_scheme" "$dataset"
 
-# mem_bound_routing=True, chunked_prefill=False
-./bench_serve.sh 8 8 0 16 1 0
-sleep 30
+            # prefill run (batch size = token_max[dataset])
+            ./bench_serve.sh 8 8 "$replication" "${token_max[$dataset]}" "$routing_scheme" "$dataset"
 
-./bench_serve.sh 8 8 32 16 1 0
-sleep 30
-
-./bench_serve.sh 8 8 64 16 1 0
+        done
+    done
+done

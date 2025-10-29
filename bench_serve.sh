@@ -5,10 +5,10 @@ EP_DEGREE=$2
 NUM_REPLICAS=$3
 BATCH_SIZE=$4
 MEM_BOUND_ROUTING=$5
-CHUNKED_PREFILL=$6
+DATASET=$6
 RES_DIR=./results
 
-RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${CHUNKED_PREFILL}
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}
 
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
 
@@ -23,7 +23,7 @@ export NCCL_P2P_DISABLE=0
 export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
-CS=$(( CHUNKED_PREFILL > 0 ? BATCH_SIZE : 4096 ))
+CS=$BATCH_SIZE
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -33,7 +33,7 @@ args=(
   --enable-expert-parallel
   --max-num-seqs "$BATCH_SIZE"
   --no-enable-chunked-prefill
-  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 16, 256, 512, 4096]}"
+  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 16, 256, 512, 4096, ${BATCH_SIZE}]}"
   --max-model-len 4096
   --max-num-batched-tokens $CS
   --expert-placement-strategy linear
@@ -83,5 +83,10 @@ cli_args=(
     --num-prompts $N
     --max-concurrency $N
 )
+
+# decode
+if (( BATCH_SIZE < 17 )); then
+  cli_args+=( --hf-output-len 1 )
+fi
 
 vllm bench serve "${cli_args[@]}"
