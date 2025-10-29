@@ -1798,7 +1798,7 @@ class FusedMoE(CustomOp):
                 router_ws=router_ws
             )
 
-        if topk_ids.shape[0] == 4096:
+        if topk_ids.shape[0] == 32768:
             import math
 
             # 1. Bring topk_ids to CPU before processing (your requirement).
