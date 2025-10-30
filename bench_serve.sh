@@ -24,8 +24,8 @@ export NCCL_P2P_DISABLE=0
 export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
-CS=$BATCH_SIZE
-CR=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE ))
+CS=4096
+CR=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE * NUM_GPUS))
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -35,7 +35,7 @@ args=(
   --enable-expert-parallel
   --max-num-seqs $CR
   --no-enable-chunked-prefill
-  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 16]}"
+  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 16, 256, 512, 4096]}"
   --max-model-len 4096
   --max-num-batched-tokens $CS
   --expert-placement-strategy linear
