@@ -1799,7 +1799,7 @@ class FusedMoE(CustomOp):
                 router_ws=router_ws
             )
 
-        if topk_ids.shape[0] == 16 or topk_ids.shape[0] == 32:
+        if topk_ids.shape[0] == (16*8) or topk_ids.shape[0] == (32*8):
             import math
 
             # 1. Bring topk_ids to CPU before processing (your requirement).
