@@ -25,7 +25,7 @@ export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
 CS=4096
-CR=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE * NUM_GPUS))
+CR=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE ))
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -73,6 +73,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+MC=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE * NUM_GPUS))
+
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
     --dataset-name hf
@@ -84,8 +86,8 @@ cli_args=(
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 240
     --port "$PORT"
-    --num-prompts $CR
-    --max-concurrency $CR
+    --num-prompts $MC
+    --max-concurrency $MC
 )
 
 # decode
