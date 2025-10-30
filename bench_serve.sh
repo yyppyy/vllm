@@ -6,6 +6,7 @@ NUM_REPLICAS=$3
 BATCH_SIZE=$4
 MEM_BOUND_ROUTING=$5
 DATASET=$6
+DATASET_NAME=$7
 RES_DIR=./results
 
 RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}
@@ -75,7 +76,7 @@ trap cleanup EXIT
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
     --dataset-name hf
-    --dataset-path likaixin/InstructCoder \
+    --dataset-path $DATASET_NAME \
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/bench_result_"$RUN_HASH".json
