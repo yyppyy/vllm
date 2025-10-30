@@ -1850,32 +1850,33 @@ class FusedMoE(CustomOp):
 
             # 6. Imbalance factor (float)
             imbalance_factor = (max_assignments_any_rank / float(total_assignments))
+            
+            if imbalance_factor < 0.25:
+                # Update global running average on the class (static members)
+                FusedMoE._imbalance_running_sum += imbalance_factor
+                FusedMoE._max_running_act_exp += max_active_experts_per_rank
+                FusedMoE._imbalance_num_updates += 1
+                running_avg = (
+                    FusedMoE._imbalance_running_sum /
+                    FusedMoE._imbalance_num_updates
+                )
+                running_act_exp = (
+                    FusedMoE._max_running_act_exp /
+                    FusedMoE._imbalance_num_updates
+                )
 
-            # Update global running average on the class (static members)
-            FusedMoE._imbalance_running_sum += imbalance_factor
-            FusedMoE._max_running_act_exp += max_active_experts_per_rank
-            FusedMoE._imbalance_num_updates += 1
-            running_avg = (
-                FusedMoE._imbalance_running_sum /
-                FusedMoE._imbalance_num_updates
-            )
-            running_act_exp = (
-                FusedMoE._max_running_act_exp /
-                FusedMoE._imbalance_num_updates
-            )
-
-            # Print debug info every time we update
-            print(
-                "[MoE Routing] "
-                f"imbalance={imbalance_factor:.6f} "
-                f"avg_imbalance={running_avg:.6f} "
-                f"max_act_exp={max_active_experts_per_rank:.6f}"
-                f"avg_max_act_exp={running_act_exp:.6f}"
-                f"(tokens={num_tokens}, top_k={k_per_token}, "
-                f"ep_world_size={ep_world_size}, "
-                f"experts_per_rank={experts_per_rank}, "
-                f"max_active_experts_per_rank={max_active_experts_per_rank})"
-            )
+                # Print debug info every time we update
+                print(
+                    "[MoE Routing] "
+                    f"imbalance={imbalance_factor:.6f} "
+                    f"avg_imbalance={running_avg:.6f} "
+                    f"max_act_exp={max_active_experts_per_rank:.6f}"
+                    f"avg_max_act_exp={running_act_exp:.6f}"
+                    f"(tokens={num_tokens}, top_k={k_per_token}, "
+                    f"ep_world_size={ep_world_size}, "
+                    f"experts_per_rank={experts_per_rank}, "
+                    f"max_active_experts_per_rank={max_active_experts_per_rank})"
+                )
 
         assert topk_ids.dtype == indices_type or indices_type is None
 
