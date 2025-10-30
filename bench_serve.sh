@@ -25,7 +25,7 @@ export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
 CS=4096
-CR=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE ))
+CR=$(( BATCH_SIZE > 128 ? 512 : BATCH_SIZE ))
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -42,14 +42,9 @@ args=(
 )
 
 # if (( NUM_REPLICAS > 0 )); then
-  USED_REPLICAS=$(( BATCH_SIZE > 16 ? 0 : NUM_REPLICAS )) # for decode only
   args+=( --enable-eplb )
-  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${USED_REPLICAS}}" )
+  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
 # fi
-
-if (( BATCH_SIZE > 16 )); then
-  args+=( --enforce-eager )
-fi
 
 if (( MEM_BOUND_ROUTING > 0 )); then
   args+=( --mem-bound-aware-routing greedy )
@@ -73,7 +68,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MC=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE * NUM_GPUS))
+MC=$(( BATCH_SIZE > 128 ? 512 : BATCH_SIZE * NUM_GPUS))
 
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
@@ -89,10 +84,5 @@ cli_args=(
     --num-prompts $MC
     --max-concurrency $MC
 )
-
-# decode
-if (( BATCH_SIZE > 16 )); then
-  cli_args+=( --hf-output-len 1 )
-fi
 
 vllm bench serve "${cli_args[@]}"
