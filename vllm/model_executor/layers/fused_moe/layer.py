@@ -961,6 +961,7 @@ class FusedMoE(CustomOp):
         enable_eplb: Whether to enable expert parallelism load balancer.
     """
 
+    _max_running_act_exp: float = 0.0
     _imbalance_running_sum: float = 0.0
     _imbalance_num_updates: int = 0
 
@@ -1798,7 +1799,7 @@ class FusedMoE(CustomOp):
                 router_ws=router_ws
             )
 
-        if topk_ids.shape[0] == 32768:
+        if topk_ids.shape[0] == 16 or topk_ids.shape[0] == 32:
             import math
 
             # 1. Bring topk_ids to CPU before processing (your requirement).
@@ -1820,41 +1821,61 @@ class FusedMoE(CustomOp):
             # ceil in case num_physical_experts isn't perfectly divisible
             experts_per_rank = router_ws.physical_experts_per_rank
 
+            # (optional but nice for some derived stats)
+            num_physical_experts = ep_world_size * experts_per_rank
+
             # 4. Map physical expert id -> EP rank id via floor-div
             #    ep_rank_ids[i] in [0, ep_world_size)
             ep_rank_ids = torch.div(flat_ids_cpu, experts_per_rank, rounding_mode='floor')
 
-            # 5. Count load per EP rank
-            per_rank_counts = torch.bincount(ep_rank_ids,
-                                            minlength=ep_world_size)
-
+            # 5. Count load per EP rank (assignments)
+            per_rank_counts = torch.bincount(ep_rank_ids, minlength=ep_world_size)
             max_assignments_any_rank = int(per_rank_counts.max().item())
 
+            # --- NEW: count activated experts per rank --------------------------------
+            # Build a boolean "active" mask per expert: active if it received >=1 assignment.
+            # Make sure bincount has enough bins for all experts.
+            per_expert_assign_counts = torch.bincount(
+                flat_ids_cpu,
+                minlength=num_physical_experts
+            )
+            active_mask = per_expert_assign_counts > 0  # shape: [num_physical_experts]
+
+            # Reshape to [ep_world_size, experts_per_rank] thanks to linear placement.
+            # Then sum along last dim to get #activated experts per rank.
+            active_mask_2d = active_mask.view(ep_world_size, experts_per_rank)
+            active_experts_per_rank = active_mask_2d.sum(dim=1)  # int64 tensor
+            max_active_experts_per_rank = int(active_experts_per_rank.max().item())
+            # ---------------------------------------------------------------------------
+
             # 6. Imbalance factor (float)
-            imbalance_factor = (
-                max_assignments_any_rank / float(total_assignments)
+            imbalance_factor = (max_assignments_any_rank / float(total_assignments))
+
+            # Update global running average on the class (static members)
+            FusedMoE._imbalance_running_sum += imbalance_factor
+            FusedMoE._max_running_act_exp += max_active_experts_per_rank
+            FusedMoE._imbalance_num_updates += 1
+            running_avg = (
+                FusedMoE._imbalance_running_sum /
+                FusedMoE._imbalance_num_updates
+            )
+            running_act_exp = (
+                FusedMoE._max_running_act_exp /
+                FusedMoE._imbalance_num_updates
             )
 
-            if imbalance_factor < 0.25: # exclude initial dummy batches
-                # Update global running average on the class (static members)
-                FusedMoE._imbalance_running_sum += imbalance_factor
-                FusedMoE._imbalance_num_updates += 1
-                running_avg = (
-                    FusedMoE._imbalance_running_sum /
-                    FusedMoE._imbalance_num_updates
-                )
-
-                # Print debug info every time we update
-                print(
-                    "[MoE Routing] "
-                    f"imbalance={imbalance_factor:.6f} "
-                    f"avg_imbalance={running_avg:.6f} "
-                    f"(tokens={num_tokens}, top_k={k_per_token}, "
-                    f"ep_world_size={ep_world_size}, "
-                    f"experts_per_rank={experts_per_rank}, "
-                    f"num_physical_experts_per_rank={experts_per_rank})"
-                )
-                # ----------------- END NEW IMBALANCE BLOCK -----------------
+            # Print debug info every time we update
+            print(
+                "[MoE Routing] "
+                f"imbalance={imbalance_factor:.6f} "
+                f"avg_imbalance={running_avg:.6f} "
+                f"max_act_exp={max_active_experts_per_rank:.6f}"
+                f"avg_max_act_exp={running_act_exp:.6f}"
+                f"(tokens={num_tokens}, top_k={k_per_token}, "
+                f"ep_world_size={ep_world_size}, "
+                f"experts_per_rank={experts_per_rank}, "
+                f"max_active_experts_per_rank={max_active_experts_per_rank})"
+            )
 
         assert topk_ids.dtype == indices_type or indices_type is None
 

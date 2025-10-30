@@ -6,6 +6,7 @@ NUM_REPLICAS=$3
 BATCH_SIZE=$4
 MEM_BOUND_ROUTING=$5
 DATASET=$6
+DATASET_NAME=$7
 RES_DIR=./results
 
 RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}
@@ -23,8 +24,8 @@ export NCCL_P2P_DISABLE=0
 export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
-CS=$BATCH_SIZE
-CR=$(( BATCH_SIZE > 16 ? 512 : BATCH_SIZE ))
+CS=4096
+CR=$(( BATCH_SIZE > 128 ? 512 : BATCH_SIZE ))
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -34,7 +35,7 @@ args=(
   --enable-expert-parallel
   --max-num-seqs $CR
   --no-enable-chunked-prefill
-  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 16]}"
+  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16, 32, 64, 256, 512, 4096]}"
   --max-model-len 4096
   --max-num-batched-tokens $CS
   --expert-placement-strategy linear
@@ -44,10 +45,6 @@ args=(
   args+=( --enable-eplb )
   args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
 # fi
-
-if (( BATCH_SIZE > 16 )); then
-  args+=( --enforce-eager )
-fi
 
 if (( MEM_BOUND_ROUTING > 0 )); then
   args+=( --mem-bound-aware-routing greedy )
@@ -71,10 +68,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+MC=$(( BATCH_SIZE > 128 ? 512 : BATCH_SIZE * NUM_GPUS))
+
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
     --dataset-name hf
-    --dataset-path likaixin/InstructCoder \
+    --dataset-path $DATASET_NAME \
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/bench_result_"$RUN_HASH".json
@@ -82,13 +81,8 @@ cli_args=(
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 240
     --port "$PORT"
-    --num-prompts $CR
-    --max-concurrency $CR
+    --num-prompts $MC
+    --max-concurrency $MC
 )
-
-# decode
-if (( BATCH_SIZE > 16 )); then
-  cli_args+=( --hf-output-len 1 )
-fi
 
 vllm bench serve "${cli_args[@]}"
