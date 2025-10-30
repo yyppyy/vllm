@@ -10,11 +10,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Filename pattern: bench_result_${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}.json
-def get_re_by_dataset_id(dataset_id):
+def get_re_by_dataset_id_batch_size(dataset_id, batch_size):
     # Ensure the dataset_id is an integer
     assert isinstance(dataset_id, int), "dataset_id must be an integer"
     return re.compile(
-        rf"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_(?P<batch_size>\d+)_(?P<mem_bound_routing>\d+)_({dataset_id})\.json$"
+        rf"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_({batch_size})_(?P<mem_bound_routing>\d+)_({dataset_id})\.json$"
     )
 
 METRICS = [
@@ -60,7 +60,7 @@ def parse_list(arg):
     else:
         return set(int(x) for x in arg.split(","))
 
-def load_results(results_dir, filters, dataset_id):
+def load_results(results_dir, filters, dataset_id, batch_size):
     """
     Scan results_dir for matching files and load JSON.
 
@@ -72,14 +72,14 @@ def load_results(results_dir, filters, dataset_id):
     missing_metrics = set()
 
     for path in Path(results_dir).glob("bench_result_*.json"):
-        m = get_re_by_dataset_id(dataset_id).match(path.name)
+        m = get_re_by_dataset_id_batch_size(dataset_id, batch_size).match(path.name)
         if not m:
             continue
 
         num_gpus = int(m.group("num_gpus"))
         ep_degree = int(m.group("ep_degree"))
         num_replicas = int(m.group("num_replicas"))
-        batch_size = int(m.group("batch_size"))
+        # batch_size = int(m.group("batch_size"))
         mem_bound_routing_enabled = int(m.group("mem_bound_routing"))
 
         # Apply filters
@@ -109,7 +109,7 @@ def load_results(results_dir, filters, dataset_id):
         
     return results
 
-def plot_group(group_key, rep_to_bsdata, outdir, dataset_name):
+def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, batch_size):
     """
     For a specific (num_gpus, ep_degree) group, plot each metric vs BATCH_SIZE.
     Each NUM_REPLICAS value becomes a separate bar within each BATCH_SIZE group.
@@ -155,7 +155,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name):
             x.append(rep)
             # Draw bars; NaNs will be skipped by matplotlib
             # plt.bar(x + offsets[i], heights, width=bar_w, label=f"NUM_REPLICAS={rep}")
-        print(x, heights_mem_bound, heights_mem_bound)
+        # print(x, heights_mem_bound, heights_mem_bound)
         plt.plot(x, heights_mem_bound, label=f"mem-bound routing")
         plt.plot(x, heights_eplb, label=f"eplb routing")
 
@@ -169,7 +169,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name):
         plt.legend(frameon=False)
         plt.tight_layout()
 
-        base = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}"
+        base = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}_bs{batch_size}_{dataset_name.replace('/', '_')}"
         base.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(f"{base}.pdf")
         plt.close()
@@ -186,9 +186,9 @@ def main():
                     help='Filter EP_DEGREE (e.g. "1,2,4"); empty = all')
     ap.add_argument("--num-replicas", type=str, default="0,16,32,48,64",
                     help='Filter NUM_REPLICAS lines to include (e.g. "0,1,2"); empty = all')
-    ap.add_argument("--batch-size", type=str, default="16",
+    ap.add_argument("--batch-size", type=str, default="16,32",
                     help='Filter BATCH_SIZE (e.g. "256,512,1024" or "256..4096:256"); empty = all')
-    ap.add_argument("--dataset-id", type=str, default="0,1,2",
+    ap.add_argument("--dataset-id", type=str, default="0",
                     help='dataset ids')
     args = ap.parse_args()
 
@@ -201,14 +201,15 @@ def main():
     }
 
     for id in filters["dataset_id"]:
-        results = load_results(args.results_dir, filters, id)
-        if not results:
-            print("No matching files found.")
-            return
+        for bs in filters["batch_size"]:
+            results = load_results(args.results_dir, filters, id, bs)
+            if not results:
+                print("No matching files found.")
+                return
 
-        # Now groups are (g, ep) only; each plot shows lines for different replicas
-        for group_key, rep_to_bsdata in results.items():
-            plot_group(group_key, rep_to_bsdata, args.output_dir, dataset_id2name[id])
+            # Now groups are (g, ep) only; each plot shows lines for different replicas
+            for group_key, rep_to_bsdata in results.items():
+                plot_group(group_key, rep_to_bsdata, args.output_dir, dataset_id2name[id], bs)
 
     print(f"Done. Plots written to: {args.output_dir}")
 
