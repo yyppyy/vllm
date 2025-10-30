@@ -10,9 +10,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Filename pattern: bench_result_${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}.json
-FILENAME_RE = re.compile(
-    r"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_(?P<batch_size>\d+)_(?P<mem_bound_routing>\d+)_0\.json$"
-)
+def get_re_by_dataset_id(dataset_id):
+    # Ensure the dataset_id is an integer
+    assert isinstance(dataset_id, int), "dataset_id must be an integer"
+    return re.compile(
+        rf"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_(?P<batch_size>\d+)_(?P<mem_bound_routing>\d+)_({dataset_id})\.json$"
+    )
 
 METRICS = [
     "output_throughput",
@@ -20,6 +23,12 @@ METRICS = [
     "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
     "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms", "p10_tpot_ms"
 ]
+
+dataset_id2name = {
+    0 : 'likaixin/InstructCoder', # code humaneval
+    1 : 'AI-MO/NuminaMath-1.5', # math gsm8k
+    2 : 'Aeala/ShareGPT_Vicuna_unfiltered', # chat gpqa
+}
 
 def metric_to_ylabel(metric):
     if 'ms' in metric:
@@ -51,7 +60,7 @@ def parse_list(arg):
     else:
         return set(int(x) for x in arg.split(","))
 
-def load_results(results_dir, filters):
+def load_results(results_dir, filters, dataset_id):
     """
     Scan results_dir for matching files and load JSON.
 
@@ -63,7 +72,7 @@ def load_results(results_dir, filters):
     missing_metrics = set()
 
     for path in Path(results_dir).glob("bench_result_*.json"):
-        m = FILENAME_RE.match(path.name)
+        m = get_re_by_dataset_id(dataset_id).match(path.name)
         if not m:
             continue
 
@@ -97,9 +106,10 @@ def load_results(results_dir, filters):
 
     if missing_metrics:
         print("Warning: some files lacked metrics:", ", ".join(sorted(missing_metrics)))
+        
     return results
 
-def plot_group(group_key, rep_to_bsdata, outdir):
+def plot_group(group_key, rep_to_bsdata, outdir, dataset_name):
     """
     For a specific (num_gpus, ep_degree) group, plot each metric vs BATCH_SIZE.
     Each NUM_REPLICAS value becomes a separate bar within each BATCH_SIZE group.
@@ -146,17 +156,17 @@ def plot_group(group_key, rep_to_bsdata, outdir):
             # Draw bars; NaNs will be skipped by matplotlib
             # plt.bar(x + offsets[i], heights, width=bar_w, label=f"NUM_REPLICAS={rep}")
         print(x, heights_mem_bound, heights_mem_bound)
-        plt.plot(x, heights_mem_bound, label=f"NUM_REPLICAS={rep}, mem-bound")
-        plt.plot(x, heights_eplb, label=f"NUM_REPLICAS={rep}, eplb")
+        plt.plot(x, heights_mem_bound, label=f"mem-bound routing")
+        plt.plot(x, heights_eplb, label=f"eplb routing")
 
         # plt.xlabel("BATCH_SIZE")
         plt.ylabel(metric_to_ylabel(metric))
-        plt.ylim(0, None)
-        # plt.title(f"{metric} vs BATCH_SIZE\nNUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}")
-        # plt.xticks(x, all_batch_sizes, rotation=0)
-        plt.xticks(x, [])
+        plt.ylim(0, max(heights_eplb) * 1.2)
+        plt.title(dataset_name)
+        plt.xticks(x, x, rotation=0)
+        plt.xlabel('# Replicated Replicate Experts (128 Total)')
         plt.grid(True, axis="y", linestyle="--", alpha=0.4)
-        plt.legend(title="Replicas", frameon=False)
+        plt.legend(frameon=False)
         plt.tight_layout()
 
         base = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}"
@@ -178,6 +188,8 @@ def main():
                     help='Filter NUM_REPLICAS lines to include (e.g. "0,1,2"); empty = all')
     ap.add_argument("--batch-size", type=str, default="16",
                     help='Filter BATCH_SIZE (e.g. "256,512,1024" or "256..4096:256"); empty = all')
+    ap.add_argument("--dataset-id", type=str, default="0,1,2",
+                    help='dataset ids')
     args = ap.parse_args()
 
     filters = {
@@ -185,16 +197,18 @@ def main():
         "ep_degree": parse_list(args.ep_degree),
         "num_replicas": parse_list(args.num_replicas),
         "batch_size": parse_list(args.batch_size),
+        "dataset_id": parse_list(args.dataset_id),
     }
 
-    results = load_results(args.results_dir, filters)
-    if not results:
-        print("No matching files found.")
-        return
+    for id in filters["dataset_id"]:
+        results = load_results(args.results_dir, filters, id)
+        if not results:
+            print("No matching files found.")
+            return
 
-    # Now groups are (g, ep) only; each plot shows lines for different replicas
-    for group_key, rep_to_bsdata in results.items():
-        plot_group(group_key, rep_to_bsdata, args.output_dir)
+        # Now groups are (g, ep) only; each plot shows lines for different replicas
+        for group_key, rep_to_bsdata in results.items():
+            plot_group(group_key, rep_to_bsdata, args.output_dir, dataset_id2name[id])
 
     print(f"Done. Plots written to: {args.output_dir}")
 
