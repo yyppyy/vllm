@@ -3,6 +3,6 @@
 !*_itl_*g8_ep8*.pdf
 !*_tpot_*g8_ep8*.pdf
 !*_ttft_*g8_ep8*.pdf
-!output_throughput_g8_ep8.pdf
+!total_token_throughput_g8_ep8*.pdf
 !.gitignore
 !*.py
