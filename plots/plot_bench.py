@@ -10,6 +10,24 @@ from utils import *
 
 import matplotlib.pyplot as plt
 
+_FLOAT_RE = re.compile(
+    r'avg_max_act_exp\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)'
+)
+
+def get_last_avg_max_act_exp(path: str) -> float:
+    """
+    Scan the file at `path` and return the float x from the LAST occurrence of
+    'avg_max_act_exp=x'. Raises ValueError if no match is found.
+    """
+    last = None
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            for m in _FLOAT_RE.finditer(line):
+                last = float(m.group(1))
+    if last is None:
+        raise ValueError("No 'avg_max_act_exp=...' found in file.")
+    return last
+
 # Filename pattern: bench_result_${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}.json
 def get_re_by_dataset_id_batch_size(dataset_id, batch_size):
     # Ensure the dataset_id is an integer
@@ -18,6 +36,13 @@ def get_re_by_dataset_id_batch_size(dataset_id, batch_size):
         rf"^bench_result_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_({batch_size})_(?P<routing_id>\d+)_({dataset_id})\.json$"
     )
 
+def get_server_re_by_dataset_id_batch_size(dataset_id, batch_size):
+    # Ensure the dataset_id is an integer
+    assert isinstance(dataset_id, int), "dataset_id must be an integer"
+    return re.compile(
+        rf"^server_(?P<num_gpus>\d+)_(?P<ep_degree>\d+)_(?P<num_replicas>\d+)_({batch_size})_(?P<routing_id>\d+)_({dataset_id})\.log$"
+    )
+    
 METRICS = [
     "total_token_throughput",
     "mean_ttft_ms",
@@ -25,6 +50,7 @@ METRICS = [
     # "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
     "mean_tpot_ms",
     # "p95_tpot_ms", "p99_tpot_ms", "p10_tpot_ms"
+    "activated_experts"
 ]
 
 dataset_id2name = {
@@ -50,6 +76,8 @@ def metric_to_ylabel(metric):
         return res
     elif metric == 'total_token_throughput':
         return 'Throughput (Tokens/s)'
+    elif metric == 'activated_experts':
+        return 'Max Activated Experts per GPU'
     else:
         raise RuntimeError('unsupported metric')
 
@@ -60,6 +88,8 @@ def metric_to_title(metric):
         return 'Decode Latency'
     elif metric == 'total_token_throughput':
         return 'Total Throughput'
+    elif metric == 'activated_experts':
+        return 'Activated Experts'
     else:
         return ''
 
@@ -97,39 +127,50 @@ def load_results(results_dir, filters, dataset_id):
     missing_metrics = set()
 
     for batch_size in filters["batch_size"]:
-        for path in Path(results_dir).glob("bench_result_*.json"):
+        for path in Path(results_dir).glob("*"):
+            m = get_server_re_by_dataset_id_batch_size(dataset_id, batch_size).match(path.name)
+            if m:
+                num_gpus = int(m.group("num_gpus"))
+                ep_degree = int(m.group("ep_degree"))
+                num_replicas = int(m.group("num_replicas"))
+                routing_id = int(m.group("routing_id"))
+                data = get_last_avg_max_act_exp(path)
+                if routing_id not in results[(num_gpus, ep_degree)][num_replicas][batch_size]:
+                    results[(num_gpus, ep_degree)][num_replicas][batch_size][routing_id] = {}
+                results[(num_gpus, ep_degree)][num_replicas][batch_size][routing_id] |= {'activated_experts': data}
+
             m = get_re_by_dataset_id_batch_size(dataset_id, batch_size).match(path.name)
-            if not m:
-                continue
+            if m:
+                num_gpus = int(m.group("num_gpus"))
+                ep_degree = int(m.group("ep_degree"))
+                num_replicas = int(m.group("num_replicas"))
+                # batch_size = int(m.group("batch_size"))
+                routing_id = int(m.group("routing_id"))
 
-            num_gpus = int(m.group("num_gpus"))
-            ep_degree = int(m.group("ep_degree"))
-            num_replicas = int(m.group("num_replicas"))
-            # batch_size = int(m.group("batch_size"))
-            routing_id = int(m.group("routing_id"))
+                # Apply filters
+                if filters["num_gpus"] is not None and num_gpus not in filters["num_gpus"]:
+                    continue
+                if filters["ep_degree"] is not None and ep_degree not in filters["ep_degree"]:
+                    continue
+                if filters["num_replicas"] is not None and num_replicas not in filters["num_replicas"]:
+                    continue
+                if filters["batch_size"] is not None and batch_size not in filters["batch_size"]:
+                    continue
 
-            # Apply filters
-            if filters["num_gpus"] is not None and num_gpus not in filters["num_gpus"]:
-                continue
-            if filters["ep_degree"] is not None and ep_degree not in filters["ep_degree"]:
-                continue
-            if filters["num_replicas"] is not None and num_replicas not in filters["num_replicas"]:
-                continue
-            if filters["batch_size"] is not None and batch_size not in filters["batch_size"]:
-                continue
+                try:
+                    data = json.loads(path.read_text())
+                except Exception as e:
+                    print(f"Failed to read {path}: {e}")
+                    continue
 
-            try:
-                data = json.loads(path.read_text())
-            except Exception as e:
-                print(f"Failed to read {path}: {e}")
-                continue
+                for metric in METRICS:
+                    if metric not in data and metric != 'activated_experts':
+                        missing_metrics.add(metric)
 
-            for metric in METRICS:
-                if metric not in data:
-                    missing_metrics.add(metric)
-
-            results[(num_gpus, ep_degree)][num_replicas][batch_size][routing_id] = data
-
+                if routing_id not in results[(num_gpus, ep_degree)][num_replicas][batch_size]:
+                    results[(num_gpus, ep_degree)][num_replicas][batch_size][routing_id] = {}
+                results[(num_gpus, ep_degree)][num_replicas][batch_size][routing_id] |= data
+                
     if missing_metrics:
         print("Warning: some files lacked metrics:", ", ".join(sorted(missing_metrics)))
         
