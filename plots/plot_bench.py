@@ -208,9 +208,10 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
         ax = plt.gca()
 
         # clean axes
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+        # ax.spines["top"].set_visible(False)
+        # ax.spines["right"].set_visible(False)
         ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+        ax.grid(True, axis="x", linestyle="--", alpha=0.35)
 
         # integer x axis from your `reps`
         x_vals = np.array(sorted(reps), dtype=float)
