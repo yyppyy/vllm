@@ -243,6 +243,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
                     marker=marker, linewidth=2.2, markersize=5.5,
                     label=f"{routing_id2name[routing_id]}, batch={batch_size}",
                 )
+                print(arr)
                 if np.any(np.isfinite(arr)):
                     max_h = max(max_h, np.nanmax(arr))
 

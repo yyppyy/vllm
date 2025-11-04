@@ -106,43 +106,52 @@ def arithmetic_intensity(B: int, S: int, cfg: MoEConfig, bytes_model: BytesModel
 def main():
     p = argparse.ArgumentParser(description="Arithmetic intensity of a DeepSeek-V3-style MoE layer.")
     # p.add_argument("--batch", "-B", type=int, required=True, help="Batch size (B).")
-    p.add_argument("--seq", "-S", type=int, default=1, help="Tokens per sequence this step (S). Use 1 for decode.")
-    p.add_argument("--D", type=int, help="Hidden size D.", default=7168)
-    p.add_argument("--MD", type=int, help="Expert inner dim MD.", default=2048)
-    p.add_argument("--MR", type=int, help="Top-k routed experts per token.", default=256)
-    p.add_argument("--MS", type=int, help="Shared experts per layer (0 if none).", default=1)
-    p.add_argument("--MA", type=int, help="Routing multiplicity per token (defaults to MR).", default=8)
-    p.add_argument("--elem-bytes", type=int, default=2, choices=[1,2,4], help="Element bytes (e.g., 2 for bf16/fp16).")
-    p.add_argument("--bytes-model", type=str, default="weights+activations",
-                   choices=["weights-only", "weights+activations"],
-                   help="Byte model for arithmetic intensity.")
+    # p.add_argument("--seq", "-S", type=int, default=1, help="Tokens per sequence this step (S). Use 1 for decode.")
+    # p.add_argument("--D", type=int, help="Hidden size D.", default=7168)
+    # p.add_argument("--MD", type=int, help="Expert inner dim MD.", default=2048)
+    # p.add_argument("--MR", type=int, help="Top-k routed experts per token.", default=256)
+    # p.add_argument("--MS", type=int, help="Shared experts per layer (0 if none).", default=1)
+    # p.add_argument("--MA", type=int, help="Routing multiplicity per token (defaults to MR).", default=8)
+    # p.add_argument("--elem-bytes", type=int, default=2, choices=[1,2,4], help="Element bytes (e.g., 2 for bf16/fp16).")
+    # p.add_argument("--bytes-model", type=str, default="weights+activations",
+    #                choices=["weights-only", "weights+activations"],
+    #                help="Byte model for arithmetic intensity.")
     p.add_argument("--output-dir", type=str, default=".",
                     help="Where to save figures (default: plots)")
     args = p.parse_args()
-
-    cfg = MoEConfig(D=args.D, MD=args.MD, MR=args.MR, MS=args.MS,
-                    MA=args.MA, elem_bytes=args.elem_bytes)
-
+    
+    model2configs = {
+        'DeepSeek-V3': {
+            'seq': 1,
+            'D': 7168,
+            'MD': 2048,
+            'MR': 256,
+            'MS': 1,
+            'MA': 8,
+            'elem_bytes': 2,
+            'bytes_model': 'weights+activations'
+        },
+        'Qwen3-30B-A3B': {
+            'seq': 1,
+            'D': 4096,
+            'MD': 1536,
+            'MR': 128,
+            'MS': 0,
+            'MA': 8,
+            'elem_bytes': 2,
+            'bytes_model': 'weights+activations'
+        },
+    }
+    
     batches = [1, 4, 16, 64, 256, 1024]
-    model_ois = {}
+    
     gpu_ois = [
         # ('A100', 153),
         ('H100', 295),
         ('B200', 281),
     ]
-    for batch in batches:
-        flops, bytes_, oi = arithmetic_intensity(batch, args.seq, cfg, args.bytes_model)
-        model_ois[batch] = oi
-
-        print(f"Config: B={batch}, S={args.seq}, D={cfg.D}, MD={cfg.MD}, MR={cfg.MR}, MS={cfg.MS}, "
-            f"elem_bytes={cfg.elem_bytes}, bytes_model={args.bytes_model}")
-        print(f"MoE layer FLOPs: {flops:,.0f}")
-        print(f"Estimated bytes moved: {bytes_:,.0f}")
-        print(f"Arithmetic intensity (FLOPs/byte): {oi:.3f}")
-    
-    
     set_paper_style()
-    apply_color_cycle(len(gpu_ois) + 1, "tableau10")
+    apply_color_cycle(len(gpu_ois) + 2, "tableau10")
     
     fig = plt.figure(figsize=(3.5, 3.5))
     ax = plt.gca()
@@ -161,19 +170,37 @@ def main():
     ax.set_xticklabels([str(int(xx)) for xx in x_vals])
 
     series_idx = 0
-
-    y_vals = [model_ois[batch] for batch in batches]
-    max_h = max(y_vals)
-
-    marker = MARKERS[series_idx % len(MARKERS)]
-    series_idx += 1
-    ax.plot(
-        x_vals, y_vals,
-        marker=marker, linewidth=2.2, markersize=5.5,
-        label=f"DeepSeek-V3 MoE FFN",
-    )
+    max_h = 0
     
-    colors = PALETTES["tableau10"][1:]
+    for model in ('DeepSeek-V3', 'Qwen3-30B-A3B'):
+        mcfg = model2configs[model]
+
+        cfg = MoEConfig(D=mcfg['D'], MD=mcfg['MD'], MR=mcfg['MR'], MS=mcfg['MS'],
+                        MA=mcfg['MA'], elem_bytes=mcfg['elem_bytes'])
+
+        model_ois = {}
+        for batch in batches:
+            flops, bytes_, oi = arithmetic_intensity(batch, mcfg['seq'], cfg, mcfg['bytes_model'])
+            print(f"Arithmetic intensity (FLOPs/byte): {oi:.3f}")
+            model_ois[batch] = oi
+        y_vals = [model_ois[batch] for batch in batches]
+        max_h = max(y_vals)
+
+        marker = MARKERS[series_idx % len(MARKERS)]
+        series_idx += 1
+        ax.plot(
+            x_vals, y_vals,
+            marker=marker, linewidth=2.2, markersize=5.5,
+            label=f"{model} FFN",
+        )
+
+            # print(f"Config: B={batch}, S={args.seq}, D={cfg.D}, MD={cfg.MD}, MR={cfg.MR}, MS={cfg.MS}, "
+            #     f"elem_bytes={cfg.elem_bytes}, bytes_model={args.bytes_model}")
+            # print(f"MoE layer FLOPs: {flops:,.0f}")
+            # print(f"Estimated bytes moved: {bytes_:,.0f}")
+            # print(f"Arithmetic intensity (FLOPs/byte): {oi:.3f}")
+    
+    colors = PALETTES["tableau10"][len(model2configs):]
     idx = 0
     for gpu, oi in gpu_ois:
         ax.axhline(y=oi, linestyle='--', linewidth=2.2, label=gpu, color=colors[idx])
@@ -189,10 +216,70 @@ def main():
 
     fig.tight_layout()
 
-    base = Path(args.output_dir) / f"deepseekv3_vs_gpu_oi"
+    base = Path(args.output_dir) / f"moe_vs_gpu_oi"
     base.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(f"{base}.pdf", transparent=True)
     plt.close(fig)
+    
+    
+    # # activation VS. expert bytes
+    # fig = plt.figure(figsize=(3.5, 3.5))
+    # ax = plt.gca()
+
+    # # clean axes
+    # # ax.spines["top"].set_visible(False)
+    # # ax.spines["right"].set_visible(False)
+    # ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    # ax.grid(True, axis="x", linestyle="--", alpha=0.35)
+
+    # # integer x axis from your `reps`
+    # x_vals = list(range(len(batches)))
+    # ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    # ax.set_xticks(x_vals)
+    # ax.set_xticklabels([str(int(xx)) for xx in x_vals])
+
+    # series_idx = 0
+    # max_h = 0
+    
+    # for i, model in enumerate(('DeepSeek-V3', 'Qwen3-30B-A3B')):
+        
+    #     mcfg = model2configs[model]
+
+    #     cfg = MoEConfig(D=mcfg['D'], MD=mcfg['MD'], MR=mcfg['MR'], MS=mcfg['MS'],
+    #                     MA=mcfg['MA'], elem_bytes=mcfg['elem_bytes'])
+
+    #     model_bytes = {}
+    #     for batch in batches:
+    #         bytes_all = moe_bytes(batch, mcfg['seq'], cfg, "weights+activations")
+    #         bytes_expert = moe_bytes(batch, mcfg['seq'], cfg, "weights-only")
+    #         bytes_activation = bytes_all - bytes_expert
+    #         model_bytes[batch] = bytes_activation / bytes_expert
+    #         print(f"expert bytes {bytes_expert}, activation bytes {bytes_activation}")
+            
+    #     y_vals = [model_bytes[batch] for batch in batches]
+    #     max_h = max(y_vals)
+
+    #     marker = MARKERS[series_idx % len(MARKERS)]
+    #     series_idx += 1
+    #     ax.plot(
+    #         x_vals, y_vals,
+    #         marker=marker, linewidth=2.2, markersize=5.5,
+    #         label=model,
+    #     )
+    
+    #     ax.set_ylabel('Percentage (%)')
+    #     ax.set_xlabel('Batch Size (Tokens)')
+    #     ax.set_title('Ratio of Token to Expert Size')
+    #     ax.legend()
+    #     if max_h > 0:
+    #         ax.set_ylim(0, max_h * 1.15)
+
+    #     fig.tight_layout()
+
+    #     base = Path(args.output_dir) / f"activation_vs_expert_size"
+    #     base.parent.mkdir(parents=True, exist_ok=True)
+    #     fig.savefig(f"{base}.pdf", transparent=True)
+    #     plt.close(fig)
 
 if __name__ == "__main__":
     main()

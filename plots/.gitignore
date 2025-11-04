@@ -5,6 +5,7 @@
 !*_ttft_*g8_ep8*.pdf
 !total_token_throughput_g8_ep8*.pdf
 !activated_experts_g8_ep8*.pdf
-!deepseekv3_vs_gpu_oi.pdf
+!moe_vs_gpu_oi.pdf
+!token_balanced_vs_ideal_routing.pdf
 !.gitignore
 !*.py
