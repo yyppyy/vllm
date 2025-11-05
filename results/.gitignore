@@ -7,4 +7,5 @@
 !server_8_8_*_32_*_*.log
 !latency_breakdown.csv
 !routing_solver.csv
+!all2all.csv
 !.gitignore
