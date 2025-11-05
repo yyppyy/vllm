@@ -5,4 +5,5 @@
 !server_8_8_*_16_*_*.log
 !bench_result_8_8_*_32_*_*.json
 !server_8_8_*_32_*_*.log
+!latency_breakdown.csv
 !.gitignore
