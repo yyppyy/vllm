@@ -2301,7 +2301,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._bs_iter = 0
                 self._bs_print_every = 1
             
-            # torch.cuda.synchronize()
+            torch.cuda.synchronize()
             time_before_model = time.perf_counter()
             model_output = self.model(
                 input_ids=input_ids,
@@ -2310,7 +2310,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
-            # torch.cuda.synchronize()
+            torch.cuda.synchronize()
             elapsed = time.perf_counter() - time_before_model
             
             bs = int(num_input_tokens)  # batch size proxy you already log
