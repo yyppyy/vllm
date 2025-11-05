@@ -60,8 +60,8 @@ dataset_id2name = {
 }
 
 routing_id2name = {
-    1 : 'Mem. Bound Aware', # code humaneval
-    0 : 'EPLB', # math gsm8k
+    1 : 'vLLM-NAME', # code humaneval
+    0 : 'vLLM-EPLB', # math gsm8k
 }
 
 def metric_to_ylabel(metric):
@@ -241,7 +241,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
                 ax.plot(
                     x_vals, arr,
                     marker=marker, linewidth=2.2, markersize=5.5,
-                    label=f"{routing_id2name[routing_id]}, batch={batch_size}",
+                    label=f"batch={batch_size}",
                 )
                 print(arr)
                 if np.any(np.isfinite(arr)):
@@ -255,8 +255,8 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
         if max_h > 0:
             ax.set_ylim(0, max_h * 1.15)
 
-        # if series_idx > 0:
-        #     ax.legend(frameon=False, ncol=2, handlelength=2.2, columnspacing=1.0)
+        if series_idx > 0:
+            ax.legend(frameon=False, ncol=1, handlelength=2.2, columnspacing=1.0)
 
         fig.tight_layout()
 

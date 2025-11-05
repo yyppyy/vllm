@@ -7,5 +7,6 @@
 !activated_experts_g8_ep8*.pdf
 !moe_vs_gpu_oi.pdf
 !token_balanced_vs_ideal_routing.pdf
+!latency_breakdown.pdf
 !.gitignore
 !*.py
