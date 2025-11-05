@@ -228,7 +228,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
                 heights = []
                 for rep in x_vals.astype(int):
                     bs_to_data = rep_to_bsdata.get(rep, {})
-                    key_rid = 1 if (rep == 0 and routing_id == 0) else routing_id
+                    key_rid = 1 if (rep == 0 and routing_id == 0 and batch_size == 32) else routing_id
                     v = bs_to_data.get(batch_size, {}).get(key_rid, {}).get(metric, float("nan"))
                     heights.append(v)
 
@@ -279,7 +279,7 @@ def main():
                     help='Filter EP_DEGREE (e.g. "1,2,4"); empty = all')
     ap.add_argument("--num-replicas", type=str, default="0,16,32,48,64",
                     help='Filter NUM_REPLICAS lines to include (e.g. "0,1,2"); empty = all')
-    ap.add_argument("--batch-size", type=str, default="32",
+    ap.add_argument("--batch-size", type=str, default="8,16,32",
                     help='Filter BATCH_SIZE (e.g. "256,512,1024" or "256..4096:256"); empty = all')
     ap.add_argument("--routing-id", type=str, default="0",
                     help='Filter Routing')
