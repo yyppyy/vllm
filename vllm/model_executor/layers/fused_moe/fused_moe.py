@@ -1237,6 +1237,17 @@ def eplb_map_to_physical_and_record(
                 router_ws.physical_active,
                 router_ws.physical_experts_per_rank,
                 router_ws.ep_size)
+            # # redundant mem bound routing
+            # torch.ops._moe_C.mem_bound_router_greedy(
+            #     logical_buffer,
+            #     logical_to_physical_map,
+            #     logical_replica_count,
+            #     physical_buffer,
+            #     router_ws.physical_token_counts,
+            #     router_ws.rank_active_counts,
+            #     router_ws.physical_active,
+            #     router_ws.physical_experts_per_rank,
+            #     router_ws.ep_size)
             topk_ids = physical_buffer.view_as(topk_ids)
             greedy_used = True
 

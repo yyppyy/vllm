@@ -601,6 +601,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing,
             router_ws=self.router_ws)
 
+        # # redundant topk
+        # _, _, _ = FusedMoE.select_experts(
+        #     hidden_states=x,
+        #     router_logits=router_logits,
+        #     use_grouped_topk=use_grouped_topk,
+        #     top_k=top_k,
+        #     renormalize=renormalize,
+        #     topk_group=topk_group,
+        #     num_expert_group=num_expert_group,
+        #     custom_routing_function=custom_routing_function,
+        #     scoring_func=scoring_func,
+        #     routed_scaling_factor=routed_scaling_factor,
+        #     e_score_correction_bias=e_score_correction_bias,
+        #     indices_type=self.topk_indices_dtype,
+        #     enable_eplb=enable_eplb,
+        #     expert_map=expert_map,
+        #     expert_load_view=expert_load_view,
+        #     logical_to_physical_map=logical_to_physical_map,
+        #     logical_replica_count=logical_replica_count,
+        #     global_num_experts=global_num_experts,
+        #     zero_expert_num=zero_expert_num,
+        #     zero_expert_type=zero_expert_type,
+        #     mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing,
+        #     router_ws=self.router_ws)
+
         record_topk_for_batch(
             ep_rank=self.moe.moe_parallel_config.ep_rank,
             topk_tensor=topk_ids
@@ -642,6 +667,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
             )
+            # # redundant ffn
+            # _ = self.fused_experts(
+            #     hidden_states=x,
+            #     w1=layer.w13_weight,
+            #     w2=layer.w2_weight,
+            #     topk_weights=topk_weights,
+            #     topk_ids=topk_ids,
+            #     inplace=True,
+            #     activation=activation,
+            #     apply_router_weight_on_input=apply_router_weight_on_input,
+            #     global_num_experts=global_num_experts,
+            #     expert_map=expert_map,
+            # )
         else:
             assert fused_experts is not None
             result = fused_experts(
@@ -657,6 +695,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
             )
+            # # redundant ffn
+            # _ = fused_experts(
+            #     hidden_states=x,
+            #     w1=layer.w13_weight,
+            #     w2=layer.w2_weight,
+            #     topk_weights=topk_weights,
+            #     topk_ids=topk_ids,
+            #     inplace=True,
+            #     activation=activation,
+            #     quant_config=self.moe_quant_config,
+            #     apply_router_weight_on_input=apply_router_weight_on_input,
+            #     global_num_experts=global_num_experts,
+            #     expert_map=expert_map,
+            # )
 
         if zero_expert_num != 0 and zero_expert_type is not None:
             assert not isinstance(result, tuple), \
@@ -2054,6 +2106,8 @@ class FusedMoE(CustomOp):
             if do_naive_dispatch_combine:
                 hidden_states, router_logits = get_ep_group().dispatch(
                     hidden_states, router_logits, self.is_sequence_parallel)
+                # # redundant all2all dispatch
+                # _, _ = get_ep_group().dispatch(hidden_states, router_logits, self.is_sequence_parallel)
 
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
@@ -2095,7 +2149,8 @@ class FusedMoE(CustomOp):
                 if do_naive_dispatch_combine and do_combine:
                     states = get_ep_group().combine(states,
                                                     self.is_sequence_parallel)
-
+                    # # redundant all2all combine
+                    # _ = get_ep_group().combine(states, self.is_sequence_parallel)
                 if (not self.is_sequence_parallel and self.reduce_results
                         and (self.tp_size > 1 or self.ep_size > 1)):
                     states = self.maybe_all_reduce_tensor_model_parallel(
