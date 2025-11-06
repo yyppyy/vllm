@@ -33,12 +33,13 @@ def main():
     colors = get_palette(len(allgathers), name="okabe_ito")
     allgather_color = {ag: colors[i] for i, ag in enumerate(allgathers)}
 
-    fig, ax = plt.subplots(figsize=(5.5, 3.3))
+    fig, ax = plt.subplots(figsize=(3.5, 4))
 
     for j, ag in enumerate(allgathers):
         sub = df[df["allgather"] == ag].set_index("batch")
         x_pos = x + (j - (len(allgathers) - 1) / 2.0) * bar_width
         vals = sub.loc[batches, "runtime(ms)"].values
+        vals = [v * 1e3 for v in vals]  # to us
 
         ax.bar(
             x_pos,
@@ -52,8 +53,8 @@ def main():
 
     ax.set_xticks(x)
     ax.set_xticklabels([str(b) for b in batches])
-    ax.set_xlabel("batch")
-    ax.set_ylabel("runtime (ms)")
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Time (us)")
     # ax.set_title("Allgather runtime (GPUs=8)")
     ax.grid(axis="y", linestyle="--", alpha=0.35)
 

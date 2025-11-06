@@ -11,4 +11,5 @@
 !routing_solver_experts.pdf
 !routing_solver_time.pdf
 !.gitignore
+!all2all_8gpus.pdf
 !*.py
