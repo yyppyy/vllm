@@ -8,5 +8,7 @@
 !moe_vs_gpu_oi.pdf
 !token_balanced_vs_ideal_routing.pdf
 !latency_breakdown.pdf
+!routing_solver_experts.pdf
+!routing_solver_time.pdf
 !.gitignore
 !*.py
