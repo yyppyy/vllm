@@ -1,0 +1,344 @@
+#include "moe_ops.h"
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime.h>
+
+#include <limits>
+
+#ifndef USE_ROCM
+
+namespace {
+
+float _total_ms = 0.0;
+int _total_calls = 0;
+
+#ifndef EXPERTS_PER_THREAD
+#define EXPERTS_PER_THREAD 1
+#endif
+
+#ifndef LOCKING_THREADS
+#define LOCKING_THREADS 128
+#endif
+
+__device__ __forceinline__ void lock_acquire_block(int* m) {
+  while (atomicCAS(m, 0, 1) != 0) { /* spin */ }
+  __threadfence_block();
+}
+
+__device__ __forceinline__ void lock_release_block(int* m) {
+  __threadfence_block();
+  atomicExch(m, 0);
+}
+
+__global__ void mem_bound_router_greedy_kernel(
+    const int32_t* __restrict__ logical_ids,
+    int32_t* __restrict__ out_physical_ids,
+    const int32_t* __restrict__ logical_to_physical,
+    const int64_t* __restrict__ logical_replica_count,
+    int32_t* __restrict__ physical_token_counts, // unused
+    int32_t* __restrict__ rank_active_counts,    // ignored (using shared)
+    uint8_t* __restrict__ physical_active_flags, // unused
+    int64_t num_pairs,
+    int64_t num_logical_experts,
+    int64_t slots_per_logical,
+    int32_t physical_experts_per_rank,
+    int32_t ep_size,
+    int64_t physical_capacity, // unused
+    int64_t rank_capacity) {   // unused
+  if (blockIdx.x != 0) return;
+
+  constexpr int kMaxReplica = 2;
+
+  extern __shared__ uint8_t shared_bytes[];
+  size_t off = 0;
+
+  uint8_t*  logical_active   = reinterpret_cast<uint8_t*>(shared_bytes + off);
+  off += static_cast<size_t>(num_logical_experts) * sizeof(uint8_t);
+  off = (off + 3) & ~static_cast<size_t>(3);
+
+  int32_t*  logical_selection = reinterpret_cast<int32_t*>(shared_bytes + off);
+  off += static_cast<size_t>(num_logical_experts) * sizeof(int32_t);
+  off = (off + 3) & ~static_cast<size_t>(3);
+
+  int32_t*  rank_locks       = reinterpret_cast<int32_t*>(shared_bytes + off);
+  off += static_cast<size_t>(ep_size) * sizeof(int32_t);
+  off = (off + 3) & ~static_cast<size_t>(3);
+
+  int32_t*  rank_active_counts_smem = reinterpret_cast<int32_t*>(shared_bytes + off);
+
+  for (int64_t i = threadIdx.x; i < num_logical_experts; i += blockDim.x) {
+    logical_active[i] = 0;
+    logical_selection[i] = -1;
+  }
+  for (int32_t r = threadIdx.x; r < ep_size; r += blockDim.x) {
+    rank_locks[r] = 0;
+    rank_active_counts_smem[r] = 0;
+  }
+  __syncthreads();
+
+  for (int64_t idx = threadIdx.x; idx < num_pairs; idx += blockDim.x) {
+    const int32_t logical_id = logical_ids[idx];
+    logical_active[logical_id] = 1;
+  }
+  __syncthreads();
+  
+  const int participating = ((int)blockDim.x < LOCKING_THREADS)
+                          ? (int)blockDim.x
+                          : LOCKING_THREADS;
+  const bool participates = (threadIdx.x < participating);
+
+  if (participates) {
+    for (int64_t base = (num_logical_experts - 1)
+                        - (int64_t)threadIdx.x * EXPERTS_PER_THREAD;
+         base >= 0;
+         base -= (int64_t)participating * EXPERTS_PER_THREAD) {
+      #pragma unroll
+      for (int s = 0; s < EXPERTS_PER_THREAD; ++s) {
+        const int64_t logical = base - s;
+        if (logical < 0) break;
+        if (!logical_active[logical]) continue;
+
+        const int64_t rc_raw = logical_replica_count[logical];
+        const int32_t replica_count = (rc_raw > kMaxReplica) ? kMaxReplica : (int32_t)rc_raw;
+        if (replica_count <= 0) continue;
+
+        // Gather candidates
+        int candidate_phys[kMaxReplica];
+        int candidate_rank[kMaxReplica];
+        int candidate_count = 0;
+        #pragma unroll
+        for (int i = 0; i < replica_count; ++i) {
+          const int32_t phys = logical_to_physical[logical * slots_per_logical + i];
+          const int32_t r    = phys / physical_experts_per_rank;
+          candidate_phys[candidate_count] = phys;
+          candidate_rank[candidate_count] = r;
+          ++candidate_count;
+        }
+
+        // ── FAST PATH: exactly one replica -> no locking needed
+        if (replica_count == 1) {
+          const int chosen_phys = candidate_phys[0];
+          const int chosen_rank = candidate_rank[0];
+          logical_selection[logical] = chosen_phys;
+          // Atomic add in shared memory to avoid data races without locks
+          atomicAdd(&rank_active_counts_smem[chosen_rank], 1);
+          continue;
+        }
+
+        // // Build unique sorted ranks (tiny k -> simple O(k^2))
+        // int uniq_rank[kMaxReplica];
+        // int ucnt = 0;
+        // for (int i = 0; i < candidate_count; ++i) {
+        //   int r = candidate_rank[i];
+        //   bool seen = false;
+        //   for (int j = 0; j < ucnt; ++j) if (uniq_rank[j] == r) { seen = true; break; }
+        //   if (!seen) uniq_rank[ucnt++] = r;
+        // }
+        // if (ucnt == 2 && uniq_rank[1] < uniq_rank[0]) {
+        //   int t = uniq_rank[0]; uniq_rank[0] = uniq_rank[1]; uniq_rank[1] = t;
+        // }
+
+        // // Lock all involved ranks (ascending order) — deadlock-safe
+        // for (int j = 0; j < ucnt; ++j) {
+        //   lock_acquire_block(&rank_locks[uniq_rank[j]]);
+        // }
+
+        // Choose by minimal active count (now stable under locks)
+        
+        // for large replication degree (e.g., 1.5x capacity)
+        // int best_idx  = 0;
+        // int best_cost = rank_active_counts_smem[best_rank];
+        // int best_cost = candidate_phys[0] % physical_experts_per_rank;
+        // for (int i = 1; i < candidate_count; ++i) {
+        //   const int r = candidate_rank[i];
+        //   const int c = rank_active_counts_smem[r];
+        //   if (c < best_cost) {
+        //     const int c = candidate_phys[i] % physical_experts_per_rank;
+        //     if (c < best_cost) {
+        //       ...
+
+        int best_idx  = 0;
+        int best_rank = candidate_rank[0];
+        int best_cost = rank_active_counts_smem[best_rank];
+        for (int i = 1; i < candidate_count; ++i) {
+          const int r = candidate_rank[i];
+          const int c = rank_active_counts_smem[r];
+          const int turn = int(logical / 8); // psuedo random to break tie
+          if ((turn % 2) == 0) {
+            if (c < best_cost) {
+              best_cost = c;
+              best_rank = r;
+              best_idx  = i;
+            }
+          } else {
+            if (c <= best_cost) {
+              best_cost = c;
+              best_rank = r;
+              best_idx  = i;
+            }            
+          }
+        }
+
+        // Commit selection and increment chosen rank
+        const int chosen_phys = candidate_phys[best_idx];
+        logical_selection[logical] = chosen_phys;
+        ++rank_active_counts_smem[best_rank];
+
+        // // Release locks in reverse order
+        // for (int j = ucnt - 1; j >= 0; --j) {
+        //   lock_release_block(&rank_locks[uniq_rank[j]]);
+        // }
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int64_t idx = threadIdx.x; idx < num_pairs; idx += blockDim.x) {
+    const int32_t logical_id = logical_ids[idx];
+    out_physical_ids[idx] = logical_selection[logical_id];
+  }
+
+  (void)physical_token_counts;
+  (void)physical_active_flags;
+  (void)physical_capacity;
+  (void)rank_capacity;
+  (void)rank_active_counts; // ignored
+}
+
+}  // namespace
+
+void mem_bound_router_greedy(torch::Tensor logical_ids,
+                             torch::Tensor logical_to_physical_map,
+                             torch::Tensor logical_replica_count,
+                             torch::Tensor output,
+                             torch::Tensor physical_token_counts,
+                             torch::Tensor rank_active_counts,
+                             torch::Tensor physical_active,
+                             int64_t physical_experts_per_rank,
+                             int64_t ep_size) {
+  TORCH_CHECK(logical_ids.is_cuda(),
+              "logical_ids must reside on CUDA for mem_bound_router_greedy");
+  TORCH_CHECK(output.is_cuda(),
+              "output tensor must reside on CUDA for mem_bound_router_greedy");
+  TORCH_CHECK(logical_to_physical_map.is_cuda(),
+              "logical_to_physical_map must reside on CUDA");
+  TORCH_CHECK(logical_replica_count.is_cuda(),
+              "logical_replica_count must reside on CUDA");
+  TORCH_CHECK(physical_token_counts.is_cuda(),
+              "physical_token_counts must reside on CUDA");
+  TORCH_CHECK(rank_active_counts.is_cuda(),
+              "rank_active_counts must reside on CUDA");
+  TORCH_CHECK(physical_active.is_cuda(),
+              "physical_active must reside on CUDA");
+
+  TORCH_CHECK(
+      logical_ids.dim() == 1 && output.dim() == 1,
+      "mem_bound_router_greedy expects logical_ids/output to be flattened 1D");
+  TORCH_CHECK(logical_ids.numel() == output.numel(),
+              "logical_ids and output must have identical numel");
+  TORCH_CHECK(logical_ids.scalar_type() == at::kInt,
+              "logical_ids must be torch.int32");
+  TORCH_CHECK(output.scalar_type() == at::kInt,
+              "output must be torch.int32");
+  TORCH_CHECK(logical_to_physical_map.scalar_type() == at::kInt,
+              "logical_to_physical_map must be torch.int32");
+  TORCH_CHECK(logical_replica_count.scalar_type() == at::kLong,
+              "logical_replica_count must be torch.int64");
+  TORCH_CHECK(physical_token_counts.scalar_type() == at::kInt,
+              "physical_token_counts must be torch.int32");
+  TORCH_CHECK(rank_active_counts.scalar_type() == at::kInt,
+              "rank_active_counts must be torch.int32");
+  TORCH_CHECK(physical_active.scalar_type() == at::kByte,
+              "physical_active must be torch.uint8");
+
+  if (logical_ids.numel() == 0) {
+    return;
+  }
+
+  c10::cuda::CUDAGuard device_guard(logical_ids.device());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
+  physical_token_counts.zero_();
+  rank_active_counts.zero_();
+  physical_active.zero_();
+
+  const int64_t num_pairs = logical_ids.numel();
+  const int64_t num_logical_experts = logical_to_physical_map.size(0);
+  const int64_t slots_per_logical = logical_to_physical_map.size(1);
+  const int64_t physical_capacity = physical_token_counts.numel();
+  const int64_t rank_capacity = rank_active_counts.numel();
+
+  TORCH_CHECK(physical_capacity > 0,
+              "physical_token_counts workspace must have positive size");
+  TORCH_CHECK(rank_capacity > 0,
+              "rank_active_counts workspace must have positive size");
+  TORCH_CHECK(slots_per_logical > 0,
+              "logical_to_physical_map must have slot dimension > 0");
+
+  if (physical_experts_per_rank <= 0) {
+    physical_experts_per_rank = std::max<int64_t>(1, physical_capacity);
+  }
+  if (ep_size <= 0) {
+    ep_size = 1;
+  }
+
+  const dim3 grid(1);
+  const dim3 block(1024);
+  size_t shared_bytes = static_cast<size_t>(num_logical_experts);
+  shared_bytes = (shared_bytes + 3) & ~static_cast<size_t>(3);
+  shared_bytes +=
+      sizeof(int32_t) * static_cast<size_t>(num_logical_experts);
+  const auto* device_prop = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(shared_bytes <= static_cast<size_t>(device_prop->sharedMemPerBlock),
+              "mem_bound_router_greedy shared memory requirement exceeds device limit");
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventRecord(start, stream);
+  mem_bound_router_greedy_kernel<<<grid, block, shared_bytes, stream>>>(
+      logical_ids.data_ptr<int32_t>(),
+      output.data_ptr<int32_t>(),
+      logical_to_physical_map.data_ptr<int32_t>(),
+      logical_replica_count.data_ptr<int64_t>(),
+      physical_token_counts.data_ptr<int32_t>(),
+      rank_active_counts.data_ptr<int32_t>(),
+      physical_active.data_ptr<uint8_t>(),
+      num_pairs,
+      num_logical_experts,
+      slots_per_logical,
+      static_cast<int32_t>(physical_experts_per_rank),
+      static_cast<int32_t>(ep_size),
+      physical_capacity,
+      rank_capacity);
+  cudaEventRecord(stop, stream);
+  cudaEventSynchronize(stop);
+  float ms = 0.f;
+  cudaEventElapsedTime(&ms, start, stop);
+  _total_ms += ms;
+  _total_calls += 1;
+  printf("mem_bound_router_greedy call %d took %.3f ms (avg %.3f ms)\n",
+         _total_calls, ms, _total_ms / _total_calls); 
+
+    AT_CUDA_CHECK(cudaEventDestroy(start));
+    AT_CUDA_CHECK(cudaEventDestroy(stop));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+#else
+
+void mem_bound_router_greedy(torch::Tensor,
+                             torch::Tensor,
+                             torch::Tensor,
+                             torch::Tensor,
+                             torch::Tensor,
+                             torch::Tensor,
+                             torch::Tensor,
+                             int64_t,
+                             int64_t) {
+  TORCH_CHECK(false,
+              "mem_bound_router_greedy is not supported on ROCm builds");
+}
+
+#endif  // USE_ROCM
