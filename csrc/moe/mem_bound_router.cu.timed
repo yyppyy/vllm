@@ -321,8 +321,8 @@ void mem_bound_router_greedy(torch::Tensor logical_ids,
   printf("mem_bound_router_greedy call %d took %.3f ms (avg %.3f ms)\n",
          _total_calls, ms, _total_ms / _total_calls); 
 
-    AT_CUDA_CHECK(cudaEventDestroy(start));
-    AT_CUDA_CHECK(cudaEventDestroy(stop));
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
