@@ -35,7 +35,7 @@ args=(
   --enable-expert-parallel
   --max-num-seqs $CR
   --no-enable-chunked-prefill
-  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16, 32, 64, 256, 512, 4096]}"
+  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 32, 256, 512, 4096]}"
   --max-model-len 4096
   --max-num-batched-tokens $CS
   --expert-placement-strategy linear
