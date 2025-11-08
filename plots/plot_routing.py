@@ -40,7 +40,7 @@ def main():
     df = df[df["batch_per_chip"] == 32].copy()
 
     selected_algos = ["cpu_max_flow", "gpu_max_flow"]
-    selected_algos2 = ["eplb", "cpu_max_flow", "gpu_max_flow"]
+    selected_algos2 = ["eplb", "cpu_max_flow", "gpu_greedy_lock"]
     m = 'qwen.yaml'
     d = 'humaneval'
     df = df[df["algo"].isin(selected_algos) & (df["model_config"] == m) & (df["dataset"] == d)]
