@@ -9,6 +9,8 @@ from utils import (
     get_palette,
 )
 
+num_layers = 48
+
 # ---------------------------------------------
 # config
 # ---------------------------------------------
@@ -52,7 +54,8 @@ def main():
         bottom = np.zeros(len(replications), dtype=float)
 
         for comp in components:
-            vals = [val * 1e3 for val in sub.loc[replications, comp].values]
+            vals = [val * 1e6 / num_layers for val in sub.loc[replications, comp].values]
+            print(vals)
             ax.bar(
                 x_pos,
                 vals,
@@ -112,7 +115,7 @@ def main():
     ax.set_xticks(x)
     ax.set_xticklabels([str(r) for r in replications])
     ax.set_xlabel("Replication Ratio")
-    ax.set_ylabel("time (ms)")
+    ax.set_ylabel("time (us)")
     # ax.set_title("Per-replication stacked breakdown")
 
     ax.grid(axis="y")
