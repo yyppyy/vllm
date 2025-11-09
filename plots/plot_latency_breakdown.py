@@ -17,7 +17,8 @@ num_layers = 48
 CSV_PATH = Path("../results/latency_breakdown.csv")
 OUT_PATH = Path("latency_breakdown.pdf")
 
-components = ["topk", "routing", "all2all", "ffn", "attention"]
+components = ["topk", "routing_lock", "all2all", "ffn", "attention"]
+legend_components = ["Top-k", "Routing", "All2All / AllGather", "FFN", "Attention"]
 
 # hatches to distinguish routing_id
 ROUTING_HATCHES = {
@@ -44,32 +45,51 @@ def main():
     x = np.arange(len(replications), dtype=float)
     bar_width = 0.38 if len(routing_ids) == 2 else 0.8 / max(len(routing_ids), 1)
 
-    fig, ax = plt.subplots(figsize=(3.5, 4))
+    fig, ax = plt.subplots(figsize=(9, 3.5))
+
+    # y positions for each replication group
+    y = np.arange(len(replications), dtype=float)
 
     for j, rid in enumerate(routing_ids):
-        # shift for grouped bars
-        x_pos = x + (j - (len(routing_ids) - 1) / 2.0) * bar_width
+        # shift for grouped bars, but vertically now
+        y_pos = y + (j - (len(routing_ids) - 1) / 2.0) * bar_width
 
         sub = df[df["routing_id"] == rid].set_index("replication_id")
-        bottom = np.zeros(len(replications), dtype=float)
+        left = np.zeros(len(replications), dtype=float)
 
-        for comp in components:
+        for comp, lg in zip(components, legend_components):
             vals = [val * 1e6 / num_layers for val in sub.loc[replications, comp].values]
-            print(vals)
-            ax.bar(
-                x_pos,
+
+            bar_container = ax.barh(
+                y_pos,
                 vals,
                 bar_width,
-                bottom=bottom,
+                left=left,
                 color=comp_color_map[comp],
                 edgecolor="black",
                 linewidth=1,
                 hatch=ROUTING_HATCHES.get(rid, ""),
-                label=comp if j == 0 else None,  # components in legend only once
+                label=lg if j == 0 else None,  # components in legend only once
             )
-            bottom += vals
+            
+            # annotate each segment
+            for k, v in enumerate(vals):
+                if v == 0:
+                    continue
+                x_text = left[k] + v / 2.0     # middle of this stacked segment
+                y_text = y_pos[k]
+                ax.text(
+                    x_text,
+                    y_text,
+                    f"{v:.0f}",                # format however you like
+                    va="center",
+                    ha="center",
+                    fontsize=10,
+                    fontweight='bold'
+                )
+            
+            left += vals
 
-    # legends
     # component legend (colors)
     comp_handles, comp_labels = ax.get_legend_handles_labels()
 
@@ -85,46 +105,42 @@ def main():
             linewidth=1,
         )
         routing_handles.append(patch)
-        routing_labels.append("vLLM-EPLB" if rid == 0 else 'vLLM-NAME')
+        routing_labels.append("vLLM-EPLB" if rid == 0 else "vLLM-NAME")
 
-    # place legends to the right
+    # place legends above
     leg1 = ax.legend(
         comp_handles,
         comp_labels,
-        # title="Component",
-        # loc="upper left",
-        ncols=3,
+        ncols=5,
         loc="upper center",
-        bbox_to_anchor=(0.45, 1.34),
+        bbox_to_anchor=(0.32, 1.13),
         frameon=False,
     )
     ax.add_artist(leg1)
     ax.legend(
         routing_handles,
         routing_labels,
-        # title="Series",
-        # loc="lower left",
         ncols=2,
         loc="upper center",
-        bbox_to_anchor=(0.34, 1.15),
+        bbox_to_anchor=(0.85, 1.13),
         frameon=False,
     )
-    
-    # plt.subplots_adjust(top=0.7)
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(r) for r in replications])
-    ax.set_xlabel("Replication Ratio")
-    ax.set_ylabel("time (us)")
-    # ax.set_title("Per-replication stacked breakdown")
+    # y ticks correspond to replications
+    ax.set_yticks(y)
+    ax.set_yticklabels([str(r) for r in replications])
+    ax.set_ylabel("Replication Ratio")
 
-    ax.grid(axis="y")
-    ax.margins(x=0.03)
+    ax.set_xlabel("Time (us)")
 
-    fig.tight_layout()
-    plt.subplots_adjust(top=0.65)  # leave space at top
+    # ax.grid(axis="x", linestyle="--", alpha=0.4)
+    # ax.margins(y=0.03)
+
+    plt.subplots_adjust(top=0.9, bottom=0.15, left=0.1, right=0.99)  # leave space for legends
+    # fig.tight_layout()
     fig.savefig(OUT_PATH, format="pdf")
     print(f"saved to {OUT_PATH.resolve()}")
+
 
 if __name__ == "__main__":
     main()

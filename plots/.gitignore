@@ -12,4 +12,6 @@
 !routing_solver_time.pdf
 !.gitignore
 !all2all_8gpus.pdf
+!background_moe_ep.pdf
+!design_allgather.pdf
 !*.py

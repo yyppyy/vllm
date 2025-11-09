@@ -38,9 +38,9 @@ def apply_color_cycle(n_series: int, name: str = "okabe_ito"):
 def set_paper_style(*, base_font=11, dpi=300, grid_alpha=0.35):
     plt.rcParams.update({
         "figure.dpi": 180,
-        "savefig.dpi": dpi,
-        "savefig.bbox": "tight",
-        "savefig.pad_inches": 0.02,
+        # "savefig.dpi": dpi,
+        # "savefig.bbox": "tight",
+        # "savefig.pad_inches": 0.02,
         "font.size": base_font,
         "axes.titlesize": base_font + 1,
         "axes.labelsize": base_font,
