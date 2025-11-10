@@ -62,15 +62,6 @@ def main():
     # Figure 1: stacked avg_time_ms + avg_copy_ms
     # --------------------------------------------------
     fig1, ax1 = plt.subplots(figsize=(4, 4))
-    ax1.bar(
-        x,
-        vllm_eplb_ffn_time_us,
-        bar_width * len(algos),
-        color='white',
-        edgecolor="black", # keep frame
-        linewidth=1.0,
-        label="vLLM-EPLB FFN",
-    )
 
     for j, algo in enumerate(algos):
         sub = df[df["algo"] == algo].set_index("density_factor")
@@ -107,6 +98,16 @@ def main():
             )
             print(extra)
 
+    ax1.bar(
+        x,
+        vllm_eplb_ffn_time_us,
+        bar_width * len(algos),
+        facecolor=(0, 0, 1, 0.0),
+        edgecolor="black", # keep frame
+        linewidth=1.0,
+        label="FFN",
+    )
+    
     ax1.set_xticks(x)
     ax1.set_xticklabels([str(v) for v in density_vals])
     ax1.set_xlabel("Replication Ratio")
