@@ -7,6 +7,7 @@ from pathlib import Path
 from utils import (
     set_paper_style,
     get_palette,
+    HATCHES
 )
 
 num_layers = 48
@@ -19,13 +20,6 @@ OUT_PATH = Path("latency_breakdown.pdf")
 
 components = ["topk", "routing_lock", "all2all", "ffn", "attention"]
 legend_components = ["Top-k", "Routing", "All2All / AllGather", "FFN", "Attention"]
-
-# hatches to distinguish routing_id
-ROUTING_HATCHES = {
-    0: "",
-    1: "//",
-    2: "xx",   # in case you add more later
-}
 
 def main():
     # make it pretty
@@ -68,7 +62,7 @@ def main():
                 color=comp_color_map[comp],
                 edgecolor="black",
                 linewidth=1,
-                hatch=ROUTING_HATCHES.get(rid, ""),
+                hatch=HATCHES[rid%len(HATCHES)],
                 label=lg if j == 0 else None,  # components in legend only once
             )
             
@@ -101,7 +95,7 @@ def main():
             (0, 0), 1, 1,
             facecolor="white",
             edgecolor="black",
-            hatch=ROUTING_HATCHES.get(rid, ""),
+            hatch=HATCHES[rid%len(HATCHES)],
             linewidth=1,
         )
         routing_handles.append(patch)

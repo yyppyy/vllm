@@ -42,11 +42,11 @@ def set_paper_style(*, base_font=11, dpi=300, grid_alpha=0.35):
         # "savefig.bbox": "tight",
         # "savefig.pad_inches": 0.02,
         "font.size": base_font,
-        "axes.titlesize": base_font + 1,
+        "axes.titlesize": base_font,
         "axes.labelsize": base_font,
-        "xtick.labelsize": base_font - 1,
-        "ytick.labelsize": base_font - 1,
-        "legend.fontsize": base_font - 2,
+        "xtick.labelsize": base_font,
+        "ytick.labelsize": base_font,
+        "legend.fontsize": base_font,
         "axes.titlepad": 8,
         "axes.labelpad": 6,
         "axes.linewidth": 1.0,
@@ -57,3 +57,6 @@ def set_paper_style(*, base_font=11, dpi=300, grid_alpha=0.35):
     })
 
 MARKERS = ['o', 's', '^', 'D', 'v', 'X', 'P', '*', 'h', 'p']
+
+# hatches to distinguish routing_id
+HATCHES = ["//", "\\\\", "--", "xx", "||", "++", "oo", "**", ""]

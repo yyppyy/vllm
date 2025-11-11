@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from utils import set_paper_style, get_palette
+from utils import set_paper_style, get_palette, HATCHES
 
 CSV_PATH = Path("../results") / "routing_solver.csv"
 OUT_TIME = Path("routing_solver_time.pdf")
@@ -13,20 +13,25 @@ OUT_EXPERTS = Path("routing_solver_experts.pdf")
 algo_to_legend = {
     'cpu_max_flow': 'CPU Exact',
     'gpu_max_flow': 'GPU Exact',
-    'gpu_greedy_lock': 'NAME',
+    'gpu_greedy_lock': 'METRO',
     'eplb': 'EPLB',
 }
 
 algo_to_legend2 = {
     'cpu_max_flow': 'Exact',
     'gpu_max_flow': 'Exact',
-    'gpu_greedy_lock': 'NAME',
+    'gpu_greedy_lock': 'METRO',
     'eplb': 'EPLB',
 }
 
 model_to_legend = {
-    'qwen.yaml': 'Qwen',
-    'deepseek-v3.yaml': 'DeepSeek',
+    'qwen.yaml': 'Qwen3-30B',
+    'deepseek-v3.yaml': 'DeepSeek-V3',
+}
+
+dataset_to_legend = {
+    'humaneval': 'HumanEval',
+    'gsm8k': 'GSM8K',
 }
 
 vllm_eplb_ffn_time_us = [281.3125, 297.7916666666667, 310.7916666666667, 335.7083333333333]
@@ -61,7 +66,7 @@ def main():
     # --------------------------------------------------
     # Figure 1: stacked avg_time_ms + avg_copy_ms
     # --------------------------------------------------
-    fig1, ax1 = plt.subplots(figsize=(4, 4))
+    fig1, ax1 = plt.subplots(figsize=(4, 3.5))
 
     for j, algo in enumerate(algos):
         sub = df[df["algo"] == algo].set_index("density_factor")
@@ -77,6 +82,7 @@ def main():
             x_pos,
             base,
             bar_width,
+            hatch=HATCHES[j],
             color=algo_color_map[algo],
             edgecolor="black",
             linewidth=1,
@@ -89,6 +95,7 @@ def main():
                 x_pos,
                 extra,
                 bar_width,
+                hatch=HATCHES[2],
                 bottom=base,
                 color=algo_color_map[algo],
                 edgecolor="black",
@@ -109,7 +116,7 @@ def main():
     )
     
     ax1.set_xticks(x)
-    ax1.set_xticklabels([str(v) for v in density_vals])
+    ax1.set_xticklabels([f'{v}x' for v in density_vals], rotation=30)
     ax1.set_xlabel("Replication Ratio")
     ax1.set_ylabel("Time (us)")
     # ax1.set_title("Routing solver time breakdown")
@@ -117,16 +124,16 @@ def main():
     # legend on top
     leg1 = ax1.legend(
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.20),
+        bbox_to_anchor=(0.5, 1.26),
         ncol=len(algos),
         frameon=False,
         # title="algo",
     )
     # leave room for legend
-    plt.subplots_adjust(top=0.75)
+    fig1.subplots_adjust(top=0.85, bottom=0.22, left=0.16, right=0.99)
 
     ax1.grid(axis="y", linestyle="--", alpha=0.35)
-    fig1.tight_layout()
+    # fig1.tight_layout()
     fig1.savefig(OUT_TIME, format="pdf")
     print(f"saved {OUT_TIME}")
 
@@ -152,7 +159,7 @@ def main():
     datasets = ('humaneval', 'gsm8k')
     mds = [(m, d) for m in models for d in datasets]
     # create subplots with shared y so they all use the same scale
-    fig2, ax2s = plt.subplots(1, len(mds), figsize=(10, 3.5), sharey=True)
+    fig2, ax2s = plt.subplots(1, len(mds), figsize=(9, 3.5), sharey=True)
 
     # if len(mds) == 1, make ax2s iterable
     if not isinstance(ax2s, (list, np.ndarray)):
@@ -178,6 +185,7 @@ def main():
                 x_pos,
                 vals,
                 bar_width,
+                hatch=HATCHES[j%len(HATCHES)],
                 color=algo_color_map[algo],
                 edgecolor="black",
                 linewidth=1,
@@ -189,9 +197,9 @@ def main():
                 max_y = max(max_y, float(np.max(vals)))
 
         ax2.set_xticks(x)
-        ax2.set_xticklabels([str(v) for v in density_vals], rotation=30)
+        ax2.set_xticklabels([f'{v}x' for v in density_vals], rotation=30)
         ax2.grid(axis="y", linestyle="--", alpha=0.35)
-        ax2.set_title(f"{model_to_legend[md[0]]} / {md[1]}")
+        ax2.set_title(f"{model_to_legend[md[0]]} / {dataset_to_legend[md[1]]}")
 
     # apply the unified y-limit to all axes
     for i, ax2 in enumerate(ax2s):
@@ -216,7 +224,7 @@ def main():
     fig2.supxlabel("Replication Ratio")
 
     # tighten layout, remove horizontal gaps
-    fig2.subplots_adjust(top=0.84, bottom=0.2, wspace=0.0)
+    fig2.subplots_adjust(top=0.84, bottom=0.2, left=0.065, right=0.995, wspace=0.0)
 
     fig2.savefig(OUT_EXPERTS, format="pdf")
     print(f"saved {OUT_EXPERTS}")
