@@ -37,9 +37,9 @@ def main():
     comp_color_map = {comp: comp_colors[i] for i, comp in enumerate(components)}
 
     x = np.arange(len(replications), dtype=float)
-    bar_width = 0.38 if len(routing_ids) == 2 else 0.8 / max(len(routing_ids), 1)
+    bar_width = 0.36 if len(routing_ids) == 2 else 0.8 / max(len(routing_ids), 1)
 
-    fig, ax = plt.subplots(figsize=(9, 3.5))
+    fig, ax = plt.subplots(figsize=(8, 3.5))
 
     # y positions for each replication group
     y = np.arange(len(replications), dtype=float)
@@ -79,6 +79,7 @@ def main():
                     va="center",
                     ha="center",
                     fontsize=10,
+                    color='white',
                     fontweight='bold'
                 )
             
@@ -99,15 +100,15 @@ def main():
             linewidth=1,
         )
         routing_handles.append(patch)
-        routing_labels.append("vLLM-EPLB" if rid == 0 else "vLLM-NAME")
+        routing_labels.append("vLLM-EPLB" if rid == 0 else "vLLM-METRO")
 
     # place legends above
     leg1 = ax.legend(
         comp_handles,
         comp_labels,
-        ncols=5,
+        ncols=3,
         loc="upper center",
-        bbox_to_anchor=(0.32, 1.13),
+        bbox_to_anchor=(0.32, 1.25),
         frameon=False,
     )
     ax.add_artist(leg1)
@@ -116,7 +117,7 @@ def main():
         routing_labels,
         ncols=2,
         loc="upper center",
-        bbox_to_anchor=(0.85, 1.13),
+        bbox_to_anchor=(0.54, 1.157),
         frameon=False,
     )
 
@@ -130,7 +131,7 @@ def main():
     # ax.grid(axis="x", linestyle="--", alpha=0.4)
     # ax.margins(y=0.03)
 
-    plt.subplots_adjust(top=0.9, bottom=0.15, left=0.1, right=0.99)  # leave space for legends
+    plt.subplots_adjust(top=0.85, bottom=0.15, left=0.1, right=0.99)  # leave space for legends
     # fig.tight_layout()
     fig.savefig(OUT_PATH, format="pdf")
     print(f"saved to {OUT_PATH.resolve()}")

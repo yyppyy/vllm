@@ -159,7 +159,7 @@ def main():
     datasets = ('humaneval', 'gsm8k')
     mds = [(m, d) for m in models for d in datasets]
     # create subplots with shared y so they all use the same scale
-    fig2, ax2s = plt.subplots(1, len(mds), figsize=(9, 3.5), sharey=True)
+    fig2, ax2s = plt.subplots(1, len(mds), figsize=(8, 3.5), sharey=True)
 
     # if len(mds) == 1, make ax2s iterable
     if not isinstance(ax2s, (list, np.ndarray)):
@@ -191,6 +191,7 @@ def main():
                 linewidth=1,
                 label=algo_to_legend2[algo],
             )
+            print(vals)
 
             # track global max for unified y
             if len(vals) > 0:
@@ -199,7 +200,7 @@ def main():
         ax2.set_xticks(x)
         ax2.set_xticklabels([f'{v}x' for v in density_vals], rotation=30)
         ax2.grid(axis="y", linestyle="--", alpha=0.35)
-        ax2.set_title(f"{model_to_legend[md[0]]} / {dataset_to_legend[md[1]]}")
+        ax2.set_title(f"{model_to_legend[md[0]]}\n{dataset_to_legend[md[1]]}")
 
     # apply the unified y-limit to all axes
     for i, ax2 in enumerate(ax2s):
@@ -224,7 +225,7 @@ def main():
     fig2.supxlabel("Replication Ratio")
 
     # tighten layout, remove horizontal gaps
-    fig2.subplots_adjust(top=0.84, bottom=0.2, left=0.065, right=0.995, wspace=0.0)
+    fig2.subplots_adjust(top=0.8, bottom=0.2, left=0.07, right=0.995, wspace=0.0)
 
     fig2.savefig(OUT_EXPERTS, format="pdf")
     print(f"saved {OUT_EXPERTS}")

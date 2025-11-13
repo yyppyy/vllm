@@ -10,9 +10,25 @@ from utils import *
 
 import matplotlib.pyplot as plt
 
+total_experts = 128
+
 _FLOAT_RE = re.compile(
     r'avg_max_act_exp\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)'
 )
+
+metric_to_plot_left_adust = {
+    'total_token_throughput': 0.24,
+    'mean_ttft_ms': 0.24,
+    'mean_tpot_ms': 0.24,
+    'activated_experts': 0.24,
+}
+
+metric_to_ticks = {
+    'total_token_throughput': 7,
+    'mean_ttft_ms': 7,
+    'mean_tpot_ms': 8,
+    'activated_experts': 8,    
+}
 
 def get_last_avg_max_act_exp(path: str) -> float:
     """
@@ -77,7 +93,7 @@ def metric_to_ylabel(metric):
     elif metric == 'total_token_throughput':
         return 'Throughput (Tokens/s)'
     elif metric == 'activated_experts':
-        return 'Max Activated Experts per GPU'
+        return 'Max Act. Experts Per GPU'
     else:
         raise RuntimeError('unsupported metric')
 
@@ -87,9 +103,9 @@ def metric_to_title(metric):
     elif 'tpot' in metric:
         return 'Decode Latency'
     elif metric == 'total_token_throughput':
-        return 'Total Throughput'
+        return 'Total Token Throughput'
     elif metric == 'activated_experts':
-        return 'Activated Experts'
+        return 'Decode Expert Activation'
     else:
         return ''
 
@@ -204,7 +220,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
     apply_color_cycle(len(all_batch_sizes) * len(routing_ids), "tableau10")
 
     for metric in METRICS:
-        fig = plt.figure(figsize=(3.5, 3.5))
+        fig = plt.figure(figsize=(3.0, 2.4))
         ax = plt.gca()
 
         # clean axes
@@ -217,7 +233,7 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
         x_vals = np.array(sorted(reps), dtype=float)
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.set_xticks(x_vals)
-        ax.set_xticklabels([str(int(xx)) for xx in x_vals])
+        ax.set_xticklabels([f'{float(xx) / total_experts + 1}x' for xx in x_vals])
 
         max_h = 0.0
         series_idx = 0
@@ -248,21 +264,27 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
                     max_h = max(max_h, np.nanmax(arr))
 
         ax.set_ylabel(metric_to_ylabel(metric))
-        ax.set_xlabel("# Replicated Experts (128 Total)")
+        ax.set_xlabel("Replication Ratio")
         ax.set_title(metric_to_title(metric))
         if metric == 'total_token_throughput':
-            ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0), useMathText=True)
+            ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+            offset_text = ax.yaxis.get_offset_text()
+            offset_text.set_x(-0.1)
+            offset_text.set_y(0.5)
         if max_h > 0:
             ax.set_ylim(0, max_h * 1.15)
 
-        if series_idx > 0:
-            ax.legend(frameon=False, ncol=1, handlelength=2.2, columnspacing=1.0)
+        if metric == 'mean_tpot_ms':
+            if series_idx > 0:
+                ax.legend(frameon=False, ncol=1, handlelength=2.2, columnspacing=1.0)
 
         fig.tight_layout()
 
         bs_tag = ",".join(map(str, sorted(all_batch_sizes)))
         base = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}_bs{bs_tag}_{dataset_name.replace('/', '_')}"
         base.parent.mkdir(parents=True, exist_ok=True)
+        plt.locator_params(axis='y', nbins=metric_to_ticks[metric])
+        fig.subplots_adjust(top=0.88, bottom=0.2, left=metric_to_plot_left_adust[metric], right=0.97)
         fig.savefig(f"{base}.pdf", transparent=True)
         # fig.savefig(f"{base}.png", transparent=True)
         plt.close(fig)

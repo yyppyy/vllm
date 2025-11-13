@@ -131,7 +131,7 @@ def main():
             'elem_bytes': 2,
             'bytes_model': 'weights+activations'
         },
-        'Qwen3-30B-A3B': {
+        'Qwen3-30B': {
             'seq': 1,
             'D': 4096,
             'MD': 1536,
@@ -153,7 +153,7 @@ def main():
     set_paper_style()
     apply_color_cycle(len(gpu_ois) + 2, "tableau10")
     
-    fig = plt.figure(figsize=(3.5, 3.5))
+    fig = plt.figure(figsize=(3.5, 3))
     ax = plt.gca()
 
     # clean axes
@@ -172,7 +172,7 @@ def main():
     series_idx = 0
     max_h = 0
     
-    for model in ('DeepSeek-V3', 'Qwen3-30B-A3B'):
+    for model in ('DeepSeek-V3', 'Qwen3-30B'):
         mcfg = model2configs[model]
 
         cfg = MoEConfig(D=mcfg['D'], MD=mcfg['MD'], MR=mcfg['MR'], MS=mcfg['MS'],
@@ -207,14 +207,14 @@ def main():
         idx += 1
     max_h = max(max_h, max(x[1] for x in gpu_ois))
 
-    ax.set_ylabel('Operational Intensity (FLOP/Byte)')
+    ax.set_ylabel('Operational Intensity\n(FLOPs/byte)')
     ax.set_xlabel('Batch Size (Tokens)')
     # ax.set_title('')
     ax.legend()
     if max_h > 0:
         ax.set_ylim(-10, max_h * 1.15)
 
-    fig.tight_layout()
+    fig.subplots_adjust(top=0.99, bottom=0.17, left=0.23, right=0.97)
 
     base = Path(args.output_dir) / f"moe_vs_gpu_oi"
     base.parent.mkdir(parents=True, exist_ok=True)
