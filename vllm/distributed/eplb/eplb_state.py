@@ -193,7 +193,7 @@ class EplbState:
             global_physical_to_logical_map[phi_linear_idx] = log_expert_id
             # secondary replica
             if log_expert_id < num_redundant_experts:
-                sec_phi_id = (log_expert_id + 1) % num_redundant_experts
+                sec_phi_id = (log_expert_id + 1) if (log_expert_id % 2 == 0) else (log_expert_id - 1)
                 phi_rank_idx = sec_phi_id % num_ranks
                 phi_rank_offset = (sec_phi_id // num_ranks) + num_primary_phi_experts_per_rank
                 phi_linear_idx = phi_rank_idx * num_phi_experts_per_rank + phi_rank_offset

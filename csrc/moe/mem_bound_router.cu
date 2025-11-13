@@ -96,7 +96,6 @@ __global__ void mem_bound_router_greedy_kernel(
         const int64_t logical = base - s;
         if (logical < 0) break;
         if (!logical_active[logical]) {
-          __syncwarp();
           continue;
         }
 
@@ -123,57 +122,53 @@ __global__ void mem_bound_router_greedy_kernel(
           const int chosen_rank = candidate_rank[0];
           logical_selection[logical] = chosen_phys;
           // Atomic add in shared memory to avoid data races without locks
-          __syncwarp();
           atomicAdd(&rank_active_counts_smem[chosen_rank], 1);
           continue;
         }
 
-        // // Build unique sorted ranks (tiny k -> simple O(k^2))
-        // int uniq_rank[kMaxReplica];
-        // int ucnt = 0;
-        // for (int i = 0; i < candidate_count; ++i) {
-        //   int r = candidate_rank[i];
-        //   bool seen = false;
-        //   for (int j = 0; j < ucnt; ++j) if (uniq_rank[j] == r) { seen = true; break; }
-        //   if (!seen) uniq_rank[ucnt++] = r;
-        // }
-        // if (ucnt == 2 && uniq_rank[1] < uniq_rank[0]) {
-        //   int t = uniq_rank[0]; uniq_rank[0] = uniq_rank[1]; uniq_rank[1] = t;
-        // }
+        // Build unique sorted ranks (tiny k -> simple O(k^2))
+        int uniq_rank[kMaxReplica];
+        int ucnt = 0;
+        for (int i = 0; i < candidate_count; ++i) {
+          int r = candidate_rank[i];
+          bool seen = false;
+          for (int j = 0; j < ucnt; ++j) if (uniq_rank[j] == r) { seen = true; break; }
+          if (!seen) uniq_rank[ucnt++] = r;
+        }
+        if (ucnt == 2 && uniq_rank[1] < uniq_rank[0]) {
+          int t = uniq_rank[0]; uniq_rank[0] = uniq_rank[1]; uniq_rank[1] = t;
+        }
 
-        // // Lock all involved ranks (ascending order) — deadlock-safe
-        // for (int j = 0; j < ucnt; ++j) {
-        //   lock_acquire_block(&rank_locks[uniq_rank[j]]);
-        // }
+        // Lock all involved ranks (ascending order) — deadlock-safe
+        for (int j = 0; j < ucnt; ++j) {
+          lock_acquire_block(&rank_locks[uniq_rank[j]]);
+        }
 
         // Choose by minimal active count (now stable under locks)
 
         int best_idx  = 0;
         int best_rank = candidate_rank[0];
         int best_cost = rank_active_counts_smem[best_rank];
-        int best_phy = candidate_phys[0];
         for (int i = 1; i < candidate_count; ++i) {
           const int r = candidate_rank[i];
           const int c = rank_active_counts_smem[r];
           const int p = candidate_phys[i];
-          if (c < best_cost || ((best_cost == c) && ((p % physical_experts_per_rank) < (best_phy % physical_experts_per_rank)))) {
+          if (c < best_cost) {
             best_cost = c;
             best_rank = r;
             best_idx  = i;
-            best_phy = p;
           }
         }
-        __syncwarp();
 
         // Commit selection and increment chosen rank
         const int chosen_phys = candidate_phys[best_idx];
         logical_selection[logical] = chosen_phys;
         ++rank_active_counts_smem[best_rank];
 
-        // // Release locks in reverse order
-        // for (int j = ucnt - 1; j >= 0; --j) {
-        //   lock_release_block(&rank_locks[uniq_rank[j]]);
-        // }
+        // Release locks in reverse order
+        for (int j = ucnt - 1; j >= 0; --j) {
+          lock_release_block(&rank_locks[uniq_rank[j]]);
+        }
       }
     }
   }
