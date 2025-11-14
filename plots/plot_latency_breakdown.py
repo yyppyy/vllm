@@ -100,7 +100,7 @@ def main():
             linewidth=1,
         )
         routing_handles.append(patch)
-        routing_labels.append("vLLM-EPLB" if rid == 0 else "vLLM-METRO")
+        routing_labels.append("EPLB" if rid == 0 else "METRO")
 
     # place legends above
     leg1 = ax.legend(
@@ -117,7 +117,7 @@ def main():
         routing_labels,
         ncols=2,
         loc="upper center",
-        bbox_to_anchor=(0.54, 1.157),
+        bbox_to_anchor=(0.485, 1.159),
         frameon=False,
     )
 
