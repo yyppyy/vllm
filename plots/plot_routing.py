@@ -11,15 +11,15 @@ OUT_TIME = Path("routing_solver_time.pdf")
 OUT_EXPERTS = Path("routing_solver_experts.pdf")
 
 algo_to_legend = {
-    'cpu_max_flow': 'CPU Exact',
-    'gpu_max_flow': 'GPU Exact',
+    'cpu_max_flow': 'CPU Optimal',
+    'gpu_max_flow': 'GPU Optimal',
     'gpu_greedy_lock': 'METRO',
     'eplb': 'EPLB',
 }
 
 algo_to_legend2 = {
-    'cpu_max_flow': 'Exact',
-    'gpu_max_flow': 'Exact',
+    'cpu_max_flow': 'Optimal',
+    'gpu_max_flow': 'Optimal',
     'gpu_greedy_lock': 'METRO',
     'eplb': 'EPLB',
 }
