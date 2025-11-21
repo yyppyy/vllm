@@ -61,7 +61,9 @@ Join us at the [PyTorch Conference, October 22-23](https://events.linuxfoundatio
 
 - first-time setup: ```./setup.sh```
 - incremental setup: ```./setup.sh --incremental```
-- run benchmark: ```./bench_serve.sh 2 2 8 32```
+- run end-to-end benchmark: ```./bench_serve.sh 8 8 0 32 0 0 likaixin/InstructCoder```
+- run latency breakdown: ```git checkout latency_breakdown```; uncomment redundant components (search for redundant) in ```vllm/model_executor/layers/fused_moe/fused_moe.py```; run end-to-end, subtract original end-to-end to get the redundat component time
+
 - [incremental compilation workflow](https://docs.vllm.ai/en/stable/contributing/incremental_build.html#prerequisites)
 - [vllm bench serve](https://docs.vllm.ai/en/latest/cli/bench/serve.html#options)
 - [EPLB routing](https://github.com/vllm-project/vllm/blob/8bf8f4582208ac7af230512ff5f3ac1dc36d5222/vllm/model_executor/layers/fused_moe/fused_moe.py#L1110)
