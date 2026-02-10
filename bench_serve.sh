@@ -65,7 +65,8 @@ if (( USE_PROFILER > 0 )); then
     --capture-range=cudaProfilerApi \
     --capture-range-end=repeat \
     --output="$RES_DIR"/"$RUN_HASH"/profile \
-    VLLM_ALL2ALL_BACKEND=${ALLTOALL_BACKEND} vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
+    -- \
+    vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
   NSYS_PID=$!
   # Get the actual vllm PID (child of nsys)
   sleep 10  # Give nsys time to fork vllm
