@@ -16,3 +16,4 @@
 !design_allgather.pdf
 !GB200_*GPU_NVLS*.pdf
 !*.py
+!ep_vs_tp.pdf
