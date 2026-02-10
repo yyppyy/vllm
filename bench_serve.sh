@@ -50,7 +50,7 @@ if (( USE_EP > 0 )); then
   if (( MEM_BOUND_ROUTING > 0 )); then
     args+=( --mem-bound-aware-routing greedy )
   fi
-  args+=( --all2all-backend $ALLTOALL_BACKEND)
+  # args+=( --all2all-backend $ALLTOALL_BACKEND)
 else
   args+=( --no-enable-expert-parallel )
 fi
@@ -65,7 +65,7 @@ if (( USE_PROFILER > 0 )); then
     --capture-range=cudaProfilerApi \
     --capture-range-end=repeat \
     --output="$RES_DIR"/"$RUN_HASH"/profile \
-    vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
+    VLLM_ALL2ALL_BACKEND=${ALLTOALL_BACKEND} vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
   NSYS_PID=$!
   # Get the actual vllm PID (child of nsys)
   sleep 10  # Give nsys time to fork vllm
