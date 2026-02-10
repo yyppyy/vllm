@@ -8,8 +8,9 @@ BATCH_SIZE=$5
 MEM_BOUND_ROUTING=$6
 DATASET=$7
 DATASET_NAME=$8
+ALLTOALL_BACKEND=$9
 RES_DIR=./results
-RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}_${ALLTOALL_BACKEND}
 
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
 
@@ -47,6 +48,7 @@ if (( USE_EP > 0 )); then
   if (( MEM_BOUND_ROUTING > 0 )); then
     args+=( --mem-bound-aware-routing greedy )
   fi
+  args+=( --all2all-backend $ALLTOALL_BACKEND)
 else
   args+=( --no-enable-expert-parallel )
 fi
