@@ -57,6 +57,7 @@ fi
 
 unset VLLM_TORCH_PROFILER_DIR
 unset TOPK_DUMP_PREFIX
+export VLLM_ALL2ALL_BACKEND=${ALLTOALL_BACKEND}
 
 if (( USE_PROFILER > 0 )); then
   nsys profile \
