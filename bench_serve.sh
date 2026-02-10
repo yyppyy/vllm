@@ -2,14 +2,14 @@
 
 NUM_GPUS=$1
 EP_DEGREE=$2
-NUM_REPLICAS=$3
-BATCH_SIZE=$4
-MEM_BOUND_ROUTING=$5
-DATASET=$6
-DATASET_NAME=$7
+USE_EP=$3
+NUM_REPLICAS=$4
+BATCH_SIZE=$5
+MEM_BOUND_ROUTING=$6
+DATASET=$7
+DATASET_NAME=$8
 RES_DIR=./results
-
-RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}
 
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
 
@@ -32,7 +32,6 @@ args=(
   --port "$PORT"
   --data-parallel-size "$EP_DEGREE"
   --tensor-parallel-size 1
-  --enable-expert-parallel
   --max-num-seqs $MAX_REQ_PER_BATCH
   --no-enable-chunked-prefill
   --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]}"
@@ -41,11 +40,15 @@ args=(
   --expert-placement-strategy linear
 )
 
-args+=( --enable-eplb )
-args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
-
-if (( MEM_BOUND_ROUTING > 0 )); then
-  args+=( --mem-bound-aware-routing greedy )
+if (( USE_EP > 0 )); then
+  args+=( --enable-expert-parallel )
+  args+=( --enable-eplb )
+  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
+  if (( MEM_BOUND_ROUTING > 0 )); then
+    args+=( --mem-bound-aware-routing greedy )
+  fi
+else
+  args+=( --no-enable-expert-parallel )
 fi
 
 unset VLLM_TORCH_PROFILER_DIR
@@ -55,16 +58,16 @@ SERVER_PID=$!
 
 # Ensure we always stop the server on exit (success or failure)
 cleanup() {
-    # SIGINT lets vLLM shut down cleanly
     kill -INT "$SERVER_PID" 2>/dev/null || true
-    # wait a bit; if it's still around, escalate to SIGTERM
     sleep 30
     kill -TERM "$SERVER_PID" 2>/dev/null || true
-    # final fallback after a short wait
     sleep 10
     kill -KILL "$SERVER_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+
+################ client #################
 
 MAX_CONCURRENT_REQ=$((BATCH_SIZE * NUM_GPUS))
 
