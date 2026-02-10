@@ -6,11 +6,13 @@ USE_EP=$3
 NUM_REPLICAS=$4
 BATCH_SIZE=$5
 MEM_BOUND_ROUTING=$6
-DATASET=$7
-DATASET_NAME=$8
-ALLTOALL_BACKEND=$9
+ALLTOALL_BACKEND=$7
+DATASET=$8
+DATASET_NAME=$9
+USE_PROFILER=$10
 RES_DIR=./results
-RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${DATASET}_${ALLTOALL_BACKEND}
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}
+mkdir -p "$RES_DIR"/"$RUN_HASH"
 
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
 
@@ -55,16 +57,38 @@ fi
 
 unset VLLM_TORCH_PROFILER_DIR
 unset TOPK_DUMP_PREFIX
-vllm "${args[@]}" >"$RES_DIR/server_$RUN_HASH.log" 2>&1 &
-SERVER_PID=$!
+
+if (( USE_PROFILER > 0 )); then
+  nsys profile \
+    --trace-fork-before-exec=true \
+    --cuda-graph-trace=node \
+    --capture-range=cudaProfilerApi \
+    --capture-range-end=repeat \
+    --output="$RES_DIR"/"$RUN_HASH"/profile \
+    vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
+  NSYS_PID=$!
+  # Get the actual vllm PID (child of nsys)
+  sleep 10  # Give nsys time to fork vllm
+  SERVER_PID=$(pgrep -P "$NSYS_PID" | head -1)
+  if [[ -z "$SERVER_PID" ]]; then
+    SERVER_PID=$NSYS_PID  # Fallback if we can't find child
+  fi
+else
+  vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
+  SERVER_PID=$!
+  NSYS_PID=""
+fi
 
 # Ensure we always stop the server on exit (success or failure)
 cleanup() {
-    kill -INT "$SERVER_PID" 2>/dev/null || true
-    sleep 30
-    kill -TERM "$SERVER_PID" 2>/dev/null || true
-    sleep 10
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
+    if [[ -n "$NSYS_PID" ]]; then
+        # Signal nsys, it will handle stopping vllm
+        kill -INT "$NSYS_PID" 2>/dev/null || true
+        wait "$NSYS_PID" 2>/dev/null || true
+    else
+        kill -INT "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -79,7 +103,7 @@ cli_args=(
     --dataset-path $DATASET_NAME \
     --backend vllm
     --save-result
-    --result-filename "$RES_DIR"/bench_result_"$RUN_HASH".json
+    --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result.json
     --percentile-metrics ttft,tpot,itl,e2el
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 2400
@@ -87,5 +111,9 @@ cli_args=(
     --num-prompts $MAX_CONCURRENT_REQ
     --max-concurrency $MAX_CONCURRENT_REQ
 )
+
+if (( USE_PROFILER > 0 )); then
+  cli_args+=( --profile )
+fi
 
 vllm bench serve "${cli_args[@]}"
