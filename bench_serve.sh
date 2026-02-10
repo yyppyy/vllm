@@ -24,8 +24,8 @@ export NCCL_P2P_DISABLE=0
 export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
-CS=4096
-CR=$(( BATCH_SIZE > 128 ? 512 : BATCH_SIZE ))
+MAX_TOKEN_PER_BATCH=4096
+MAX_REQ_PER_BATCH=$BATCH_SIZE
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -33,18 +33,16 @@ args=(
   --data-parallel-size "$EP_DEGREE"
   --tensor-parallel-size 1
   --enable-expert-parallel
-  --max-num-seqs $CR
+  --max-num-seqs $MAX_REQ_PER_BATCH
   --no-enable-chunked-prefill
-  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 32, 256, 512, 4096]}"
+  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]}"
   --max-model-len 4096
-  --max-num-batched-tokens $CS
+  --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
 )
 
-# if (( NUM_REPLICAS > 0 )); then
-  args+=( --enable-eplb )
-  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
-# fi
+args+=( --enable-eplb )
+args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
 
 if (( MEM_BOUND_ROUTING > 0 )); then
   args+=( --mem-bound-aware-routing greedy )
@@ -68,7 +66,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MC=$(( BATCH_SIZE > 128 ? 512 : BATCH_SIZE * NUM_GPUS))
+MAX_CONCURRENT_REQ=$((BATCH_SIZE * NUM_GPUS))
 
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
@@ -79,10 +77,10 @@ cli_args=(
     --result-filename "$RES_DIR"/bench_result_"$RUN_HASH".json
     --percentile-metrics ttft,tpot,itl,e2el
     --metric-percentiles 10,20,30,40,50,95,99
-    --ready-check-timeout-sec 240
+    --ready-check-timeout-sec 2400
     --port "$PORT"
-    --num-prompts $MC
-    --max-concurrency $MC
+    --num-prompts $MAX_CONCURRENT_REQ
+    --max-concurrency $MAX_CONCURRENT_REQ
 )
 
 vllm bench serve "${cli_args[@]}"
