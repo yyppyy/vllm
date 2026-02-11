@@ -63,8 +63,10 @@ if (( USE_PROFILER > 0 )); then
   nsys profile \
     --trace-fork-before-exec=true \
     --cuda-graph-trace=node \
-    --capture-range=cudaProfilerApi \
-    --capture-range-end=repeat \
+    # --capture-range=cudaProfilerApi \
+    # --capture-range-end=repeat \
+    --delay 30 \
+    --duration 6000 \
     --output="$RES_DIR"/"$RUN_HASH"/profile \
     -- \
     vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
@@ -114,8 +116,8 @@ cli_args=(
     --max-concurrency $MAX_CONCURRENT_REQ
 )
 
-if (( USE_PROFILER > 0 )); then
-  cli_args+=( --profile )
-fi
+# if (( USE_PROFILER > 0 )); then
+#   cli_args+=( --profile )
+# fi
 
 vllm bench serve "${cli_args[@]}"
