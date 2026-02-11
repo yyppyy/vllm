@@ -63,8 +63,6 @@ if (( USE_PROFILER > 0 )); then
   nsys profile \
     --trace-fork-before-exec=true \
     --cuda-graph-trace=node \
-    # --capture-range=cudaProfilerApi \
-    # --capture-range-end=repeat \
     --delay 30 \
     --duration 6000 \
     --output="$RES_DIR"/"$RUN_HASH"/profile \
