@@ -70,31 +70,13 @@ if (( USE_PROFILER > 0 )); then
     -- \
     vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
   NSYS_PID=$!
-  # Get the actual vllm PID (child of nsys)
-  sleep 10  # Give nsys time to fork vllm
-  SERVER_PID=$(pgrep -P "$NSYS_PID" | head -1)
-  if [[ -z "$SERVER_PID" ]]; then
-    SERVER_PID=$NSYS_PID  # Fallback if we can't find child
-  fi
+  SESSION_PID=$NSYS_PID     # setsid => session leader PID == NSYS_PID
 else
-  vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
+  setsid vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
   SERVER_PID=$!
+  SESSION_PID=$SERVER_PID
   NSYS_PID=""
 fi
-
-# Ensure we always stop the server on exit (success or failure)
-cleanup() {
-    if [[ -n "$NSYS_PID" ]]; then
-        # Signal nsys, it will handle stopping vllm
-        kill -INT "$NSYS_PID" 2>/dev/null || true
-        wait "$NSYS_PID" 2>/dev/null || true
-    else
-        kill -INT "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
-
 
 ################ client #################
 
@@ -120,3 +102,35 @@ cli_args=(
 # fi
 
 vllm bench serve "${cli_args[@]}"
+
+
+############## kill server & collect profile and logs ##############
+# 1) Try graceful shutdown of everything in the session
+kill -INT  -- "-$SESSION_PID" 2>/dev/null || true
+
+# 2) Wait a bit for nsys to flush / children to exit
+for _ in {1..200}; do
+  kill -0 "$SESSION_PID" 2>/dev/null || break
+  sleep 0.1
+done
+
+# 3) Escalate if still alive
+if kill -0 "$SESSION_PID" 2>/dev/null; then
+  kill -TERM -- "-$SESSION_PID" 2>/dev/null || true
+  for _ in {1..100}; do
+    kill -0 "$SESSION_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
+
+# 4) Hard kill as last resort
+if kill -0 "$SESSION_PID" 2>/dev/null; then
+  kill -KILL -- "-$SESSION_PID" 2>/dev/null || true
+fi
+
+# 5) Reap nsys so zombies don’t stick around
+if [[ -n "${NSYS_PID:-}" ]]; then
+  wait "$NSYS_PID" 2>/dev/null || true
+fi
+
+wait "${NSYS_PID:-$SESSION_PID}"
