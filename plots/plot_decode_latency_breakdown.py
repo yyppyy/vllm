@@ -36,6 +36,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from matplotlib.ticker import MaxNLocator
 from collections import defaultdict
 import re
 
@@ -776,11 +778,40 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
     print(f"  Min:  {avg_breakdown['min']:.2f} ms")
     print(f"  Max:  {avg_breakdown['max']:.2f} ms")
 
-    return avg_breakdown
+    return avg_breakdown, dict(category_kernels)
+
+
+def shorten_kernel_name(name):
+    """Shorten a CUDA kernel name for display."""
+    # Strip 'void ' prefix
+    s = re.sub(r'^void\s+', '', name)
+    # Strip function parameters: everything from the first '(' that isn't inside '<>'
+    # Find the outermost '(' that comes after all template brackets are closed
+    depth = 0
+    cut = len(s)
+    for i, ch in enumerate(s):
+        if ch == '<':
+            depth += 1
+        elif ch == '>':
+            depth -= 1
+        elif ch == '(' and depth == 0:
+            cut = i
+            break
+    s = s[:cut]
+    # Simplify templates: keep only first type token inside <>
+    s = re.sub(r'<([^<>,]+),\s*[^>]+>', r'<\1>', s)
+    # Strip nested templates (e.g., <ReduceOp<float>>)
+    s = re.sub(r'<([^<>]+)<[^>]*>>', r'<\1>', s)
+    # Strip remaining numeric template args (e.g., <512, 1, ...>)
+    s = re.sub(r'<\d[\d, ]*>', '', s)
+    # Take last namespace component (e.g., vllm::moe::topkGatingSoftmax -> topkGatingSoftmax)
+    if '::' in s:
+        s = s.split('::')[-1]
+    return s.strip()
 
 
 def analyze_profile(profile_path, label):
-    """Analyze a single profile and return latency breakdown."""
+    """Analyze a single profile and return (breakdown, category_kernels)."""
     print(f"\n{'='*60}")
     print(f"Analyzing {label}: {profile_path.name}")
     print(f"{'='*60}")
@@ -796,22 +827,24 @@ def analyze_profile(profile_path, label):
 
     if not layers:
         print(f"ERROR: No layers found for {label}")
-        return None
+        return None, None
 
     # Compute breakdown
-    breakdown = compute_latency_breakdown(df, layers)
+    breakdown, cat_kernels = compute_latency_breakdown(df, layers)
 
     print(f"\nLatency breakdown for {label} (per decode layer):")
     for cat in ['attention', 'norm', 'topk', 'expert', 'communication', 'others']:
         print(f"  {cat.capitalize():<15s} {breakdown[cat]:.3f} ms ({breakdown[cat]/breakdown['total']*100:.1f}%)")
     print(f"  {'Total':<15s} {breakdown['total']:.3f} ms")
 
-    return breakdown
+    return breakdown, cat_kernels
 
 
-def plot_comparison(tp_breakdown, ep_breakdown):
+def plot_comparison(tp_breakdown, ep_breakdown,
+                    tp_kernels=None, ep_kernels=None):
     """Create stacked bar chart comparing TP and EP latency breakdowns."""
-    set_paper_style()
+    BASE_FONT = 11
+    set_paper_style(base_font=BASE_FONT)
 
     categories = ['attention', 'norm', 'topk', 'expert', 'communication', 'others']
     category_labels = {
@@ -823,61 +856,142 @@ def plot_comparison(tp_breakdown, ep_breakdown):
         'others': 'Others'
     }
 
+    # Filter out categories with zero values in both breakdowns
+    active_cats = [c for c in categories
+                   if tp_breakdown.get(c, 0.0) > 0 or ep_breakdown.get(c, 0.0) > 0]
+
     # Prepare data
     systems = ['Tensor Parallel', 'Expert Parallel']
-    tp_values = [tp_breakdown.get(cat, 0.0) for cat in categories]
-    ep_values = [ep_breakdown.get(cat, 0.0) for cat in categories]
+    tp_values = [tp_breakdown.get(cat, 0.0) for cat in active_cats]
+    ep_values = [ep_breakdown.get(cat, 0.0) for cat in active_cats]
 
-    # Create figure
-    fig, ax = plt.subplots(figsize=(8, 5))
+    # Create figure with two panels: bar chart (left) + kernel list (right)
+    fig = plt.figure(figsize=(12, 5))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1, 1.6], wspace=0.05)
+    ax = fig.add_subplot(gs[0])
+    ax_text = fig.add_subplot(gs[1])
 
-    # Get colors
-    colors = get_palette(len(categories), name="tableau10")
+    # Get colors (index into full palette to keep colors stable)
+    full_colors = get_palette(len(categories), name="tableau10")
+    colors = [full_colors[categories.index(c)] for c in active_cats]
+    hatches = [HATCHES[categories.index(c)] for c in active_cats]
 
-    # Width of bars
-    width = 0.5
+    # Bar layout
+    width = 0.55
     x = np.arange(len(systems))
 
     # Create stacked bars
     bottom_tp = 0.0
     bottom_ep = 0.0
 
-    for i, cat in enumerate(categories):
+    for i, cat in enumerate(active_cats):
         tp_val = tp_values[i]
         ep_val = ep_values[i]
 
-        # TP bar
         ax.bar(0, tp_val, width, bottom=bottom_tp,
-               color=colors[i], edgecolor='black', linewidth=1,
-               hatch=HATCHES[i], label=category_labels[cat])
+               color=colors[i], edgecolor='#333333', linewidth=0.8,
+               hatch=hatches[i], label=category_labels[cat])
 
-        # EP bar
         ax.bar(1, ep_val, width, bottom=bottom_ep,
-               color=colors[i], edgecolor='black', linewidth=1,
-               hatch=HATCHES[i])
+               color=colors[i], edgecolor='#333333', linewidth=0.8,
+               hatch=hatches[i])
+
+        # In-bar latency annotations (us)
+        ann_font = BASE_FONT - 2
+        for bar_x, val, bottom in [(0, tp_val, bottom_tp), (1, ep_val, bottom_ep)]:
+            if val > 0:
+                label = f'{val * 1000:.1f}'
+                ax.text(bar_x, bottom + val / 2, label,
+                        ha='center', va='center',
+                        fontsize=ann_font, fontweight='bold',
+                        color='white',
+                        path_effects=[
+                            pe.withStroke(
+                                linewidth=2, foreground='#333333')
+                        ])
 
         bottom_tp += tp_val
         bottom_ep += ep_val
 
-    # Formatting
-    ax.set_xticks(x)
-    ax.set_xticklabels(systems)
-    ax.set_ylabel('Latency per Layer (ms)')
-    ax.set_title('Decode Layer Latency Breakdown: TP vs EP')
-    ax.legend(loc='upper right', frameon=False)
+    # Y-axis
+    y_max = max(bottom_tp, bottom_ep)
+    ax.set_ylim(0, y_max * 1.18)
+    ax.set_ylabel('Latency per Decode Layer (ms)', fontsize=BASE_FONT)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=6, steps=[1, 2, 5, 10]))
     ax.grid(axis='y', linestyle='--', alpha=0.35)
 
-    # Add total latency annotations on top of bars
-    ax.text(0, bottom_tp, f'{bottom_tp:.1f}ms',
-            ha='center', va='bottom', fontsize=10, fontweight='bold')
-    ax.text(1, bottom_ep, f'{bottom_ep:.1f}ms',
-            ha='center', va='bottom', fontsize=10, fontweight='bold')
+    # X-axis
+    ax.set_xticks(x)
+    ax.set_xticklabels(systems, fontsize=BASE_FONT)
+    ax.set_xlim(-0.5, 1.5)
 
-    # Add speedup annotation
-    speedup = bottom_tp / bottom_ep if bottom_ep > 0 else 0
-    ax.text(0.5, max(bottom_tp, bottom_ep) * 1.05, f'{speedup:.2f}x',
-            ha='center', va='bottom', fontsize=11, fontweight='bold',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Total latency on top of bars
+    top_font = BASE_FONT
+    ax.text(0, bottom_tp + y_max * 0.015, f'{bottom_tp * 1000:.0f} us',
+            ha='center', va='bottom', fontsize=top_font, fontweight='bold')
+    ax.text(1, bottom_ep + y_max * 0.015, f'{bottom_ep * 1000:.0f} us',
+            ha='center', va='bottom', fontsize=top_font, fontweight='bold')
+
+    # Legend — below the bar chart
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.10),
+              ncol=2, frameon=False, fontsize=BASE_FONT - 1,
+              columnspacing=1.0, handletextpad=0.5)
+
+    # Remove top and right spines
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # ---- Right panel: kernel name listing per category ----
+    ax_text.axis('off')
+
+    if tp_kernels and ep_kernels:
+        list_font = BASE_FONT - 3  # 8pt for kernel names
+        header_font = BASE_FONT - 1  # 10pt for category headers
+
+        # Column x-positions (in axes coords)
+        col_tp_x = 0.05   # TP column
+        col_ep_x = 0.55   # EP column
+
+        # Column headers
+        y = 0.97
+        ax_text.text(col_tp_x, y, 'Tensor Parallel', fontsize=header_font,
+                     fontweight='bold', transform=ax_text.transAxes, va='top',
+                     family='monospace')
+        ax_text.text(col_ep_x, y, 'Expert Parallel', fontsize=header_font,
+                     fontweight='bold', transform=ax_text.transAxes, va='top',
+                     family='monospace')
+        y -= 0.05
+
+        for i, cat in enumerate(active_cats):
+            color = colors[i]
+            tp_names = sorted(shorten_kernel_name(k) for k in tp_kernels.get(cat, set()))
+            ep_names = sorted(shorten_kernel_name(k) for k in ep_kernels.get(cat, set()))
+
+            # Category header (colored)
+            ax_text.text(col_tp_x, y, category_labels[cat],
+                         fontsize=header_font, fontweight='bold', color=color,
+                         transform=ax_text.transAxes, va='top')
+            ax_text.text(col_ep_x, y, category_labels[cat],
+                         fontsize=header_font, fontweight='bold', color=color,
+                         transform=ax_text.transAxes, va='top')
+            y -= 0.04
+
+            # List kernels side by side
+            max_rows = max(len(tp_names), len(ep_names))
+            for j in range(max_rows):
+                if j < len(tp_names):
+                    ax_text.text(col_tp_x + 0.02, y, tp_names[j],
+                                 fontsize=list_font, color='#333333',
+                                 transform=ax_text.transAxes, va='top',
+                                 family='monospace')
+                if j < len(ep_names):
+                    ax_text.text(col_ep_x + 0.02, y, ep_names[j],
+                                 fontsize=list_font, color='#333333',
+                                 transform=ax_text.transAxes, va='top',
+                                 family='monospace')
+                y -= 0.03
+
+            y -= 0.02  # gap between categories
 
     fig.tight_layout()
     fig.savefig(OUTPUT_FILE, format='pdf', bbox_inches='tight')
@@ -886,15 +1000,15 @@ def plot_comparison(tp_breakdown, ep_breakdown):
 
 def main():
     # Analyze both profiles
-    tp_breakdown = analyze_profile(TP_PROFILE, "Tensor Parallel")
-    ep_breakdown = analyze_profile(EP_PROFILE, "Expert Parallel")
+    tp_breakdown, tp_kernels = analyze_profile(TP_PROFILE, "Tensor Parallel")
+    ep_breakdown, ep_kernels = analyze_profile(EP_PROFILE, "Expert Parallel")
 
     if tp_breakdown is None or ep_breakdown is None:
         print("\nERROR: Failed to analyze one or both profiles")
         return
 
     # Create comparison plot
-    plot_comparison(tp_breakdown, ep_breakdown)
+    plot_comparison(tp_breakdown, ep_breakdown, tp_kernels, ep_kernels)
 
     # Print summary comparison
     print("\n" + "="*70)
