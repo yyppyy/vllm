@@ -5,7 +5,7 @@ Analyze nsys profile data to generate decoding latency breakdown.
 This script:
 1. Exports nsys-rep files to SQLite format (or uses pre-exported files)
 2. Identifies decode batches using marker events
-3. Categorizes CUDA kernels into: attention, topk, communication, expert, others
+3. Categorizes CUDA kernels into: attention, norm, communication, expert, others
 4. Computes average latency excluding outliers
 5. Generates visualization comparing TP vs EP
 
@@ -108,15 +108,15 @@ def categorize_kernel(kernel_name):
     Categorize CUDA kernel based on its name.
 
     Categories:
-    - attention: Attention-related kernels (flash attention, gemm for QK/AV)
-    - topk: Top-K selection kernels
-    - communication: Inter-GPU communication (NCCL, all-reduce, etc.)
-    - expert: Expert computation (MoE-related)
-    - others: Everything else
+    - attention: Flash attention, KV cache, QKV/output projections, input reshaping
+    - norm: RMSNorm, residual connections, RoPE (rotary position embeddings)
+    - topk: TopK gating/routing decision and weight normalization
+    - expert: Token dispatch, expert GEMM, FFN activation, output aggregation
+    - communication: Inter-GPU communication (NCCL collectives)
+    - others: Remaining unclassified kernels
 
-    IMPORTANT: Check order matters! MoE/expert must come before attention because
-    some MoE kernels (e.g., topkGatingSoftmax) contain 'softmax' which would
-    otherwise match the attention category.
+    IMPORTANT: Check order matters! TopK must come before expert because
+    topkGatingSoftmax also matches 'moe::' in the expert patterns.
     """
     name_lower = kernel_name.lower()
 
@@ -127,24 +127,52 @@ def categorize_kernel(kernel_name):
     ]):
         return 'communication'
 
-    # Expert/MoE patterns (check BEFORE attention - moe::topkGatingSoftmax contains 'softmax')
+    # TopK routing (check BEFORE expert - topkGatingSoftmax also matches 'moe::')
+    # Includes the gating kernel and surrounding routing weight normalization ops
+    if any(pattern in name_lower for pattern in [
+        'topk', 'top_k', 'select_top', 'argmax', 'argtop',
+    ]):
+        return 'topk'
+
+    # TopK routing data ops (directly before/after topkGatingSoftmax):
+    # - DivFunctor: routing weight normalization (softmax division)
+    # - reduce_kernel<float> (NOT bfloat16): routing weight sum (softmax denominator)
+    if 'divfunctor' in name_lower:
+        return 'topk'
+    if 'reduce_kernel' in name_lower and 'float' in name_lower and 'bfloat' not in name_lower:
+        return 'topk'
+
+    # Expert/MoE patterns (check BEFORE attention)
     if any(pattern in name_lower for pattern in [
         'fused_moe', 'moe_align_block', 'count_and_sort_expert',
-        'moe::', 'expert', 'router', 'routing'
+        'moe::', 'expert', 'router', 'routing',
     ]):
         return 'expert'
 
-    # Check for specific gemm patterns that are expert FFN
+    # Expert FFN activation (SiLU/GeLU between up/down projections)
+    if 'act_and_mul_kernel' in name_lower:
+        return 'expert'
+
+    # EP token dispatch/routing kernels (scatter/gather for token-to-expert assignment)
+    if any(pattern in name_lower for pattern in [
+        'scatter_add', 'gather_index',
+    ]):
+        return 'expert'
+
+    # Expert-specific GEMM patterns
     if 'gemm' in name_lower and any(pattern in name_lower for pattern in [
         'sliced', 'grouped', 'splitk'
     ]):
         return 'expert'
 
-    # TopK patterns
+    # Expert data ops:
+    # - reduce_kernel<BFloat16>: expert output aggregation
+    # - direct_copy_kernel: data casting/copying within MoE pipeline
+    # - gpu_index_kernel: token permutation for expert dispatch (EP only)
     if any(pattern in name_lower for pattern in [
-        'topk', 'top_k', 'select_top', 'argmax', 'argtop'
+        'reduce_kernel', 'direct_copy_kernel', 'gpu_index_kernel',
     ]):
-        return 'topk'
+        return 'expert'
 
     # Attention patterns
     if any(pattern in name_lower for pattern in [
@@ -156,6 +184,25 @@ def categorize_kernel(kernel_name):
     # Attention projection GEMV kernels (cuBLAS matrix-vector multiply for QKV/output projections)
     if 'gemvx' in name_lower or 'gemv' in name_lower:
         return 'attention'
+
+    # Attention input reshaping (fused_view = tensor reshape for QKV)
+    if 'fused_view' in name_lower:
+        return 'attention'
+
+    # Normalization + residual patterns
+    # RMSNorm: triton kernels with mean+pow (RMS computation) or mean+pow+rsqrt (full norm)
+    # Residual: fused add+mul+sub (residual connection and/or RoPE application)
+    if any(pattern in name_lower for pattern in [
+        'rmsnorm', 'rms_norm', 'layernorm', 'layer_norm',
+        'fused__to_copy_mean_pow',          # RMSNorm: mean + pow
+        'fused__to_copy_add_mean_mul_pow',  # residual add + RMSNorm fused
+        'fused_add_mul_sub',                # residual connection / RoPE
+    ]):
+        return 'norm'
+
+    # Remaining unmatched Triton kernels (e.g., triton_poi_fused_2) sit in the MoE section
+    if name_lower.startswith('triton_'):
+        return 'expert'
 
     return 'others'
 
@@ -620,13 +667,13 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
     # Check if we got any data
     if not layer_breakdowns:
         print("\nERROR: No layer breakdown data collected!")
-        return {'attention': 0.0, 'topk': 0.0, 'communication': 0.0, 'expert': 0.0, 'others': 0.0, 'total': 0.0}
+        return {'attention': 0.0, 'norm': 0.0, 'topk': 0.0, 'expert': 0.0, 'communication': 0.0, 'others': 0.0, 'total': 0.0}
 
     # Print unique kernels per category
     print(f"\n" + "="*70)
     print("KERNEL CATEGORIZATION - ALL UNIQUE KERNELS")
     print("="*70)
-    categories = ['attention', 'topk', 'communication', 'expert', 'others']
+    categories = ['attention', 'norm', 'topk', 'expert', 'communication', 'others']
     for cat in categories:
         kernels = sorted(category_kernels[cat])
         print(f"\n{cat.upper()} ({len(kernels)} unique kernels):")
@@ -708,7 +755,7 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
             print(" (no events!)")
 
     # Average only across stable (non-outlier) layers
-    categories = ['attention', 'topk', 'communication', 'expert', 'others']
+    categories = ['attention', 'norm', 'topk', 'expert', 'communication', 'others']
     avg_breakdown = {}
 
     for cat in categories:
@@ -755,12 +802,9 @@ def analyze_profile(profile_path, label):
     breakdown = compute_latency_breakdown(df, layers)
 
     print(f"\nLatency breakdown for {label} (per decode layer):")
-    print(f"  Attention:      {breakdown['attention']:.2f} ms ({breakdown['attention']/breakdown['total']*100:.1f}%)")
-    print(f"  TopK:           {breakdown['topk']:.2f} ms ({breakdown['topk']/breakdown['total']*100:.1f}%)")
-    print(f"  Communication:  {breakdown['communication']:.2f} ms ({breakdown['communication']/breakdown['total']*100:.1f}%)")
-    print(f"  Expert:         {breakdown['expert']:.2f} ms ({breakdown['expert']/breakdown['total']*100:.1f}%)")
-    print(f"  Others:         {breakdown['others']:.2f} ms ({breakdown['others']/breakdown['total']*100:.1f}%)")
-    print(f"  Total:          {breakdown['total']:.2f} ms")
+    for cat in ['attention', 'norm', 'topk', 'expert', 'communication', 'others']:
+        print(f"  {cat.capitalize():<15s} {breakdown[cat]:.3f} ms ({breakdown[cat]/breakdown['total']*100:.1f}%)")
+    print(f"  {'Total':<15s} {breakdown['total']:.3f} ms")
 
     return breakdown
 
@@ -769,12 +813,13 @@ def plot_comparison(tp_breakdown, ep_breakdown):
     """Create stacked bar chart comparing TP and EP latency breakdowns."""
     set_paper_style()
 
-    categories = ['attention', 'topk', 'communication', 'expert', 'others']
+    categories = ['attention', 'norm', 'topk', 'expert', 'communication', 'others']
     category_labels = {
         'attention': 'Attention',
-        'topk': 'Top-K',
+        'norm': 'Norm + Residual',
+        'topk': 'TopK Routing',
+        'expert': 'Expert (MoE)',
         'communication': 'Communication',
-        'expert': 'Expert',
         'others': 'Others'
     }
 
@@ -858,7 +903,7 @@ def main():
     print(f"{'Category':<15} {'TP (ms)':<12} {'EP (ms)':<12} {'Diff (ms)':<12} {'Speedup':<10}")
     print("-"*70)
 
-    categories = ['attention', 'topk', 'communication', 'expert', 'others', 'total']
+    categories = ['attention', 'norm', 'topk', 'expert', 'communication', 'others', 'total']
     for cat in categories:
         tp_val = tp_breakdown.get(cat, 0.0)
         ep_val = ep_breakdown.get(cat, 0.0)
@@ -881,7 +926,7 @@ def main():
     # Identify largest differences
     print("\nLargest differences:")
     diffs = [(cat, tp_breakdown.get(cat, 0) - ep_breakdown.get(cat, 0))
-             for cat in ['attention', 'topk', 'communication', 'expert', 'others']]
+             for cat in ['attention', 'norm', 'topk', 'expert', 'communication', 'others']]
     diffs.sort(key=lambda x: abs(x[1]), reverse=True)
     for cat, diff in diffs[:3]:
         pct = abs(diff) / tp_total * 100 if tp_total > 0 else 0
