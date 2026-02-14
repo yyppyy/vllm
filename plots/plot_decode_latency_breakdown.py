@@ -47,8 +47,8 @@ EP_PROFILE = Path("../results/vllm_results_dev/8_8_1_0_4_0_allgather_reducescatt
 OUTPUT_FILE = Path(__file__).parent / "decode_latency_breakdown.pdf"
 
 # Layer markers (start and end of a single transformer layer)
-LAYER_START_MARKER = "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x6_tn"
-LAYER_END_MARKER = "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_1"
+LAYER_START_MARKER = "triton_red_fused__to_copy_mean_pow_2"
+LAYER_END_MARKER = "ncclDevKernel_Reduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)"
 
 # Analyze only the last N layers to ensure we're in decode phase (not prefill)
 ANALYZE_LAST_N_LAYERS = 100
@@ -113,22 +113,32 @@ def categorize_kernel(kernel_name):
     - communication: Inter-GPU communication (NCCL, all-reduce, etc.)
     - expert: Expert computation (MoE-related)
     - others: Everything else
+
+    IMPORTANT: Check order matters! MoE/expert must come before attention because
+    some MoE kernels (e.g., topkGatingSoftmax) contain 'softmax' which would
+    otherwise match the attention category.
     """
     name_lower = kernel_name.lower()
 
-    # Communication patterns
+    # Communication patterns (check first - NCCL is unambiguous)
     if any(pattern in name_lower for pattern in [
         'nccl', 'allreduce', 'allgather', 'reducescatter',
         'alltoall', 'p2p', 'send', 'recv', 'broadcast'
     ]):
         return 'communication'
 
-    # Attention patterns
+    # Expert/MoE patterns (check BEFORE attention - moe::topkGatingSoftmax contains 'softmax')
     if any(pattern in name_lower for pattern in [
-        'flash', 'fmha', 'attention', 'attn',
-        'scaled_dot_product', 'softmax'
+        'fused_moe', 'moe_align_block', 'count_and_sort_expert',
+        'moe::', 'expert', 'router', 'routing'
     ]):
-        return 'attention'
+        return 'expert'
+
+    # Check for specific gemm patterns that are expert FFN
+    if 'gemm' in name_lower and any(pattern in name_lower for pattern in [
+        'sliced', 'grouped', 'splitk'
+    ]):
+        return 'expert'
 
     # TopK patterns
     if any(pattern in name_lower for pattern in [
@@ -136,18 +146,16 @@ def categorize_kernel(kernel_name):
     ]):
         return 'topk'
 
-    # Expert/MoE patterns
+    # Attention patterns
     if any(pattern in name_lower for pattern in [
-        'moe', 'expert', 'gate', 'router', 'routing'
+        'flash', 'fmha', 'attention', 'attn',
+        'scaled_dot_product', 'reshape_and_cache'
     ]):
-        return 'expert'
+        return 'attention'
 
-    # Check for specific gemm patterns that might be expert FFN
-    # Expert FFNs often use specific gemm configurations
-    if 'gemm' in name_lower and any(pattern in name_lower for pattern in [
-        'sliced', 'grouped', 'splitk'
-    ]):
-        return 'expert'
+    # Attention projection GEMV kernels (cuBLAS matrix-vector multiply for QKV/output projections)
+    if 'gemvx' in name_lower or 'gemv' in name_lower:
+        return 'attention'
 
     return 'others'
 
@@ -201,11 +209,17 @@ def load_cuda_events(sqlite_path):
             break
 
     # Find device/GPU ID column
+    # IMPORTANT: Only use actual GPU device ID columns, NOT contextId or streamId.
+    # NCCL kernels and compute kernels run on different streams/contexts on the same GPU,
+    # so grouping by stream/context would incorrectly separate markers from their kernels.
     device_col = None
-    for col in ['deviceId', 'device', 'gpuId', 'contextId', 'streamId']:
+    for col in ['deviceId', 'device', 'gpuId']:
         if col in columns:
             device_col = col
             break
+    if device_col is None:
+        print("WARNING: No GPU device ID column found. All events will be treated as same device.")
+        print(f"  Available columns: {list(columns.keys())}")
 
     if not all([name_col, start_col, end_col]):
         print(f"ERROR: Could not find required columns")
@@ -237,11 +251,15 @@ def load_cuda_events(sqlite_path):
 
         # Join with StringIds to get actual kernel names
         device_select = f"k.{device_col} as device_id," if device_col else "0 as device_id,"
+        stream_select = "k.streamId as stream_id," if 'streamId' in columns else "0 as stream_id,"
+        pid_select = "k.globalPid as global_pid," if 'globalPid' in columns else "0 as global_pid,"
         query = f"""
         SELECT
             k.{start_col} as start_ns,
             k.{end_col} as end_ns,
             {device_select}
+            {stream_select}
+            {pid_select}
             COALESCE(s.value, CAST(k.{name_col} AS TEXT)) as name
         FROM {kernel_table} k
         LEFT JOIN StringIds s ON k.{name_col} = s.id
@@ -250,11 +268,15 @@ def load_cuda_events(sqlite_path):
     else:
         # Direct query without join
         device_select = f"{device_col} as device_id," if device_col else "0 as device_id,"
+        stream_select = "streamId as stream_id," if 'streamId' in columns else "0 as stream_id,"
+        pid_select = "globalPid as global_pid," if 'globalPid' in columns else "0 as global_pid,"
         query = f"""
         SELECT
             {start_col} as start_ns,
             {end_col} as end_ns,
             {device_select}
+            {stream_select}
+            {pid_select}
             {name_col} as name
         FROM {kernel_table}
         ORDER BY {start_col}
@@ -271,12 +293,34 @@ def load_cuda_events(sqlite_path):
 
     print(f"Loaded {len(df)} CUDA kernel events")
 
-    # Show device distribution
+    # Show device, stream, and globalPid distribution
     if 'device_id' in df.columns:
         device_counts = df['device_id'].value_counts().sort_index()
         print(f"\nEvents per device:")
         for device_id, count in device_counts.items():
             print(f"  Device {device_id}: {count} events")
+
+    if 'global_pid' in df.columns:
+        pid_counts = df['global_pid'].value_counts().sort_index()
+        print(f"\nEvents per globalPid (each = one GPU rank):")
+        for pid, count in pid_counts.items():
+            print(f"  globalPid={pid}: {count} events")
+
+        # In multi-GPU multi-process setups (torchrun), each rank sees its GPU as device 0.
+        # All ranks' kernels appear with deviceId=0 but different globalPid values.
+        # Filter to a single rank (the one with the most events) to get one GPU's view.
+        if len(pid_counts) > 1:
+            chosen_pid = pid_counts.idxmax()
+            print(f"\nMulti-rank profile detected ({len(pid_counts)} ranks). "
+                  f"Filtering to single rank: globalPid={chosen_pid} ({pid_counts[chosen_pid]} events)")
+            df = df[df['global_pid'] == chosen_pid].reset_index(drop=True)
+            print(f"After filtering: {len(df)} events")
+
+    if 'stream_id' in df.columns:
+        stream_counts = df['stream_id'].value_counts().sort_index()
+        print(f"\nEvents per stream (after rank filtering):")
+        for stream_id, count in stream_counts.items():
+            print(f"  Stream {stream_id}: {count} events")
 
     # Verify we have actual kernel names, not just IDs
     sample_names = df['name'].head(20).to_list()
@@ -304,97 +348,98 @@ def load_cuda_events(sqlite_path):
 
 def find_decode_layers(df):
     """
-    Find decode layer boundaries using marker events, grouped by device.
+    Find decode layer boundaries using marker events, grouped by device and stream.
 
-    Returns list of tuples: (device_id, layer_idx, start_time_ns, end_time_ns)
+    Multiple CUDA streams may execute the same layer in parallel (one per batch element).
+    We pick one representative stream per device to avoid counting the same work N times.
+
+    Returns list of tuples: (device_id, stream_id, layer_idx, start_time_ns, end_time_ns)
     """
     print(f"\nSearching for layer markers...")
     print(f"  Start marker: {LAYER_START_MARKER}")
     print(f"  End marker: {LAYER_END_MARKER}")
 
-    # Find layer start events (try exact match first, then partial)
+    # Find layer start events
     start_events = df[df['name'].str.contains(LAYER_START_MARKER, regex=False, na=False)]
-    if len(start_events) == 0:
-        # Try partial match with just the key part
-        partial_marker = LAYER_START_MARKER.split('_')[0:3]  # e.g., "ampere_bf16_s16816gemm"
-        partial_pattern = '_'.join(partial_marker)
-        print(f"  No exact match for start marker, trying partial: {partial_pattern}")
-        start_events = df[df['name'].str.contains(partial_pattern, regex=False, na=False)]
+    print(f"  Found {len(start_events)} instances of start marker")
 
     # Find layer end events
     end_events = df[df['name'].str.contains(LAYER_END_MARKER, regex=False, na=False)]
-    if len(end_events) == 0:
-        # Try partial match
-        partial_marker = LAYER_END_MARKER.split('_')[0:3]  # e.g., "triton_red_fused"
-        partial_pattern = '_'.join(partial_marker)
-        print(f"  No exact match for end marker, trying partial: {partial_pattern}")
-        end_events = df[df['name'].str.contains(partial_pattern, regex=False, na=False)]
-
-    print(f"Found {len(start_events)} layer start markers total")
-    print(f"Found {len(end_events)} layer end markers total")
-
-    # Group by device
-    devices = sorted(df['device_id'].unique())
-    print(f"\nDevices found: {devices}")
+    print(f"  Found {len(end_events)} instances of end marker")
 
     if len(start_events) == 0 or len(end_events) == 0:
         print("\nWARNING: No layer markers found!")
         print("Layer start marker:", LAYER_START_MARKER)
         print("Layer end marker:", LAYER_END_MARKER)
-        print("\nSearching for similar kernel names...")
-
-        # Search for similar patterns
-        print("\nKernels containing 'ampere' or 'gemm':")
-        similar = df[df['name'].str.contains('ampere|gemm', case=False, regex=True, na=False)]
-        if len(similar) > 0:
-            print(similar['name'].unique()[:10])
-        else:
-            print("  None found")
-
-        print("\nKernels containing 'triton' or 'fused':")
-        similar = df[df['name'].str.contains('triton|fused', case=False, regex=True, na=False)]
-        if len(similar) > 0:
-            print(similar['name'].unique()[:10])
-        else:
-            print("  None found")
-
         return []
+
+    # Show marker distribution by stream
+    start_stream_counts = start_events['stream_id'].value_counts().sort_index()
+    end_stream_counts = end_events['stream_id'].value_counts().sort_index()
+    print(f"\nStart markers per stream:")
+    for sid, cnt in start_stream_counts.items():
+        print(f"  Stream {sid}: {cnt}")
+    print(f"End markers per stream:")
+    for sid, cnt in end_stream_counts.items():
+        print(f"  Stream {sid}: {cnt}")
+
+    # Group by device
+    devices = sorted(df['device_id'].unique())
+    print(f"\nDevices found: {devices}")
 
     all_layers = []
 
     # Process each device separately
     for device_id in devices:
-        # Filter events for this device
-        device_start_events = start_events[start_events['device_id'] == device_id]
-        device_end_events = end_events[end_events['device_id'] == device_id]
+        device_start = start_events[start_events['device_id'] == device_id]
+        device_end = end_events[end_events['device_id'] == device_id]
 
-        print(f"\nDevice {device_id}:")
-        print(f"  Start markers: {len(device_start_events)}")
-        print(f"  End markers: {len(device_end_events)}")
-
-        if len(device_start_events) == 0 or len(device_end_events) == 0:
-            print(f"  Skipping device {device_id} - missing markers")
+        if len(device_start) == 0 or len(device_end) == 0:
+            print(f"\nDevice {device_id}: Skipping - missing markers")
             continue
 
-        # Get both start and end times for the marker events
-        start_times = device_start_events['start_ns'].values
-        start_end_times = device_start_events['end_ns'].values
-        end_start_times = device_end_events['start_ns'].values
-        end_end_times = device_end_events['end_ns'].values
+        # Find streams that have BOTH start and end markers
+        start_streams = set(device_start['stream_id'].unique())
+        end_streams = set(device_end['stream_id'].unique())
+        common_streams = sorted(start_streams & end_streams)
 
-        # Match start and end events for this device
-        # A layer runs from when the start marker begins to when the end marker ends
-        # We match each start marker with the first end marker that STARTS after the start marker BEGINS
+        print(f"\nDevice {device_id}:")
+        print(f"  Streams with start markers: {sorted(start_streams)}")
+        print(f"  Streams with end markers: {sorted(end_streams)}")
+        print(f"  Streams with both: {common_streams}")
+
+        if not common_streams:
+            # Start and end markers on different streams - try cross-stream matching
+            print(f"  WARNING: No stream has both markers. Using cross-stream matching.")
+            # Pick the stream with most start markers
+            best_stream = device_start['stream_id'].value_counts().idxmax()
+            stream_start = device_start[device_start['stream_id'] == best_stream]
+            # Use end markers from any stream on this device
+            stream_end = device_end
+            chosen_stream = best_stream
+        else:
+            # Pick the stream with the most start markers
+            best_stream = max(common_streams, key=lambda s: len(device_start[device_start['stream_id'] == s]))
+            stream_start = device_start[device_start['stream_id'] == best_stream]
+            stream_end = device_end[device_end['stream_id'] == best_stream]
+            chosen_stream = best_stream
+
+        print(f"  Chosen stream: {chosen_stream}")
+        print(f"  Start markers on chosen stream: {len(stream_start)}")
+        print(f"  End markers on chosen stream: {len(stream_end)}")
+
+        # Match start and end events
+        start_times = stream_start['start_ns'].values
+        end_start_times = stream_end['start_ns'].values
+        end_end_times = stream_end['end_ns'].values
+
         device_layers = []
         for i, start_time in enumerate(start_times):
-            # Find the first end marker that starts after this start marker begins
             matching_end_indices = np.where(end_start_times > start_time)[0]
             if len(matching_end_indices) > 0:
-                # Get the index of the first matching end marker
                 end_idx = matching_end_indices[0]
-                # Use the END time of that end marker as the layer end
                 end_time = end_end_times[end_idx]
-                device_layers.append((device_id, i, start_time, end_time))
+                device_layers.append((device_id, chosen_stream, i, start_time, end_time))
 
         print(f"  Identified {len(device_layers)} layers")
 
@@ -410,8 +455,8 @@ def find_decode_layers(df):
         if device_layers_to_use:
             sample_layers = device_layers_to_use[:3]
             print(f"  Sample layer durations:")
-            for dev_id, idx, start, end in sample_layers:
-                print(f"    Layer {idx}: {(end - start)/1e6:.2f} ms")
+            for dev_id, stream_id, idx, start, end in sample_layers:
+                print(f"    Layer {idx} (stream {stream_id}): {(end - start)/1e3:.1f} us")
 
         all_layers.extend(device_layers_to_use)
 
@@ -426,7 +471,7 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
 
     Args:
         df: DataFrame with CUDA events (times in nanoseconds)
-        layers: List of (device_id, layer_idx, start_time_ns, end_time_ns) tuples
+        layers: List of (device_id, stream_id, layer_idx, start_time_ns, end_time_ns) tuples
         skip_first_n: Number of initial layers to skip as warmup outliers PER DEVICE
 
     Returns: dict of category -> average latency in ms (converted for readability)
@@ -442,7 +487,7 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
     for device_id, device_layers in layers_by_device.items():
         if len(device_layers) <= skip_first_n:
             print(f"WARNING: Device {device_id} has only {len(device_layers)} layers, but skipping {skip_first_n}")
-            skip_n = max(0, len(device_layers) - 10)  # Keep at least 10 layers if possible
+            skip_n = max(0, len(device_layers) - 10)
         else:
             skip_n = skip_first_n
 
@@ -452,27 +497,14 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
     print(f"\nTotal layers to analyze: {len(layers_to_analyze)}")
 
     # Debug: check time ranges
-    print(f"\nDEBUG: Time range analysis")
-    print(f"  DataFrame event time range:")
-    print(f"    Min: {df['start_ns'].min()/1e6:.2f} ms ({df['start_ns'].min():.0f} ns)")
-    print(f"    Max: {df['end_ns'].max()/1e6:.2f} ms ({df['end_ns'].max():.0f} ns)")
-    print(f"  Layer time range:")
     if layers_to_analyze:
         first_layer = layers_to_analyze[0]
         last_layer = layers_to_analyze[-1]
-        print(f"    First layer: {first_layer[1]/1e6:.2f} - {first_layer[2]/1e6:.2f} ms")
-        print(f"    Last layer:  {last_layer[1]/1e6:.2f} - {last_layer[2]/1e6:.2f} ms")
-
-        # Check overlap
-        layer_min = min(l[1] for l in layers_to_analyze)
-        layer_max = max(l[2] for l in layers_to_analyze)
-        df_min = df['start_ns'].min()
-        df_max = df['end_ns'].max()
-
-        if layer_max < df_min or layer_min > df_max:
-            print(f"\n  WARNING: No overlap between layer times and event times!")
-            print(f"    Layer range: {layer_min/1e6:.2f} - {layer_max/1e6:.2f} ms")
-            print(f"    Event range: {df_min/1e6:.2f} - {df_max/1e6:.2f} ms")
+        # Tuple format: (device_id, stream_id, layer_idx, start_time_ns, end_time_ns)
+        print(f"  First layer: dev={first_layer[0]} stream={first_layer[1]} idx={first_layer[2]} "
+              f"{first_layer[3]/1e6:.2f} - {first_layer[4]/1e6:.2f} ms")
+        print(f"  Last layer:  dev={last_layer[0]} stream={last_layer[1]} idx={last_layer[2]} "
+              f"{last_layer[3]/1e6:.2f} - {last_layer[4]/1e6:.2f} ms")
 
     # Collect latency breakdown for each layer
     layer_breakdowns = []
@@ -484,51 +516,102 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
     # Debug: show details for first layer
     show_debug = True
 
-    for idx, (device_id, layer_idx, start_time, end_time) in enumerate(layers_to_analyze):
-        # Get all events that overlap with this layer (times in ns) AND are from the same device
-        # An event overlaps if: event_start < layer_end AND event_end > layer_start
+    for idx, (device_id, stream_id, layer_idx, start_time, end_time) in enumerate(layers_to_analyze):
+        # Get all events that overlap with this layer AND are on the same device+stream.
+        # Filtering by stream ensures we only capture kernels from ONE batch element,
+        # not from all concurrent streams (which would N-x duplicate the count).
         layer_events = df[
             (df['device_id'] == device_id) &
+            (df['stream_id'] == stream_id) &
             (df['start_ns'] < end_time) &
             (df['end_ns'] > start_time)
         ]
 
         if show_debug and idx == 0:
             print(f"\nDEBUG: First layer analysis")
-            print(f"  Device: {device_id}")
-            print(f"  Layer time range: {start_time/1e6:.2f} - {end_time/1e6:.2f} ms")
-            print(f"  Duration: {(end_time - start_time)/1e6:.2f} ms")
-            print(f"  Events in layer: {len(layer_events)}")
-            print(f"\n  ALL events in first layer:")
+            print(f"  Device: {device_id}, Stream: {stream_id}")
+            print(f"  Layer time range: {start_time/1e3:.1f} - {end_time/1e3:.1f} us")
+            print(f"  Duration: {(end_time - start_time)/1e3:.1f} us")
+
+            # Verify stream filtering is working
+            all_overlap = df[
+                (df['device_id'] == device_id) &
+                (df['start_ns'] < end_time) &
+                (df['end_ns'] > start_time)
+            ]
+            stream_dist = all_overlap['stream_id'].value_counts().sort_index()
+            print(f"  All overlapping events (any stream): {len(all_overlap)}")
+            print(f"  Per-stream breakdown of overlapping events:")
+            for sid, cnt in stream_dist.items():
+                print(f"    Stream {sid}: {cnt} events")
+            print(f"  Events on chosen stream {stream_id}: {len(layer_events)}")
+            # Check for overlapping events - print timestamps relative to layer start
+            print(f"\n  ALL events in first layer (times relative to layer start):")
             for i, (_, event) in enumerate(layer_events.iterrows()):
                 cat = categorize_kernel(event['name'])
-                print(f"    {i+1:3d}. [{cat:15s}] {event['duration_ns']/1e6:7.3f}ms | {event['name']}")
+                rel_start = (event['start_ns'] - start_time) / 1e3  # relative start in us
+                rel_end = (event['end_ns'] - start_time) / 1e3  # relative end in us
+                print(f"    {i+1:3d}. [{cat:15s}] {rel_start:8.1f} - {rel_end:8.1f}us ({event['duration_ns']/1e3:6.1f}us) "
+                      f"stream={event['stream_id']} | {event['name'][:90]}")
 
-            # Show category distribution
+            # Show category distribution (raw, before merging)
             cat_counts = defaultdict(int)
             cat_times = defaultdict(float)
             for _, event in layer_events.iterrows():
                 cat = categorize_kernel(event['name'])
                 cat_counts[cat] += 1
                 cat_times[cat] += event['duration_ns']
-            print(f"\n  Category distribution:")
+            print(f"\n  Category distribution (raw, before merging):")
             for cat, count in sorted(cat_counts.items()):
-                total_time_ms = cat_times[cat] / 1e6
-                print(f"    {cat:15s}: {count:3d} kernels, {total_time_ms:7.2f} ms total")
+                total_time_us = cat_times[cat] / 1e3
+                print(f"    {cat:15s}: {count:3d} kernels, {total_time_us:7.1f} us total (sum of durations)")
 
-        # Categorize and sum latencies (in nanoseconds, convert to ms at the end)
-        breakdown = defaultdict(float)
-        layer_kernel_categories = set()  # Track which categories are present in this layer
-
+        # Merge overlapping events of the same kernel name to get wall-clock durations.
+        # CUDA Graph replay causes N concurrent instances of the same kernel to appear
+        # with overlapping timestamps. We group by kernel name, then merge overlapping
+        # intervals within each group. This handles both consecutive and interleaved patterns.
+        events_by_name = defaultdict(list)
         for _, event in layer_events.iterrows():
-            category = categorize_kernel(event['name'])
-            breakdown[category] += event['duration_ns']
+            events_by_name[event['name']].append((event['start_ns'], event['end_ns']))
 
-            # Track which categories have non-zero latency
-            if event['duration_ns'] > 0:
+        merged_events = []  # list of (name, merged_start_ns, merged_end_ns)
+        for name, intervals in events_by_name.items():
+            # Sort intervals by start time and merge overlapping ones
+            intervals.sort()
+            merged_start, merged_end = intervals[0]
+            for s, e in intervals[1:]:
+                if s < merged_end:  # overlapping
+                    merged_end = max(merged_end, e)
+                else:
+                    merged_events.append((name, merged_start, merged_end))
+                    merged_start, merged_end = s, e
+            merged_events.append((name, merged_start, merged_end))
+
+        # Clip merged events to layer boundaries
+        clipped_events = []
+        for name, m_start, m_end in merged_events:
+            c_start = max(m_start, start_time)
+            c_end = min(m_end, end_time)
+            if c_end > c_start:
+                clipped_events.append((name, c_end - c_start))
+
+        if show_debug and idx == 0:
+            print(f"\n  After merging overlapping events: {len(merged_events)} merged (from {len(layer_events)} raw)")
+            print(f"  After clipping to layer: {len(clipped_events)} events")
+            merged_total = sum(d for _, d in clipped_events)
+            print(f"  Merged total duration: {merged_total/1e3:.1f} us (vs wall-clock {(end_time - start_time)/1e3:.1f} us)")
+
+        # Categorize and sum latencies from merged events
+        breakdown = defaultdict(float)
+        layer_kernel_categories = set()
+
+        for name, duration_ns in clipped_events:
+            category = categorize_kernel(name)
+            breakdown[category] += duration_ns
+
+            if duration_ns > 0:
                 layer_kernel_categories.add(category)
-                # Track unique kernel names per category
-                category_kernels[category].add(event['name'])
+                category_kernels[category].add(name)
 
         layer_breakdowns.append(breakdown)
         # Create signature: frozenset of categories with non-zero latency
@@ -589,11 +672,11 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
 
     print(f"\nAll layer statistics (after signature filter, before latency outlier removal):")
     print(f"  Total layers: {len(total_latencies_ns)}")
-    print(f"  Median: {median_latency / 1e6:.2f} ms")
-    print(f"  Mean:   {mean_latency / 1e6:.2f} ms")
-    print(f"  Std:    {std_latency / 1e6:.2f} ms")
-    print(f"  Min:    {np.min(total_latencies_ns) / 1e6:.2f} ms")
-    print(f"  Max:    {np.max(total_latencies_ns) / 1e6:.2f} ms")
+    print(f"  Median: {median_latency / 1e3:.1f} us ({median_latency / 1e6:.3f} ms)")
+    print(f"  Mean:   {mean_latency / 1e3:.1f} us")
+    print(f"  Std:    {std_latency / 1e3:.1f} us")
+    print(f"  Min:    {np.min(total_latencies_ns) / 1e3:.1f} us")
+    print(f"  Max:    {np.max(total_latencies_ns) / 1e3:.1f} us")
 
     # Filter latency outliers: only keep layers with latency <= median
     # This removes slow outliers while keeping the stable, typical layers
