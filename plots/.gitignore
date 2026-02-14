@@ -16,4 +16,5 @@
 !design_allgather.pdf
 !GB200_*GPU_NVLS*.pdf
 !*.py
+!decode_latency_breakdown.pdf
 !ep_vs_tp.pdf
