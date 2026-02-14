@@ -57,7 +57,10 @@ fi
 
 unset VLLM_TORCH_PROFILER_DIR
 unset TOPK_DUMP_PREFIX
-export VLLM_ALL2ALL_BACKEND=${ALLTOALL_BACKEND}
+# HACK: patch the default VLLM_ALL2ALL_BACKEND in envs.py instead of
+# setting the env var, which conflicts with nsys profiling.
+ENVS_PY="$(python3 -c 'import vllm.envs; print(vllm.envs.__file__)')"
+sed -i "s|env_with_choices(\"VLLM_ALL2ALL_BACKEND\", \"[^\"]*\"|env_with_choices(\"VLLM_ALL2ALL_BACKEND\", \"${ALLTOALL_BACKEND}\"|" "$ENVS_PY"
 unset VLLM_ALL2ALL_BACKEND
 
 if (( USE_PROFILER > 0 )); then
