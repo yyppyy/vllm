@@ -180,7 +180,7 @@ def load_cuda_events(sqlite_path):
     columns = {col[1]: col[2] for col in cursor.fetchall()}  # name: type
     print(f"Available columns: {list(columns.keys())[:20]}...")  # Show first 20
 
-    # Find the right columns for name, start, end
+    # Find the right columns for name, start, end, device
     # Common variations:
     name_col = None
     for col in ['demangledName', 'shortName', 'name', 'kernelName']:
@@ -200,6 +200,13 @@ def load_cuda_events(sqlite_path):
             end_col = col
             break
 
+    # Find device/GPU ID column
+    device_col = None
+    for col in ['deviceId', 'device', 'gpuId', 'contextId', 'streamId']:
+        if col in columns:
+            device_col = col
+            break
+
     if not all([name_col, start_col, end_col]):
         print(f"ERROR: Could not find required columns")
         print(f"  Name column: {name_col}")
@@ -208,7 +215,7 @@ def load_cuda_events(sqlite_path):
         conn.close()
         raise ValueError("Missing required columns")
 
-    print(f"Using columns: name={name_col}, start={start_col}, end={end_col}")
+    print(f"Using columns: name={name_col}, start={start_col}, end={end_col}, device={device_col}")
 
     # Check if we need to join with StringIds table for kernel names
     # In nsys exports, kernel names are often stored as IDs that reference StringIds table
@@ -229,10 +236,12 @@ def load_cuda_events(sqlite_path):
         print(f"Sample StringIds entries: {samples}")
 
         # Join with StringIds to get actual kernel names
+        device_select = f"k.{device_col} as device_id," if device_col else "0 as device_id,"
         query = f"""
         SELECT
             k.{start_col} as start_ns,
             k.{end_col} as end_ns,
+            {device_select}
             COALESCE(s.value, CAST(k.{name_col} AS TEXT)) as name
         FROM {kernel_table} k
         LEFT JOIN StringIds s ON k.{name_col} = s.id
@@ -240,10 +249,12 @@ def load_cuda_events(sqlite_path):
         """
     else:
         # Direct query without join
+        device_select = f"{device_col} as device_id," if device_col else "0 as device_id,"
         query = f"""
         SELECT
             {start_col} as start_ns,
             {end_col} as end_ns,
+            {device_select}
             {name_col} as name
         FROM {kernel_table}
         ORDER BY {start_col}
@@ -259,6 +270,13 @@ def load_cuda_events(sqlite_path):
     df['duration_ns'] = df['end_ns'] - df['start_ns']
 
     print(f"Loaded {len(df)} CUDA kernel events")
+
+    # Show device distribution
+    if 'device_id' in df.columns:
+        device_counts = df['device_id'].value_counts().sort_index()
+        print(f"\nEvents per device:")
+        for device_id, count in device_counts.items():
+            print(f"  Device {device_id}: {count} events")
 
     # Verify we have actual kernel names, not just IDs
     sample_names = df['name'].head(20).to_list()
@@ -286,9 +304,9 @@ def load_cuda_events(sqlite_path):
 
 def find_decode_layers(df):
     """
-    Find decode layer boundaries using marker events.
+    Find decode layer boundaries using marker events, grouped by device.
 
-    Returns list of tuples: (layer_idx, start_time_ns, end_time_ns)
+    Returns list of tuples: (device_id, layer_idx, start_time_ns, end_time_ns)
     """
     print(f"\nSearching for layer markers...")
     print(f"  Start marker: {LAYER_START_MARKER}")
@@ -312,8 +330,12 @@ def find_decode_layers(df):
         print(f"  No exact match for end marker, trying partial: {partial_pattern}")
         end_events = df[df['name'].str.contains(partial_pattern, regex=False, na=False)]
 
-    print(f"Found {len(start_events)} layer start markers")
-    print(f"Found {len(end_events)} layer end markers")
+    print(f"Found {len(start_events)} layer start markers total")
+    print(f"Found {len(end_events)} layer end markers total")
+
+    # Group by device
+    devices = sorted(df['device_id'].unique())
+    print(f"\nDevices found: {devices}")
 
     if len(start_events) == 0 or len(end_events) == 0:
         print("\nWARNING: No layer markers found!")
@@ -339,40 +361,63 @@ def find_decode_layers(df):
         return []
 
     all_layers = []
-    start_times = start_events['start_ns'].values
-    end_times = end_events['end_ns'].values
 
-    # Match start and end events
-    # For each start event, find the next end event
-    for i, start_time in enumerate(start_times):
-        # Find the first end event that comes after this start event
-        matching_ends = end_times[end_times > start_time]
-        if len(matching_ends) > 0:
-            end_time = matching_ends[0]
-            all_layers.append((i, start_time, end_time))
+    # Process each device separately
+    for device_id in devices:
+        # Filter events for this device
+        device_start_events = start_events[start_events['device_id'] == device_id]
+        device_end_events = end_events[end_events['device_id'] == device_id]
 
-    print(f"Identified {len(all_layers)} total layers")
+        print(f"\nDevice {device_id}:")
+        print(f"  Start markers: {len(device_start_events)}")
+        print(f"  End markers: {len(device_end_events)}")
 
-    # Take only the last N layers (decode phase)
-    if len(all_layers) > ANALYZE_LAST_N_LAYERS:
-        layers = all_layers[-ANALYZE_LAST_N_LAYERS:]
-        print(f"Analyzing last {ANALYZE_LAST_N_LAYERS} layers (decode phase)")
-    else:
-        layers = all_layers
-        print(f"Using all {len(layers)} layers (less than {ANALYZE_LAST_N_LAYERS})")
+        if len(device_start_events) == 0 or len(device_end_events) == 0:
+            print(f"  Skipping device {device_id} - missing markers")
+            continue
 
-    # Print layer durations for inspection (convert to ms for display)
-    if layers:
-        print("\nSample layer durations (ms):")
-        # Show first 5 and last 5 of the selected layers
-        for i, start, end in layers[:5]:
-            print(f"  Layer {i}: {(end - start)/1e6:.2f} ms")
-        if len(layers) > 10:
-            print("  ...")
-            for i, start, end in layers[-5:]:
-                print(f"  Layer {i}: {(end - start)/1e6:.2f} ms")
+        # Get both start and end times for the marker events
+        start_times = device_start_events['start_ns'].values
+        start_end_times = device_start_events['end_ns'].values
+        end_start_times = device_end_events['start_ns'].values
+        end_end_times = device_end_events['end_ns'].values
 
-    return layers
+        # Match start and end events for this device
+        # A layer runs from when the start marker begins to when the end marker ends
+        # We match each start marker with the first end marker that STARTS after the start marker BEGINS
+        device_layers = []
+        for i, start_time in enumerate(start_times):
+            # Find the first end marker that starts after this start marker begins
+            matching_end_indices = np.where(end_start_times > start_time)[0]
+            if len(matching_end_indices) > 0:
+                # Get the index of the first matching end marker
+                end_idx = matching_end_indices[0]
+                # Use the END time of that end marker as the layer end
+                end_time = end_end_times[end_idx]
+                device_layers.append((device_id, i, start_time, end_time))
+
+        print(f"  Identified {len(device_layers)} layers")
+
+        # Take only the last N layers for this device (decode phase)
+        if len(device_layers) > ANALYZE_LAST_N_LAYERS:
+            device_layers_to_use = device_layers[-ANALYZE_LAST_N_LAYERS:]
+            print(f"  Using last {ANALYZE_LAST_N_LAYERS} layers (decode phase)")
+        else:
+            device_layers_to_use = device_layers
+            print(f"  Using all {len(device_layers_to_use)} layers")
+
+        # Show sample layer durations for this device
+        if device_layers_to_use:
+            sample_layers = device_layers_to_use[:3]
+            print(f"  Sample layer durations:")
+            for dev_id, idx, start, end in sample_layers:
+                print(f"    Layer {idx}: {(end - start)/1e6:.2f} ms")
+
+        all_layers.extend(device_layers_to_use)
+
+    print(f"\nTotal layers across all devices: {len(all_layers)}")
+
+    return all_layers
 
 
 def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
@@ -381,18 +426,30 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
 
     Args:
         df: DataFrame with CUDA events (times in nanoseconds)
-        layers: List of (layer_idx, start_time_ns, end_time_ns) tuples
-        skip_first_n: Number of initial layers to skip as warmup outliers
+        layers: List of (device_id, layer_idx, start_time_ns, end_time_ns) tuples
+        skip_first_n: Number of initial layers to skip as warmup outliers PER DEVICE
 
     Returns: dict of category -> average latency in ms (converted for readability)
     """
-    if len(layers) <= skip_first_n:
-        print(f"WARNING: Only {len(layers)} layers found, but skipping {skip_first_n}")
-        skip_first_n = max(0, len(layers) - 10)  # Keep at least 10 layers if possible
+    # Group layers by device and skip first N per device
+    layers_by_device = defaultdict(list)
+    for layer in layers:
+        device_id = layer[0]
+        layers_by_device[device_id].append(layer)
 
-    # Skip outlier layers (warmup)
-    layers_to_analyze = layers[skip_first_n:]
-    print(f"\nAnalyzing {len(layers_to_analyze)} layers (skipped first {skip_first_n} as warmup)")
+    # Skip first N layers per device
+    layers_to_analyze = []
+    for device_id, device_layers in layers_by_device.items():
+        if len(device_layers) <= skip_first_n:
+            print(f"WARNING: Device {device_id} has only {len(device_layers)} layers, but skipping {skip_first_n}")
+            skip_n = max(0, len(device_layers) - 10)  # Keep at least 10 layers if possible
+        else:
+            skip_n = skip_first_n
+
+        layers_to_analyze.extend(device_layers[skip_n:])
+        print(f"Device {device_id}: Using {len(device_layers[skip_n:])} layers (skipped first {skip_n} as warmup)")
+
+    print(f"\nTotal layers to analyze: {len(layers_to_analyze)}")
 
     # Debug: check time ranges
     print(f"\nDEBUG: Time range analysis")
@@ -419,49 +476,110 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
 
     # Collect latency breakdown for each layer
     layer_breakdowns = []
+    layer_signatures = []  # Track which categories are present in each layer
+
+    # Track unique kernels per category across all layers
+    category_kernels = defaultdict(set)
 
     # Debug: show details for first layer
     show_debug = True
 
-    for idx, (layer_idx, start_time, end_time) in enumerate(layers_to_analyze):
-        # Get all events that overlap with this layer (times in ns)
+    for idx, (device_id, layer_idx, start_time, end_time) in enumerate(layers_to_analyze):
+        # Get all events that overlap with this layer (times in ns) AND are from the same device
         # An event overlaps if: event_start < layer_end AND event_end > layer_start
-        layer_events = df[(df['start_ns'] < end_time) & (df['end_ns'] > start_time)]
+        layer_events = df[
+            (df['device_id'] == device_id) &
+            (df['start_ns'] < end_time) &
+            (df['end_ns'] > start_time)
+        ]
 
         if show_debug and idx == 0:
             print(f"\nDEBUG: First layer analysis")
+            print(f"  Device: {device_id}")
             print(f"  Layer time range: {start_time/1e6:.2f} - {end_time/1e6:.2f} ms")
             print(f"  Duration: {(end_time - start_time)/1e6:.2f} ms")
             print(f"  Events in layer: {len(layer_events)}")
-            print(f"  Sample events:")
-            for i, (_, event) in enumerate(layer_events.head(20).iterrows()):
+            print(f"\n  ALL events in first layer:")
+            for i, (_, event) in enumerate(layer_events.iterrows()):
                 cat = categorize_kernel(event['name'])
-                print(f"    {i+1}. {event['name'][:80]:80s} | {event['duration_ns']/1e6:.3f}ms | {cat}")
+                print(f"    {i+1:3d}. [{cat:15s}] {event['duration_ns']/1e6:7.3f}ms | {event['name']}")
 
             # Show category distribution
             cat_counts = defaultdict(int)
+            cat_times = defaultdict(float)
             for _, event in layer_events.iterrows():
                 cat = categorize_kernel(event['name'])
                 cat_counts[cat] += 1
+                cat_times[cat] += event['duration_ns']
             print(f"\n  Category distribution:")
             for cat, count in sorted(cat_counts.items()):
-                print(f"    {cat}: {count} kernels")
+                total_time_ms = cat_times[cat] / 1e6
+                print(f"    {cat:15s}: {count:3d} kernels, {total_time_ms:7.2f} ms total")
 
         # Categorize and sum latencies (in nanoseconds, convert to ms at the end)
         breakdown = defaultdict(float)
+        layer_kernel_categories = set()  # Track which categories are present in this layer
+
         for _, event in layer_events.iterrows():
             category = categorize_kernel(event['name'])
             breakdown[category] += event['duration_ns']
 
+            # Track which categories have non-zero latency
+            if event['duration_ns'] > 0:
+                layer_kernel_categories.add(category)
+                # Track unique kernel names per category
+                category_kernels[category].add(event['name'])
+
         layer_breakdowns.append(breakdown)
+        # Create signature: frozenset of categories with non-zero latency
+        layer_signatures.append(frozenset(layer_kernel_categories))
 
     # Check if we got any data
     if not layer_breakdowns:
         print("\nERROR: No layer breakdown data collected!")
         return {'attention': 0.0, 'topk': 0.0, 'communication': 0.0, 'expert': 0.0, 'others': 0.0, 'total': 0.0}
 
-    # Compute total latency for each layer
-    total_latencies_ns = [sum(bd.values()) for bd in layer_breakdowns]
+    # Print unique kernels per category
+    print(f"\n" + "="*70)
+    print("KERNEL CATEGORIZATION - ALL UNIQUE KERNELS")
+    print("="*70)
+    categories = ['attention', 'topk', 'communication', 'expert', 'others']
+    for cat in categories:
+        kernels = sorted(category_kernels[cat])
+        print(f"\n{cat.upper()} ({len(kernels)} unique kernels):")
+        if len(kernels) == 0:
+            print(f"  (no kernels)")
+        else:
+            for kernel in kernels:  # Show ALL kernels
+                print(f"  - {kernel}")
+
+    # Find the most common layer signature (kernel composition)
+    from collections import Counter
+    signature_counts = Counter(layer_signatures)
+    most_common_signature, signature_count = signature_counts.most_common(1)[0]
+
+    print(f"\n" + "="*70)
+    print("LAYER SIGNATURE ANALYSIS")
+    print("="*70)
+    print(f"Total unique signatures: {len(signature_counts)}")
+    print(f"Most common signature appears in: {signature_count} / {len(layer_signatures)} layers")
+    print(f"Most common signature categories: {sorted(most_common_signature)}")
+
+    # Show all signatures and their counts
+    print(f"\nAll signatures:")
+    for sig, count in signature_counts.most_common():
+        print(f"  {sorted(sig)}: {count} layers")
+
+    # Filter layers by signature: only keep layers with the most common signature
+    signature_filtered_indices = [i for i, sig in enumerate(layer_signatures) if sig == most_common_signature]
+
+    print(f"\nSignature filtering:")
+    print(f"  Keeping layers with majority signature")
+    print(f"  Filtered layers: {len(signature_filtered_indices)} / {len(layer_signatures)}")
+    print(f"  Removed: {len(layer_signatures) - len(signature_filtered_indices)} layers with different composition")
+
+    # Compute total latency for signature-filtered layers
+    total_latencies_ns = [sum(layer_breakdowns[i].values()) for i in signature_filtered_indices]
     total_latencies_ms = [t / 1e6 for t in total_latencies_ns]
 
     # Calculate statistics for outlier detection
@@ -469,7 +587,7 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
     mean_latency = np.mean(total_latencies_ns)
     std_latency = np.std(total_latencies_ns)
 
-    print(f"\nAll layer statistics (before outlier removal):")
+    print(f"\nAll layer statistics (after signature filter, before latency outlier removal):")
     print(f"  Total layers: {len(total_latencies_ns)}")
     print(f"  Median: {median_latency / 1e6:.2f} ms")
     print(f"  Mean:   {mean_latency / 1e6:.2f} ms")
@@ -477,18 +595,22 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
     print(f"  Min:    {np.min(total_latencies_ns) / 1e6:.2f} ms")
     print(f"  Max:    {np.max(total_latencies_ns) / 1e6:.2f} ms")
 
-    # Filter outliers: only keep layers with latency <= median
+    # Filter latency outliers: only keep layers with latency <= median
     # This removes slow outliers while keeping the stable, typical layers
-    stable_indices = [i for i, lat in enumerate(total_latencies_ns) if lat <= median_latency]
+    # stable_local_indices: indices into total_latencies_ns array
+    stable_local_indices = [i for i, lat in enumerate(total_latencies_ns) if lat <= median_latency]
+    # stable_indices: indices into original layer_breakdowns array
+    stable_indices = [signature_filtered_indices[i] for i in stable_local_indices]
 
-    print(f"\nOutlier filtering:")
+    print(f"\nLatency outlier filtering:")
     print(f"  Keeping layers with latency <= median ({median_latency / 1e6:.2f} ms)")
     print(f"  Stable layers: {len(stable_indices)} / {len(total_latencies_ns)}")
     print(f"  Removed: {len(total_latencies_ns) - len(stable_indices)} outliers")
 
     if not stable_indices:
-        print("\nWARNING: No stable layers found! Using all layers.")
-        stable_indices = list(range(len(layer_breakdowns)))
+        print("\nWARNING: No stable layers found! Using all signature-filtered layers.")
+        stable_indices = signature_filtered_indices
+        stable_local_indices = list(range(len(signature_filtered_indices)))
 
     # Debug: show breakdown for first few stable layers
     print(f"\nBreakdown for first 3 stable layers:")
@@ -511,7 +633,7 @@ def compute_latency_breakdown(df, layers, skip_first_n=SKIP_FIRST_N_LAYERS):
         avg_breakdown[cat] = np.mean(values) / 1e6 if values else 0.0  # Convert to ms
 
     # Compute statistics on stable layers only
-    stable_latencies_ns = [total_latencies_ns[i] for i in stable_indices]
+    stable_latencies_ns = [total_latencies_ns[i] for i in stable_local_indices]
     avg_breakdown['total'] = np.mean(stable_latencies_ns) / 1e6
     avg_breakdown['std'] = np.std(stable_latencies_ns) / 1e6
     avg_breakdown['min'] = np.min(stable_latencies_ns) / 1e6
