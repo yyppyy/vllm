@@ -61,7 +61,7 @@ export VLLM_ALL2ALL_BACKEND=${ALLTOALL_BACKEND}
 unset VLLM_ALL2ALL_BACKEND
 
 if (( USE_PROFILER > 0 )); then
-  nsys profile \
+  setsid nsys profile \
     --trace-fork-before-exec=true \
     --cuda-graph-trace=node \
     --delay 30 \
@@ -105,32 +105,46 @@ vllm bench serve "${cli_args[@]}"
 
 
 ############## kill server & collect profile and logs ##############
-# 1) Try graceful shutdown of everything in the session
-kill -INT  -- "-$SESSION_PID" 2>/dev/null || true
+if [[ -n "${NSYS_PID:-}" ]]; then
+  # Profiler path: signal nsys directly so it can flush its trace data
+  kill -INT "$NSYS_PID" 2>/dev/null || true
 
-# 2) Wait a bit for nsys to flush / children to exit
-for _ in {1..200}; do
-  kill -0 "$SESSION_PID" 2>/dev/null || break
-  sleep 0.1
-done
+  # Give nsys generous time to finalize (up to 60s)
+  for _ in {1..600}; do
+    kill -0 "$NSYS_PID" 2>/dev/null || break
+    sleep 0.1
+  done
 
-# 3) Escalate if still alive
-if kill -0 "$SESSION_PID" 2>/dev/null; then
-  kill -TERM -- "-$SESSION_PID" 2>/dev/null || true
-  for _ in {1..100}; do
+  # If nsys is still alive, escalate (but avoid SIGKILL — it corrupts output)
+  if kill -0 "$NSYS_PID" 2>/dev/null; then
+    kill -TERM "$NSYS_PID" 2>/dev/null || true
+    for _ in {1..100}; do
+      kill -0 "$NSYS_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+
+  wait "$NSYS_PID" 2>/dev/null || true
+else
+  # Non-profiler path: kill the session group
+  kill -INT  -- "-$SESSION_PID" 2>/dev/null || true
+
+  for _ in {1..200}; do
     kill -0 "$SESSION_PID" 2>/dev/null || break
     sleep 0.1
   done
-fi
 
-# 4) Hard kill as last resort
-if kill -0 "$SESSION_PID" 2>/dev/null; then
-  kill -KILL -- "-$SESSION_PID" 2>/dev/null || true
-fi
+  if kill -0 "$SESSION_PID" 2>/dev/null; then
+    kill -TERM -- "-$SESSION_PID" 2>/dev/null || true
+    for _ in {1..100}; do
+      kill -0 "$SESSION_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
 
-# 5) Reap nsys so zombies don’t stick around
-if [[ -n "${NSYS_PID:-}" ]]; then
-  wait "$NSYS_PID" 2>/dev/null || true
-fi
+  if kill -0 "$SESSION_PID" 2>/dev/null; then
+    kill -KILL -- "-$SESSION_PID" 2>/dev/null || true
+  fi
 
-wait "${NSYS_PID:-$SESSION_PID}"
+  wait "$SESSION_PID" 2>/dev/null || true
+fi
