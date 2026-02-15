@@ -18,6 +18,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 build_ep_kernels() {
+  # Auto-detect CUDA_HOME if not already set
+  if [[ -z "${CUDA_HOME:-}" ]]; then
+    if command -v nvcc &>/dev/null; then
+      CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
+    elif [[ -d /usr/local/cuda ]]; then
+      CUDA_HOME=/usr/local/cuda
+    else
+      echo "ERROR: CUDA_HOME is not set and could not be auto-detected." >&2
+      exit 1
+    fi
+    export CUDA_HOME
+    echo "==> Auto-detected CUDA_HOME=${CUDA_HOME}"
+  fi
   # Auto-detect GPU arch if not already set
   if [[ -z "${TORCH_CUDA_ARCH_LIST:-}" ]]; then
     TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)"
