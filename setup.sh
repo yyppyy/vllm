@@ -10,7 +10,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       echo "Usage: $0 [--incremental] [--ep-kernels]"
       echo "  --incremental   Only run the final build+install step"
-      echo "  --ep-kernels    Build and install pplx-kernels + DeepEP (editable, requires CUDA_HOME and TORCH_CUDA_ARCH_LIST)"
+      echo "  --ep-kernels    Build and install pplx-kernels (editable)"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -40,18 +40,15 @@ build_ep_kernels() {
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   EP_WORKSPACE="$SCRIPT_DIR/tools/ep_kernels/ep_kernels_workspace"
   if "$incremental"; then
-    echo "==> Incremental rebuild of EP kernels..."
-    for pkg in pplx-kernels DeepEP; do
-      if [[ -d "$EP_WORKSPACE/$pkg" ]]; then
-        echo "  -> Rebuilding $pkg"
-        (cd "$EP_WORKSPACE/$pkg" && python setup.py build_ext --inplace)
-      else
-        echo "  -> $pkg not found at $EP_WORKSPACE/$pkg, skipping (run without --incremental first)"
-      fi
-    done
+    echo "==> Incremental rebuild of pplx-kernels..."
+    if [[ -d "$EP_WORKSPACE/pplx-kernels" ]]; then
+      (cd "$EP_WORKSPACE/pplx-kernels" && python setup.py build_ext --inplace)
+    else
+      echo "  -> pplx-kernels not found at $EP_WORKSPACE/pplx-kernels, skipping (run without --incremental first)"
+    fi
   else
-    echo "==> Building EP kernels (pplx-kernels + DeepEP)..."
-    bash "$SCRIPT_DIR/tools/ep_kernels/install_python_libraries.sh"
+    echo "==> Building pplx-kernels..."
+    bash "$SCRIPT_DIR/tools/ep_kernels/install_pplx.sh"
   fi
 }
 
