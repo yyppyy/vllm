@@ -38,7 +38,7 @@ build_ep_kernels() {
     echo "==> Auto-detected TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
   fi
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  EP_WORKSPACE="$SCRIPT_DIR/tools/ep_kernels/ep_kernels_workspace"
+  EP_WORKSPACE="$SCRIPT_DIR/ep_kernels_workspace"
   if "$incremental"; then
     echo "==> Incremental rebuild of pplx-kernels..."
     if [[ -d "$EP_WORKSPACE/pplx-kernels" ]]; then
@@ -48,7 +48,7 @@ build_ep_kernels() {
     fi
   else
     echo "==> Building pplx-kernels..."
-    bash "$SCRIPT_DIR/tools/ep_kernels/install_pplx.sh"
+    bash "$SCRIPT_DIR/tools/ep_kernels/install_pplx.sh" "$EP_WORKSPACE"
   fi
 }
 
