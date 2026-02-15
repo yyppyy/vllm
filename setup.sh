@@ -37,9 +37,22 @@ build_ep_kernels() {
     export TORCH_CUDA_ARCH_LIST
     echo "==> Auto-detected TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
   fi
-  echo "==> Building EP kernels (pplx-kernels + DeepEP)..."
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  bash "$SCRIPT_DIR/tools/ep_kernels/install_python_libraries.sh"
+  EP_WORKSPACE="$SCRIPT_DIR/tools/ep_kernels/ep_kernels_workspace"
+  if "$incremental"; then
+    echo "==> Incremental rebuild of EP kernels..."
+    for pkg in pplx-kernels DeepEP; do
+      if [[ -d "$EP_WORKSPACE/$pkg" ]]; then
+        echo "  -> Rebuilding $pkg"
+        (cd "$EP_WORKSPACE/$pkg" && python setup.py build_ext --inplace)
+      else
+        echo "  -> $pkg not found at $EP_WORKSPACE/$pkg, skipping (run without --incremental first)"
+      fi
+    done
+  else
+    echo "==> Building EP kernels (pplx-kernels + DeepEP)..."
+    bash "$SCRIPT_DIR/tools/ep_kernels/install_python_libraries.sh"
+  fi
 }
 
 if "$incremental"; then
