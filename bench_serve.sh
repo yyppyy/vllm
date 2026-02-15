@@ -66,6 +66,7 @@ unset VLLM_ALL2ALL_BACKEND
 if (( USE_PROFILER > 0 )); then
   setsid nsys profile \
     --trace-fork-before-exec=true \
+    --sample=process-tree \
     --cuda-graph-trace=node \
     --delay 30 \
     --duration 6000 \
