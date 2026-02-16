@@ -202,6 +202,15 @@ class CudaPlatformBase(Platform):
                 "deepep_low_latency, pplx, or allgather_reducescatter.")
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        if (envs.VLLM_ALL2ALL_BACKEND == "dispatch_combine"
+                and parallel_config.data_parallel_size > 1
+                and compilation_config.cudagraph_mode != CUDAGraphMode.NONE):
+            logger.info(
+                "Disabling CUDA Graphs since dispatch_combine "
+                "uses host synchronization and CPU barriers "
+                "which are incompatible with CUDA graph capture.")
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
     @classmethod
     def get_current_memory_usage(cls,
                                  device: Optional[torch.types.Device] = None
