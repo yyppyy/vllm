@@ -102,11 +102,9 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Reset P2P offset counters before dispatch.
         self.p2p_manager.reset_offsets()
 
-        # Synchronize all ranks to ensure offsets are reset.
+        # Synchronize to ensure offsets are reset on all streams.
         torch.cuda.synchronize()
         ep_group = get_ep_group()
-        if ep_group.device_communicator.pynccl_comm is not None:
-            ep_group.device_communicator.pynccl_comm.stream.synchronize()
 
         # Launch dispatch P2P kernel.
         # Each (token, expert_slot) pair determines a dest rank and
