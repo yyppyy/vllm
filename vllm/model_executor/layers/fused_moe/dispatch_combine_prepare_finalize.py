@@ -106,9 +106,16 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         torch.cuda.synchronize()
         ep_group = get_ep_group()
 
+        # Barrier: all ranks must finish resetting their offsets
+        # before any rank launches the dispatch kernel (which
+        # writes to remote ranks' offset counters via P2P).
+        import torch.distributed as dist
+        dist.barrier(group=ep_group.cpu_group)
+
         # Launch dispatch P2P kernel.
-        # Each (token, expert_slot) pair determines a dest rank and
-        # writes the token + metadata to that rank's recv buffer.
+        # Each (token, expert_slot) pair determines a dest rank
+        # and writes the token + metadata to that rank's recv
+        # buffer via P2P.
         topk_ids_i32 = topk_ids.to(torch.int32)
         topk_weights_f32 = topk_weights.to(torch.float32)
 
@@ -124,12 +131,7 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         torch.cuda.synchronize()
 
         # Barrier: all ranks must finish dispatch before reading.
-        if ep_group.device_communicator.pynccl_comm is not None:
-            import torch.distributed as dist
-            dist.barrier(group=ep_group.cpu_group)
-        else:
-            import torch.distributed as dist
-            dist.barrier()
+        dist.barrier(group=ep_group.cpu_group)
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config, expert_map)
@@ -275,10 +277,16 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.p2p_manager.reset_combine_offset()
         torch.cuda.synchronize()
 
+        ep_group = get_ep_group()
+        import torch.distributed as dist
+
+        # Barrier: all ranks must finish resetting combine
+        # offsets before any rank launches combine kernel.
+        dist.barrier(group=ep_group.cpu_group)
+
         # Step 2: Launch combine P2P kernel.
         # Send expert outputs back to originating ranks.
         if M_recv > 0:
-            # Reinterpret dispatch_meta_buf as raw bytes for CUDA kernel.
             meta_bytes = self._dispatch_meta_buf.view(-1).to(
                 torch.uint8).contiguous()
             torch.ops._C_dispatch_combine.combine_p2p(
@@ -290,8 +298,6 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Synchronize and barrier for combine completion.
         torch.cuda.synchronize()
-        ep_group = get_ep_group()
-        import torch.distributed as dist
         dist.barrier(group=ep_group.cpu_group)
 
         # Step 3: Read combine results and scatter-add to output.

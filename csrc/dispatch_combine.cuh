@@ -68,6 +68,7 @@ struct DispatchCombineConfig {
   int32_t experts_per_rank;
   int32_t hidden_dim;
   int32_t max_num_tokens_per_rank;
+  int32_t max_recv;  // max entries per recv buffer
 };
 
 // ====================================================================
@@ -104,9 +105,22 @@ __global__ void dispatch_p2p_kernel(
   const float weight = topk_weights[token_idx * topk + expert_slot];
   const int32_t dest_rank = expert_id / experts_per_rank;
 
+  // Bounds check: dest_rank must be in [0, world_size).
+  if (dest_rank < 0 || dest_rank >= config->world_size) return;
+
+  // NULL pointer check: all remote buffers must be valid.
+  if (!config->remote_dispatch_offsets[dest_rank] ||
+      !config->remote_dispatch_recv[dest_rank] ||
+      !config->remote_dispatch_meta[dest_rank]) {
+    return;
+  }
+
   // Atomically claim a write slot on the destination rank's recv buffer.
   int32_t write_pos = atomicAdd(
       config->remote_dispatch_offsets[dest_rank], 1);
+
+  // Bounds check: write_pos must be within buffer capacity.
+  if (write_pos >= config->max_recv) return;
 
   // P2P write: copy hidden state to remote dispatch recv buffer.
   T* dest_data = reinterpret_cast<T*>(
@@ -155,9 +169,22 @@ __global__ void combine_p2p_kernel(
   const int32_t orig_token_idx = dispatch_meta[pair_idx].source_token_idx;
   const float weight = dispatch_meta[pair_idx].topk_weight;
 
+  // Bounds check: dest_rank must be in [0, world_size).
+  if (dest_rank < 0 || dest_rank >= config->world_size) return;
+
+  // NULL pointer check.
+  if (!config->remote_combine_offsets[dest_rank] ||
+      !config->remote_combine_recv[dest_rank] ||
+      !config->remote_combine_meta[dest_rank]) {
+    return;
+  }
+
   // Atomically claim a write slot on dest rank's combine recv buffer.
   int32_t write_pos = atomicAdd(
       config->remote_combine_offsets[dest_rank], 1);
+
+  // Bounds check: write_pos must be within buffer capacity.
+  if (write_pos >= config->max_recv) return;
 
   // P2P write: copy expert output to remote combine recv buffer.
   T* dest_data = reinterpret_cast<T*>(

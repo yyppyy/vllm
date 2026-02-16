@@ -112,24 +112,50 @@ class DispatchCombineP2PManager:
             "world_size=%d, max_recv=%d, hidden_dim=%d",
             rank, world_size, self.max_recv, hidden_dim)
 
-    def _setup_p2p_mappings(self):
-        """Exchange IPC handles and open remote buffer mappings."""
-        cuda_rt = self._cuda_rt
+    @staticmethod
+    def _handle_to_bytes(handle) -> bytes:
+        """Convert cudaIpcMemHandle_t to bytes for pickling."""
+        return bytes(handle)
 
-        # Get IPC handles from raw cudaMalloc pointers.
+    @staticmethod
+    def _bytes_to_handle(data: bytes):
+        """Convert bytes back to cudaIpcMemHandle_t."""
+        from .cuda_wrapper import cudaIpcMemHandle_t
+        handle = cudaIpcMemHandle_t()
+        ctypes.memmove(ctypes.byref(handle), data,
+                       min(len(data), ctypes.sizeof(handle)))
+        return handle
+
+    def _setup_p2p_mappings(self):
+        """Exchange IPC handles and open remote buffer mappings.
+
+        Handles are converted to raw bytes before exchange via
+        all_gather_object to avoid any ctypes pickling issues
+        (matches the pattern used by custom_all_reduce).
+        """
+        cuda_rt = self._cuda_rt
+        to_bytes = self._handle_to_bytes
+
+        # Get IPC handles and convert to bytes for exchange.
         local_handles = {
-            'dispatch_recv': cuda_rt.cudaIpcGetMemHandle(
-                self._raw_dispatch_recv),
-            'dispatch_meta': cuda_rt.cudaIpcGetMemHandle(
-                self._raw_dispatch_meta),
-            'dispatch_offset': cuda_rt.cudaIpcGetMemHandle(
-                self._raw_dispatch_offset),
-            'combine_recv': cuda_rt.cudaIpcGetMemHandle(
-                self._raw_combine_recv),
-            'combine_meta': cuda_rt.cudaIpcGetMemHandle(
-                self._raw_combine_meta),
-            'combine_offset': cuda_rt.cudaIpcGetMemHandle(
-                self._raw_combine_offset),
+            'dispatch_recv': to_bytes(
+                cuda_rt.cudaIpcGetMemHandle(
+                    self._raw_dispatch_recv)),
+            'dispatch_meta': to_bytes(
+                cuda_rt.cudaIpcGetMemHandle(
+                    self._raw_dispatch_meta)),
+            'dispatch_offset': to_bytes(
+                cuda_rt.cudaIpcGetMemHandle(
+                    self._raw_dispatch_offset)),
+            'combine_recv': to_bytes(
+                cuda_rt.cudaIpcGetMemHandle(
+                    self._raw_combine_recv)),
+            'combine_meta': to_bytes(
+                cuda_rt.cudaIpcGetMemHandle(
+                    self._raw_combine_meta)),
+            'combine_offset': to_bytes(
+                cuda_rt.cudaIpcGetMemHandle(
+                    self._raw_combine_offset)),
         }
 
         # Exchange handles with all ranks.
@@ -144,6 +170,7 @@ class DispatchCombineP2PManager:
         self.remote_combine_recv_ptrs = []
         self.remote_combine_meta_ptrs = []
         self.remote_combine_offset_ptrs = []
+        from_bytes = self._bytes_to_handle
 
         for r in range(self.world_size):
             if r == self.rank:
@@ -164,22 +191,57 @@ class DispatchCombineP2PManager:
                 h = all_handles[r]
                 self.remote_dispatch_recv_ptrs.append(
                     cuda_rt.cudaIpcOpenMemHandle(
-                        h['dispatch_recv']).value)
+                        from_bytes(
+                            h['dispatch_recv'])).value)
                 self.remote_dispatch_meta_ptrs.append(
                     cuda_rt.cudaIpcOpenMemHandle(
-                        h['dispatch_meta']).value)
+                        from_bytes(
+                            h['dispatch_meta'])).value)
                 self.remote_dispatch_offset_ptrs.append(
                     cuda_rt.cudaIpcOpenMemHandle(
-                        h['dispatch_offset']).value)
+                        from_bytes(
+                            h['dispatch_offset'])).value)
                 self.remote_combine_recv_ptrs.append(
                     cuda_rt.cudaIpcOpenMemHandle(
-                        h['combine_recv']).value)
+                        from_bytes(
+                            h['combine_recv'])).value)
                 self.remote_combine_meta_ptrs.append(
                     cuda_rt.cudaIpcOpenMemHandle(
-                        h['combine_meta']).value)
+                        from_bytes(
+                            h['combine_meta'])).value)
                 self.remote_combine_offset_ptrs.append(
                     cuda_rt.cudaIpcOpenMemHandle(
-                        h['combine_offset']).value)
+                        from_bytes(
+                            h['combine_offset'])).value)
+
+        # Validate all pointers are non-NULL.
+        for r in range(self.world_size):
+            assert self.remote_dispatch_recv_ptrs[r], \
+                f"NULL dispatch_recv ptr for rank {r}"
+            assert self.remote_dispatch_meta_ptrs[r], \
+                f"NULL dispatch_meta ptr for rank {r}"
+            assert self.remote_dispatch_offset_ptrs[r], \
+                f"NULL dispatch_offset ptr for rank {r}"
+            assert self.remote_combine_recv_ptrs[r], \
+                f"NULL combine_recv ptr for rank {r}"
+            assert self.remote_combine_meta_ptrs[r], \
+                f"NULL combine_meta ptr for rank {r}"
+            assert self.remote_combine_offset_ptrs[r], \
+                f"NULL combine_offset ptr for rank {r}"
+
+        # Log pointer values for debugging.
+        for r in range(self.world_size):
+            logger.info(
+                "Rank %d → remote rank %d ptrs: "
+                "recv=0x%x meta=0x%x offset=0x%x "
+                "c_recv=0x%x c_meta=0x%x c_off=0x%x",
+                self.rank, r,
+                self.remote_dispatch_recv_ptrs[r],
+                self.remote_dispatch_meta_ptrs[r],
+                self.remote_dispatch_offset_ptrs[r],
+                self.remote_combine_recv_ptrs[r],
+                self.remote_combine_meta_ptrs[r],
+                self.remote_combine_offset_ptrs[r])
 
     def _build_config_tensor(self) -> torch.Tensor:
         """Build a raw-bytes tensor containing
@@ -227,13 +289,14 @@ class DispatchCombineP2PManager:
                 if r < self.world_size else 0
             data += struct.pack('Q', ptr)
 
-        # Scalar fields
+        # Scalar fields (must match DispatchCombineConfig)
         data += struct.pack('i', self.rank)
         data += struct.pack('i', self.world_size)
         experts_per_rank = 0  # Set later via update_experts_per_rank
         data += struct.pack('i', experts_per_rank)
         data += struct.pack('i', self.hidden_dim)
         data += struct.pack('i', self.max_num_tokens)
+        data += struct.pack('i', self.max_recv)
 
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
