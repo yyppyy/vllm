@@ -14,10 +14,10 @@ namespace dispatch_combine {
 constexpr int kBlockSize = 256;
 
 void dispatch_p2p(
-    torch::Tensor input,        // (M, K) bfloat16/float16
-    torch::Tensor topk_ids,     // (M, topk) int32
-    torch::Tensor topk_weights, // (M, topk) float32
-    torch::Tensor config_tensor,// DispatchCombineConfig as raw bytes
+    torch::Tensor input,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    torch::Tensor config_tensor,
     int64_t M, int64_t K, int64_t topk) {
 
   if (M == 0) return;
@@ -38,83 +38,90 @@ void dispatch_p2p(
       input.scalar_type(), "dispatch_p2p",
       AT_DISPATCH_CASE(at::ScalarType::BFloat16,
         [&] {
-          dispatch_p2p_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
-              reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+          dispatch_p2p_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __nv_bfloat16*>(
+                  input.data_ptr()),
               topk_ids.data_ptr<int32_t>(),
               topk_weights.data_ptr<float>(),
-              config,
-              M32, K32, topk32);
+              config, M32, K32, topk32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
-          dispatch_p2p_kernel<__half><<<grid, block, 0, stream>>>(
-              reinterpret_cast<const __half*>(input.data_ptr()),
+          dispatch_p2p_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __half*>(
+                  input.data_ptr()),
               topk_ids.data_ptr<int32_t>(),
               topk_weights.data_ptr<float>(),
-              config,
-              M32, K32, topk32);
+              config, M32, K32, topk32);
         })
   );
 }
 
 void combine_p2p(
-    torch::Tensor expert_output,  // (M_recv, K) bfloat16/float16
-    torch::Tensor dispatch_meta,  // (M_recv * sizeof(TokenMetadata),)
-    torch::Tensor config_tensor,  // DispatchCombineConfig as raw bytes
-    int64_t M_recv, int64_t K) {
+    torch::Tensor expert_output,
+    torch::Tensor dispatch_meta,
+    torch::Tensor config_tensor,
+    int64_t max_recv, int64_t K) {
 
-  if (M_recv == 0) return;
+  if (max_recv == 0) return;
 
   const auto stream = at::cuda::getCurrentCUDAStream();
   const DispatchCombineConfig* config =
       reinterpret_cast<const DispatchCombineConfig*>(
           config_tensor.data_ptr());
   const TokenMetadata* meta =
-      reinterpret_cast<const TokenMetadata*>(dispatch_meta.data_ptr());
+      reinterpret_cast<const TokenMetadata*>(
+          dispatch_meta.data_ptr());
 
-  const int32_t M_recv32 = static_cast<int32_t>(M_recv);
   const int32_t K32 = static_cast<int32_t>(K);
-  dim3 grid(M_recv32);
+  // Grid = max_recv; kernel reads actual count from config.
+  dim3 grid(static_cast<int32_t>(max_recv));
   dim3 block(kBlockSize);
 
   AT_DISPATCH_SWITCH(
       expert_output.scalar_type(), "combine_p2p",
       AT_DISPATCH_CASE(at::ScalarType::BFloat16,
         [&] {
-          combine_p2p_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+          combine_p2p_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
-              meta, config, M_recv32, K32);
+              meta, config, K32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
-          combine_p2p_kernel<__half><<<grid, block, 0, stream>>>(
-              reinterpret_cast<const __half*>(expert_output.data_ptr()),
-              meta, config, M_recv32, K32);
+          combine_p2p_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __half*>(
+                  expert_output.data_ptr()),
+              meta, config, K32);
         })
   );
 }
 
 void scatter_add_weighted(
-    torch::Tensor output,       // (M_orig, K) float32
-    torch::Tensor combine_recv, // (N_recv, K) bfloat16/float16
-    torch::Tensor combine_meta, // (N_recv * sizeof(TokenMetadata),)
+    torch::Tensor output,
+    torch::Tensor combine_recv,
+    torch::Tensor combine_meta,
     int64_t N_recv, int64_t K) {
 
   if (N_recv == 0) return;
 
   const auto stream = at::cuda::getCurrentCUDAStream();
   const TokenMetadata* meta =
-      reinterpret_cast<const TokenMetadata*>(combine_meta.data_ptr());
+      reinterpret_cast<const TokenMetadata*>(
+          combine_meta.data_ptr());
 
   const int32_t N_recv32 = static_cast<int32_t>(N_recv);
   const int32_t K32 = static_cast<int32_t>(K);
   dim3 grid(N_recv32);
   dim3 block(kBlockSize);
 
-  // Output must be float32 for correct atomic accumulation.
-  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float,
-              "scatter_add_weighted: output must be float32");
+  TORCH_CHECK(
+      output.scalar_type() == at::ScalarType::Float,
+      "scatter_add_weighted: output must be float32");
 
   AT_DISPATCH_SWITCH(
       combine_recv.scalar_type(), "scatter_add_weighted",
@@ -129,12 +136,130 @@ void scatter_add_weighted(
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
-          scatter_add_weighted_kernel<__half><<<grid, block, 0, stream>>>(
+          scatter_add_weighted_kernel<__half>
+              <<<grid, block, 0, stream>>>(
               output.data_ptr<float>(),
-              reinterpret_cast<const __half*>(combine_recv.data_ptr()),
+              reinterpret_cast<const __half*>(
+                  combine_recv.data_ptr()),
               meta, N_recv32, K32);
         })
   );
+}
+
+// ====================================================================
+// GPU-side buffer operations (CUDA-graph compatible)
+// ====================================================================
+
+void reset_offsets(torch::Tensor config_tensor) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  reset_offsets_kernel<<<1, 1, 0, stream>>>(config);
+}
+
+void reset_combine_offset(torch::Tensor config_tensor) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  reset_combine_offset_kernel<<<1, 1, 0, stream>>>(
+      config);
+}
+
+void copy_dispatch_recv(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t max_recv, int64_t K) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  const int32_t K32 = static_cast<int32_t>(K);
+  dim3 grid(static_cast<int32_t>(max_recv));
+  dim3 block(kBlockSize);
+
+  AT_DISPATCH_SWITCH(
+      output.scalar_type(), "copy_dispatch_recv",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          copy_dispatch_recv_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__nv_bfloat16*>(
+                  output.data_ptr()),
+              config, K32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          copy_dispatch_recv_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__half*>(
+                  output.data_ptr()),
+              config, K32);
+        })
+  );
+}
+
+void copy_dispatch_meta(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t max_recv) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  dim3 grid(static_cast<int32_t>(max_recv));
+  // 1 thread per block for metadata (only 4 int32s).
+  dim3 block(1);
+  copy_dispatch_meta_kernel<<<grid, block, 0, stream>>>(
+      output.data_ptr<int32_t>(), config);
+}
+
+void copy_combine_recv(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t max_recv, int64_t K) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  const int32_t K32 = static_cast<int32_t>(K);
+  dim3 grid(static_cast<int32_t>(max_recv));
+  dim3 block(kBlockSize);
+
+  AT_DISPATCH_SWITCH(
+      output.scalar_type(), "copy_combine_recv",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          copy_combine_recv_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__nv_bfloat16*>(
+                  output.data_ptr()),
+              config, K32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          copy_combine_recv_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__half*>(
+                  output.data_ptr()),
+              config, K32);
+        })
+  );
+}
+
+void copy_combine_meta(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t max_recv) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  dim3 grid(static_cast<int32_t>(max_recv));
+  dim3 block(1);
+  copy_combine_meta_kernel<<<grid, block, 0, stream>>>(
+      output.data_ptr<int32_t>(), config);
 }
 
 }  // namespace dispatch_combine

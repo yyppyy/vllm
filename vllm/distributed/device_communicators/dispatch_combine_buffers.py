@@ -8,10 +8,11 @@ receive buffers that remote ranks can write into directly via NVLink.
 
 Buffers are allocated with cudaMalloc (not PyTorch's caching allocator)
 to ensure base pointers required by cudaIpcGetMemHandle.
+
+All runtime operations use GPU-side CUDA kernels (not host-side
+cudaMemset/cudaMemcpy) for CUDA graph compatibility.
 """
 import ctypes
-from typing import Optional
-
 import torch
 import torch.distributed as dist
 
@@ -31,6 +32,13 @@ class DispatchCombineP2PManager:
     - combine_recv: (max_recv * hidden_dim * dtype_size) bytes
     - combine_meta: (max_recv * 16) bytes
     - combine_offset: 4 bytes
+
+    Pre-allocated PyTorch tensors for GPU-side copy destinations:
+    - dispatch_recv_tensor: (max_recv, hidden_dim) dtype
+    - dispatch_meta_tensor: (max_recv, 4) int32
+    - combine_recv_tensor: (max_recv, hidden_dim) dtype
+    - combine_meta_tensor: (max_recv, 4) int32
+    - accum_tensor: (max_num_tokens, hidden_dim) float32
     """
 
     def __init__(
@@ -57,34 +65,23 @@ class DispatchCombineP2PManager:
         logger.info(
             "DispatchCombineP2PManager: rank=%d, device=%d, "
             "world_size=%d, max_num_tokens=%d, "
-            "hidden_dim=%d, topk=%d, dtype=%s, "
-            "dtype_size=%d",
+            "hidden_dim=%d, topk=%d, dtype=%s",
             rank, self._device, world_size,
-            max_num_tokens, hidden_dim, topk,
-            str(dtype), self._dtype_size)
+            max_num_tokens, hidden_dim, topk, str(dtype))
 
-        # Max tokens any rank can receive. With uniform routing
-        # each rank receives ~(max_num_tokens * topk) entries.
-        # Use 2x safety factor instead of the theoretical max
-        # (max_num_tokens * topk * world_size) which consumes
-        # too much GPU memory. The kernel bounds-checks against
-        # max_recv so overflow entries are safely dropped.
+        # Max tokens any rank can receive.
         self.max_recv = max_num_tokens * topk * 2
 
         # Buffer sizes in bytes.
         self._recv_bytes = (
             self.max_recv * hidden_dim * self._dtype_size)
-        self._meta_bytes = self.max_recv * 4 * 4  # 4 int32s
-        self._offset_bytes = 4  # 1 int32
+        self._meta_bytes = self.max_recv * 4 * 4
+        self._offset_bytes = 4
 
         from .cuda_wrapper import CudaRTLibrary
         self._cuda_rt = CudaRTLibrary()
 
         # Allocate raw IPC buffers with cudaMalloc.
-        # cudaMalloc returns base pointers required by
-        # cudaIpcGetMemHandle (PyTorch's caching allocator
-        # may return sub-allocated pointers that are invalid
-        # for IPC).
         self._raw_dispatch_recv = self._cuda_rt.cudaMalloc(
             self._recv_bytes)
         self._cuda_rt.cudaMemset(
@@ -121,14 +118,44 @@ class DispatchCombineP2PManager:
         # Build the config tensor for CUDA kernels.
         self.config_tensor = self._build_config_tensor()
 
+        # Pre-allocate PyTorch tensors for GPU-side copy
+        # destinations. Fixed size = max_recv for CUDA graph
+        # compatibility (no dynamic allocation at runtime).
+        self.dispatch_recv_tensor = torch.zeros(
+            (self.max_recv, hidden_dim),
+            dtype=dtype,
+            device=self._device)
+        self.dispatch_meta_tensor = torch.zeros(
+            (self.max_recv, 4),
+            dtype=torch.int32,
+            device=self._device)
+        self.combine_recv_tensor = torch.zeros(
+            (self.max_recv, hidden_dim),
+            dtype=dtype,
+            device=self._device)
+        self.combine_meta_tensor = torch.zeros(
+            (self.max_recv, 4),
+            dtype=torch.int32,
+            device=self._device)
+
+        # Float32 accumulator for scatter-add.
+        self.accum_tensor = torch.zeros(
+            (max_num_tokens, hidden_dim),
+            dtype=torch.float32,
+            device=self._device)
+
+        # NCCL barrier tensor (tiny, for all-reduce barrier).
+        self._barrier_tensor = torch.zeros(
+            1, dtype=torch.int32, device=self._device)
+
         logger.info(
-            "DispatchCombineP2PManager initialized: rank=%d, "
-            "world_size=%d, max_recv=%d, hidden_dim=%d",
+            "DispatchCombineP2PManager initialized: rank=%d,"
+            " world_size=%d, max_recv=%d, hidden_dim=%d",
             rank, world_size, self.max_recv, hidden_dim)
 
     @staticmethod
     def _handle_to_bytes(handle) -> bytes:
-        """Convert cudaIpcMemHandle_t to bytes for pickling."""
+        """Convert cudaIpcMemHandle_t to bytes."""
         return bytes(handle)
 
     @staticmethod
@@ -141,16 +168,10 @@ class DispatchCombineP2PManager:
         return handle
 
     def _setup_p2p_mappings(self):
-        """Exchange IPC handles and open remote buffer mappings.
-
-        Handles are converted to raw bytes before exchange via
-        all_gather_object to avoid any ctypes pickling issues
-        (matches the pattern used by custom_all_reduce).
-        """
+        """Exchange IPC handles and open remote mappings."""
         cuda_rt = self._cuda_rt
         to_bytes = self._handle_to_bytes
 
-        # Get IPC handles and convert to bytes for exchange.
         local_handles = {
             'dispatch_recv': to_bytes(
                 cuda_rt.cudaIpcGetMemHandle(
@@ -172,12 +193,10 @@ class DispatchCombineP2PManager:
                     self._raw_combine_offset)),
         }
 
-        # Exchange handles with all ranks.
         all_handles = [None] * self.world_size
         dist.all_gather_object(all_handles, local_handles,
                                group=self.cpu_group)
 
-        # Open remote handles to get P2P pointers.
         self.remote_dispatch_recv_ptrs = []
         self.remote_dispatch_meta_ptrs = []
         self.remote_dispatch_offset_ptrs = []
@@ -188,7 +207,6 @@ class DispatchCombineP2PManager:
 
         for r in range(self.world_size):
             if r == self.rank:
-                # Local rank - use local raw pointers.
                 self.remote_dispatch_recv_ptrs.append(
                     self._raw_dispatch_recv.value)
                 self.remote_dispatch_meta_ptrs.append(
@@ -243,67 +261,13 @@ class DispatchCombineP2PManager:
             assert self.remote_combine_offset_ptrs[r], \
                 f"NULL combine_offset ptr for rank {r}"
 
-        # Log pointer values for debugging.
-        for r in range(self.world_size):
-            logger.info(
-                "Rank %d → remote rank %d ptrs: "
-                "recv=0x%x meta=0x%x offset=0x%x "
-                "c_recv=0x%x c_meta=0x%x c_off=0x%x",
-                self.rank, r,
-                self.remote_dispatch_recv_ptrs[r],
-                self.remote_dispatch_meta_ptrs[r],
-                self.remote_dispatch_offset_ptrs[r],
-                self.remote_combine_recv_ptrs[r],
-                self.remote_combine_meta_ptrs[r],
-                self.remote_combine_offset_ptrs[r])
-
-        # Validate IPC pointers by reading 4 bytes from each
-        # remote buffer via cudaMemcpy. This catches invalid
-        # IPC handles before any kernel launch.
-        tmp = torch.empty(
-            1, dtype=torch.int32, device=self._device)
-        for r in range(self.world_size):
-            if r == self.rank:
-                continue
-            try:
-                self._cuda_rt.cudaMemcpy(
-                    ctypes.c_void_p(tmp.data_ptr()),
-                    ctypes.c_void_p(
-                        self.remote_dispatch_recv_ptrs[r]),
-                    4)
-            except RuntimeError as e:
-                logger.error(
-                    "Rank %d: IPC validation FAILED for "
-                    "rank %d dispatch_recv ptr 0x%x: %s",
-                    self.rank, r,
-                    self.remote_dispatch_recv_ptrs[r], e)
-                raise
-            try:
-                self._cuda_rt.cudaMemcpy(
-                    ctypes.c_void_p(tmp.data_ptr()),
-                    ctypes.c_void_p(
-                        self.remote_dispatch_offset_ptrs[r]),
-                    4)
-            except RuntimeError as e:
-                logger.error(
-                    "Rank %d: IPC validation FAILED for "
-                    "rank %d dispatch_offset ptr 0x%x: %s",
-                    self.rank, r,
-                    self.remote_dispatch_offset_ptrs[r], e)
-                raise
-        logger.info(
-            "Rank %d: IPC pointer validation passed "
-            "for all %d remote ranks.",
-            self.rank, self.world_size - 1)
-
     def _build_config_tensor(self) -> torch.Tensor:
         """Build a raw-bytes tensor containing
-        DispatchCombineConfig for passing to CUDA kernels."""
+        DispatchCombineConfig for CUDA kernels."""
         import struct
 
-        max_ranks = 64  # kMaxRanks in .cuh
+        max_ranks = 64
 
-        # Pack pointers as int64 (8 bytes each)
         data = bytearray()
 
         # remote_dispatch_recv[kMaxRanks]
@@ -342,11 +306,11 @@ class DispatchCombineP2PManager:
                 if r < self.world_size else 0
             data += struct.pack('Q', ptr)
 
-        # Scalar fields (must match DispatchCombineConfig)
+        # Scalar fields
         data += struct.pack('i', self.rank)
         data += struct.pack('i', self.world_size)
-        experts_per_rank = 0  # Set later via update_experts_per_rank
-        data += struct.pack('i', experts_per_rank)
+        # experts_per_rank set later via update_experts_per_rank
+        data += struct.pack('i', 0)
         data += struct.pack('i', self.hidden_dim)
         data += struct.pack('i', self.max_num_tokens)
         data += struct.pack('i', self.max_recv)
@@ -361,7 +325,6 @@ class DispatchCombineP2PManager:
         """Update experts_per_rank in the config tensor."""
         import struct
         max_ranks = 64
-        # Offset: 6 pointer arrays * max_ranks * 8 + 2 int32s
         offset = 6 * max_ranks * 8 + 2 * 4
         packed = struct.pack('i', experts_per_rank)
         cpu_config = self.config_tensor.cpu()
@@ -369,87 +332,59 @@ class DispatchCombineP2PManager:
             cpu_config[offset + i] = b
         self.config_tensor.copy_(cpu_config)
 
-    def reset_offsets(self):
-        """Reset write offset counters before dispatch."""
-        self._cuda_rt.cudaMemset(
-            self._raw_dispatch_offset, 0, self._offset_bytes)
-        self._cuda_rt.cudaMemset(
-            self._raw_combine_offset, 0, self._offset_bytes)
+    # ================================================================
+    # GPU-side ops (CUDA-graph compatible)
+    # ================================================================
 
-    def reset_combine_offset(self):
-        """Reset only the combine offset counter."""
-        self._cuda_rt.cudaMemset(
-            self._raw_combine_offset, 0, self._offset_bytes)
+    def gpu_reset_offsets(self):
+        """Reset dispatch+combine offset counters (GPU kernel).
+        """
+        torch.ops._C_dispatch_combine.reset_offsets(
+            self.config_tensor)
 
-    def get_dispatch_recv_count(self) -> int:
-        """Get number of tokens received in dispatch phase."""
-        tmp = torch.empty(
-            1, dtype=torch.int32, device=self._device)
-        self._cuda_rt.cudaMemcpy(
-            ctypes.c_void_p(tmp.data_ptr()),
-            self._raw_dispatch_offset,
-            self._offset_bytes)
-        return tmp.item()
+    def gpu_reset_combine_offset(self):
+        """Reset combine offset counter (GPU kernel)."""
+        torch.ops._C_dispatch_combine.reset_combine_offset(
+            self.config_tensor)
 
-    def get_combine_recv_count(self) -> int:
-        """Get number of results received in combine phase."""
-        tmp = torch.empty(
-            1, dtype=torch.int32, device=self._device)
-        self._cuda_rt.cudaMemcpy(
-            ctypes.c_void_p(tmp.data_ptr()),
-            self._raw_combine_offset,
-            self._offset_bytes)
-        return tmp.item()
+    def gpu_copy_dispatch_recv(self):
+        """Copy dispatch recv from IPC to pre-allocated tensor.
+        """
+        torch.ops._C_dispatch_combine.copy_dispatch_recv(
+            self.dispatch_recv_tensor,
+            self.config_tensor,
+            self.max_recv,
+            self.hidden_dim)
 
-    def read_dispatch_recv(self, count: int) -> torch.Tensor:
-        """Copy dispatched tokens from IPC buffer to a tensor."""
-        nbytes = count * self.hidden_dim * self._dtype_size
-        tensor = torch.empty(
-            (count, self.hidden_dim),
-            dtype=self.dtype, device=self._device)
-        self._cuda_rt.cudaMemcpy(
-            ctypes.c_void_p(tensor.data_ptr()),
-            self._raw_dispatch_recv,
-            nbytes)
-        return tensor
+    def gpu_copy_dispatch_meta(self):
+        """Copy dispatch metadata from IPC to tensor."""
+        torch.ops._C_dispatch_combine.copy_dispatch_meta(
+            self.dispatch_meta_tensor,
+            self.config_tensor,
+            self.max_recv)
 
-    def read_dispatch_meta(self, count: int) -> torch.Tensor:
-        """Copy dispatch metadata from IPC buffer to a tensor.
-        Returns (count, 4) int32 tensor."""
-        nbytes = count * 4 * 4  # 4 int32 fields per entry
-        tensor = torch.empty(
-            (count, 4),
-            dtype=torch.int32, device=self._device)
-        self._cuda_rt.cudaMemcpy(
-            ctypes.c_void_p(tensor.data_ptr()),
-            self._raw_dispatch_meta,
-            nbytes)
-        return tensor
+    def gpu_copy_combine_recv(self):
+        """Copy combine recv from IPC to tensor."""
+        torch.ops._C_dispatch_combine.copy_combine_recv(
+            self.combine_recv_tensor,
+            self.config_tensor,
+            self.max_recv,
+            self.hidden_dim)
 
-    def read_combine_recv(self, count: int) -> torch.Tensor:
-        """Copy combine results from IPC buffer to a tensor."""
-        nbytes = count * self.hidden_dim * self._dtype_size
-        tensor = torch.empty(
-            (count, self.hidden_dim),
-            dtype=self.dtype, device=self._device)
-        self._cuda_rt.cudaMemcpy(
-            ctypes.c_void_p(tensor.data_ptr()),
-            self._raw_combine_recv,
-            nbytes)
-        return tensor
+    def gpu_copy_combine_meta(self):
+        """Copy combine metadata from IPC to tensor."""
+        torch.ops._C_dispatch_combine.copy_combine_meta(
+            self.combine_meta_tensor,
+            self.config_tensor,
+            self.max_recv)
 
-    def read_combine_meta_bytes(
-            self, count: int) -> torch.Tensor:
-        """Copy combine metadata as raw bytes for CUDA kernel.
-        Returns 1-D uint8 tensor of size count * 16."""
-        nbytes = count * 4 * 4  # 16 bytes per entry
-        tensor = torch.empty(
-            nbytes, dtype=torch.uint8, device=self._device)
-        self._cuda_rt.cudaMemcpy(
-            ctypes.c_void_p(tensor.data_ptr()),
-            self._raw_combine_meta,
-            nbytes)
-        return tensor
+    def nccl_barrier(self, ep_group):
+        """GPU-side barrier via NCCL all-reduce.
+        Uses GroupCoordinator.all_reduce which routes
+        through torch.ops.vllm.all_reduce custom op
+        for CUDA graph compatibility."""
+        self._barrier_tensor.fill_(0)
+        ep_group.all_reduce(self._barrier_tensor)
 
     def destroy(self):
         """Release cudaMalloc'd buffers."""
