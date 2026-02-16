@@ -38,7 +38,6 @@ class DispatchCombineP2PManager:
     - dispatch_meta_tensor: (max_recv, 4) int32
     - combine_recv_tensor: (max_recv, hidden_dim) dtype
     - combine_meta_tensor: (max_recv, 4) int32
-    - accum_tensor: (max_num_tokens, hidden_dim) float32
     """
 
     def __init__(
@@ -136,12 +135,6 @@ class DispatchCombineP2PManager:
         self.combine_meta_tensor = torch.zeros(
             (self.max_recv, 4),
             dtype=torch.int32,
-            device=self._device)
-
-        # Float32 accumulator for scatter-add.
-        self.accum_tensor = torch.zeros(
-            (max_num_tokens, hidden_dim),
-            dtype=torch.float32,
             device=self._device)
 
         # NCCL barrier tensor (tiny, for all-reduce barrier).

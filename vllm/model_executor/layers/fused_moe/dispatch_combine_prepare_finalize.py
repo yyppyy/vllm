@@ -296,9 +296,10 @@ class DispatchCombinePrepareAndFinalize(
         mgr.gpu_copy_combine_meta()
 
         # Step 7: Scatter-add weighted results to output.
-        # Use pre-allocated float32 accumulator.
-        accum = mgr.accum_tensor[:output.shape[0]]
-        accum.zero_()
+        # Float32 accumulator for precise atomic scatter-add.
+        accum = torch.zeros(
+            output.shape, dtype=torch.float32,
+            device=output.device)
 
         combine_meta_bytes = (
             mgr.combine_meta_tensor.contiguous().view(
