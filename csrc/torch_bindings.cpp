@@ -1,6 +1,19 @@
 #include "cache.h"
 #include "cuda_utils.h"
-#include "dispatch_combine.cuh"
+// Forward declarations for dispatch_combine (defined in dispatch_combine.cu).
+// Cannot include dispatch_combine.cuh here as it contains CUDA device code.
+namespace vllm {
+namespace dispatch_combine {
+void dispatch_p2p(torch::Tensor input, torch::Tensor topk_ids,
+                  torch::Tensor topk_weights, torch::Tensor config_tensor,
+                  int64_t M, int64_t K, int64_t topk);
+void combine_p2p(torch::Tensor expert_output, torch::Tensor dispatch_meta,
+                 torch::Tensor config_tensor, int64_t M_recv, int64_t K);
+void scatter_add_weighted(torch::Tensor output, torch::Tensor combine_recv,
+                          torch::Tensor combine_meta, int64_t N_recv,
+                          int64_t K);
+}  // namespace dispatch_combine
+}  // namespace vllm
 #include "ops.h"
 #include "core/registration.h"
 

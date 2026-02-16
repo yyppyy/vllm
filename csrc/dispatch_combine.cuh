@@ -215,19 +215,19 @@ void dispatch_p2p(
     torch::Tensor topk_ids,    // (M, topk) int32
     torch::Tensor topk_weights,// (M, topk) float32
     torch::Tensor config_tensor, // DispatchCombineConfig as raw bytes
-    int M, int K, int topk);
+    int64_t M, int64_t K, int64_t topk);
 
 void combine_p2p(
     torch::Tensor expert_output,  // (M_recv, K) bfloat16/float16
     torch::Tensor dispatch_meta,  // (M_recv,) TokenMetadata as raw bytes
     torch::Tensor config_tensor,  // DispatchCombineConfig as raw bytes
-    int M_recv, int K);
+    int64_t M_recv, int64_t K);
 
 void scatter_add_weighted(
     torch::Tensor output,       // (M_orig, K) float32
     torch::Tensor combine_recv, // (N_recv, K) bfloat16/float16
     torch::Tensor combine_meta, // (N_recv,) TokenMetadata as raw bytes
-    int N_recv, int K);
+    int64_t N_recv, int64_t K);
 
 }  // namespace dispatch_combine
 }  // namespace vllm
