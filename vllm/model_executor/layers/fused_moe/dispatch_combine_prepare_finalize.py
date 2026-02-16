@@ -287,8 +287,8 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Step 2: Launch combine P2P kernel.
         # Send expert outputs back to originating ranks.
         if M_recv > 0:
-            meta_bytes = self._dispatch_meta_buf.view(-1).to(
-                torch.uint8).contiguous()
+            meta_bytes = self._dispatch_meta_buf.contiguous().view(
+                torch.uint8)
             torch.ops._C_dispatch_combine.combine_p2p(
                 fused_expert_output,
                 meta_bytes,

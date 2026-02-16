@@ -50,8 +50,18 @@ class DispatchCombineP2PManager:
         self.hidden_dim = hidden_dim
         self.topk = topk
         self.dtype = dtype
-        self._dtype_size = dtype.itemsize
+        self._dtype_size = torch.tensor(
+            [], dtype=dtype).element_size()
         self._device = torch.cuda.current_device()
+
+        logger.info(
+            "DispatchCombineP2PManager: rank=%d, device=%d, "
+            "world_size=%d, max_num_tokens=%d, "
+            "hidden_dim=%d, topk=%d, dtype=%s, "
+            "dtype_size=%d",
+            rank, self._device, world_size,
+            max_num_tokens, hidden_dim, topk,
+            str(dtype), self._dtype_size)
 
         # Max tokens any rank can receive = all tokens from all
         # ranks could route to this rank's experts.
@@ -242,6 +252,45 @@ class DispatchCombineP2PManager:
                 self.remote_combine_recv_ptrs[r],
                 self.remote_combine_meta_ptrs[r],
                 self.remote_combine_offset_ptrs[r])
+
+        # Validate IPC pointers by reading 4 bytes from each
+        # remote buffer via cudaMemcpy. This catches invalid
+        # IPC handles before any kernel launch.
+        tmp = torch.empty(
+            1, dtype=torch.int32, device=self._device)
+        for r in range(self.world_size):
+            if r == self.rank:
+                continue
+            try:
+                self._cuda_rt.cudaMemcpy(
+                    ctypes.c_void_p(tmp.data_ptr()),
+                    ctypes.c_void_p(
+                        self.remote_dispatch_recv_ptrs[r]),
+                    4)
+            except RuntimeError as e:
+                logger.error(
+                    "Rank %d: IPC validation FAILED for "
+                    "rank %d dispatch_recv ptr 0x%x: %s",
+                    self.rank, r,
+                    self.remote_dispatch_recv_ptrs[r], e)
+                raise
+            try:
+                self._cuda_rt.cudaMemcpy(
+                    ctypes.c_void_p(tmp.data_ptr()),
+                    ctypes.c_void_p(
+                        self.remote_dispatch_offset_ptrs[r]),
+                    4)
+            except RuntimeError as e:
+                logger.error(
+                    "Rank %d: IPC validation FAILED for "
+                    "rank %d dispatch_offset ptr 0x%x: %s",
+                    self.rank, r,
+                    self.remote_dispatch_offset_ptrs[r], e)
+                raise
+        logger.info(
+            "Rank %d: IPC pointer validation passed "
+            "for all %d remote ranks.",
+            self.rank, self.world_size - 1)
 
     def _build_config_tensor(self) -> torch.Tensor:
         """Build a raw-bytes tensor containing
