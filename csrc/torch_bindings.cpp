@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "cuda_utils.h"
+#include "dispatch_combine.cuh"
 #include "ops.h"
 #include "core/registration.h"
 
@@ -778,6 +779,26 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   // Max input size in bytes
   custom_ar.def("qr_max_size", &qr_max_size);
 #endif
+}
+
+TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
+                     dc) {
+  // Dispatch-Combine P2P kernels for MoE all2all
+  dc.def(
+      "dispatch_p2p(Tensor input, Tensor topk_ids, Tensor topk_weights, "
+      "Tensor config_tensor, int M, int K, int topk) -> ()");
+  dc.impl("dispatch_p2p", torch::kCUDA,
+          &vllm::dispatch_combine::dispatch_p2p);
+  dc.def(
+      "combine_p2p(Tensor expert_output, Tensor dispatch_meta, "
+      "Tensor config_tensor, int M_recv, int K) -> ()");
+  dc.impl("combine_p2p", torch::kCUDA,
+          &vllm::dispatch_combine::combine_p2p);
+  dc.def(
+      "scatter_add_weighted(Tensor! output, Tensor combine_recv, "
+      "Tensor combine_meta, int N_recv, int K) -> ()");
+  dc.impl("scatter_add_weighted", torch::kCUDA,
+          &vllm::dispatch_combine::scatter_add_weighted);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

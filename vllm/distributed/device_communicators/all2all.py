@@ -438,3 +438,52 @@ class FlashInferAllToAllManager(All2AllManagerBase):
                 self.prepare_workspace_tensor = None
                 self.mapping = None
                 self.initialized = False
+
+
+class DispatchCombineAll2AllManager(All2AllManagerBase):
+    """
+    All2All communication using routing-aware dispatch/combine
+    with custom CUDA P2P kernels. Each rank only receives tokens
+    whose selected experts reside on that rank.
+    Communication is handled in the PrepareAndFinalize class,
+    not via the dispatch/combine methods here.
+    """
+
+    def __init__(self, cpu_group):
+        super().__init__(cpu_group)
+        self.handle_cache = Cache()
+
+    def get_handle(self, kwargs):
+        from .dispatch_combine_buffers import DispatchCombineP2PManager
+        return self.handle_cache.get_or_create(
+            kwargs,
+            lambda **kw: DispatchCombineP2PManager(
+                rank=self.rank,
+                world_size=self.world_size,
+                cpu_group=self.cpu_group,
+                **kw,
+            ))
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        is_sequence_parallel: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError(
+            "DispatchCombineAll2AllManager uses modular kernel "
+            "PrepareAndFinalize for communication.")
+
+    def combine(self,
+                hidden_states: torch.Tensor,
+                is_sequence_parallel: bool = False) -> torch.Tensor:
+        raise NotImplementedError(
+            "DispatchCombineAll2AllManager uses modular kernel "
+            "PrepareAndFinalize for communication.")
+
+    def destroy(self):
+        with self.handle_cache._lock:
+            for _, handle in self.handle_cache._cache.items():
+                if hasattr(handle, 'destroy'):
+                    handle.destroy()
+            self.handle_cache._cache.clear()
