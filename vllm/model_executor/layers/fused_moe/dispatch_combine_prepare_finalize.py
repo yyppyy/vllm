@@ -146,6 +146,17 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> mk.PrepareResultType:
         # Read how many tokens were received.
         M_recv = self.p2p_manager.get_dispatch_recv_count()
+
+        # Clamp to buffer capacity. The kernel bounds-checks
+        # against max_recv so any overflow entries were dropped.
+        max_recv = self.p2p_manager.max_recv
+        if M_recv > max_recv:
+            logger.warning(
+                "Dispatch recv count %d exceeds max_recv %d, "
+                "clamping (some tokens were dropped).",
+                M_recv, max_recv)
+            M_recv = max_recv
+
         self._dispatch_recv_count = M_recv
 
         if M_recv == 0:
@@ -302,6 +313,14 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Step 3: Read combine results and scatter-add to output.
         N_recv = self.p2p_manager.get_combine_recv_count()
+
+        # Clamp to buffer capacity.
+        max_recv = self.p2p_manager.max_recv
+        if N_recv > max_recv:
+            logger.warning(
+                "Combine recv count %d exceeds max_recv %d, "
+                "clamping.", N_recv, max_recv)
+            N_recv = max_recv
 
         if N_recv > 0:
             combine_recv = self.p2p_manager.read_combine_recv(

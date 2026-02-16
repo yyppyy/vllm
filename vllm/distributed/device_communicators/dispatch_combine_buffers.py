@@ -63,9 +63,13 @@ class DispatchCombineP2PManager:
             max_num_tokens, hidden_dim, topk,
             str(dtype), self._dtype_size)
 
-        # Max tokens any rank can receive = all tokens from all
-        # ranks could route to this rank's experts.
-        self.max_recv = max_num_tokens * topk * world_size
+        # Max tokens any rank can receive. With uniform routing
+        # each rank receives ~(max_num_tokens * topk) entries.
+        # Use 2x safety factor instead of the theoretical max
+        # (max_num_tokens * topk * world_size) which consumes
+        # too much GPU memory. The kernel bounds-checks against
+        # max_recv so overflow entries are safely dropped.
+        self.max_recv = max_num_tokens * topk * 2
 
         # Buffer sizes in bytes.
         self._recv_bytes = (
