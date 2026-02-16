@@ -163,9 +163,9 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             return (empty_x, None, expert_tokens_meta,
                     empty_ids, empty_weights)
 
-        # Slice the recv buffers to actual received count.
-        expert_x = self.p2p_manager.dispatch_recv_buf[:M_recv].clone()
-        dispatch_meta = self.p2p_manager.dispatch_meta_buf[:M_recv]
+        # Copy received data from IPC buffers into tensors.
+        expert_x = self.p2p_manager.read_dispatch_recv(M_recv)
+        dispatch_meta = self.p2p_manager.read_dispatch_meta(M_recv)
 
         # Save metadata for combine phase.
         self._dispatch_meta_buf = dispatch_meta
@@ -272,7 +272,7 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             )
 
         # Reset combine offset counters.
-        self.p2p_manager.combine_offset.zero_()
+        self.p2p_manager.reset_combine_offset()
         torch.cuda.synchronize()
 
         # Step 2: Launch combine P2P kernel.
@@ -298,9 +298,10 @@ class DispatchCombinePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         N_recv = self.p2p_manager.get_combine_recv_count()
 
         if N_recv > 0:
-            combine_recv = self.p2p_manager.combine_recv_buf[:N_recv]
-            combine_meta_bytes = self.p2p_manager.combine_meta_buf[
-                :N_recv].view(-1).to(torch.uint8).contiguous()
+            combine_recv = self.p2p_manager.read_combine_recv(
+                N_recv)
+            combine_meta_bytes = (
+                self.p2p_manager.read_combine_meta_bytes(N_recv))
 
             # Use float32 accumulator for precise atomic scatter-add,
             # then convert back to output dtype.
