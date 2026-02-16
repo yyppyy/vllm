@@ -115,9 +115,17 @@ __global__ void dispatch_p2p_kernel(
     return;
   }
 
-  // Atomically claim a write slot on the destination rank's recv buffer.
-  int32_t write_pos = atomicAdd(
-      config->remote_dispatch_offsets[dest_rank], 1);
+  // Only thread 0 claims a write slot; broadcast to all threads
+  // via shared memory so they can cooperate on the data copy.
+  __shared__ int32_t s_write_pos;
+
+  if (threadIdx.x == 0) {
+    s_write_pos = atomicAdd(
+        config->remote_dispatch_offsets[dest_rank], 1);
+  }
+  __syncthreads();
+
+  const int32_t write_pos = s_write_pos;
 
   // Bounds check: write_pos must be within buffer capacity.
   if (write_pos >= config->max_recv) return;
@@ -179,9 +187,16 @@ __global__ void combine_p2p_kernel(
     return;
   }
 
-  // Atomically claim a write slot on dest rank's combine recv buffer.
-  int32_t write_pos = atomicAdd(
-      config->remote_combine_offsets[dest_rank], 1);
+  // Only thread 0 claims a write slot; broadcast via shared memory.
+  __shared__ int32_t s_write_pos;
+
+  if (threadIdx.x == 0) {
+    s_write_pos = atomicAdd(
+        config->remote_combine_offsets[dest_rank], 1);
+  }
+  __syncthreads();
+
+  const int32_t write_pos = s_write_pos;
 
   // Bounds check: write_pos must be within buffer capacity.
   if (write_pos >= config->max_recv) return;
