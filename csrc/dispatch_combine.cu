@@ -262,5 +262,38 @@ void copy_combine_meta(
       output.data_ptr<int32_t>(), config);
 }
 
+// ====================================================================
+// P2P flag-based barriers (replace NCCL AllReduce)
+// ====================================================================
+
+void p2p_barrier(torch::Tensor config_tensor) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  p2p_barrier_kernel<BarrierMode::PURE>
+      <<<1, kMaxRanks, 0, stream>>>(config);
+}
+
+void p2p_barrier_reset_offsets(
+    torch::Tensor config_tensor) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  p2p_barrier_kernel<BarrierMode::RESET_DISPATCH_COMBINE>
+      <<<1, kMaxRanks, 0, stream>>>(config);
+}
+
+void p2p_barrier_reset_combine_offset(
+    torch::Tensor config_tensor) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  p2p_barrier_kernel<BarrierMode::RESET_COMBINE>
+      <<<1, kMaxRanks, 0, stream>>>(config);
+}
+
 }  // namespace dispatch_combine
 }  // namespace vllm

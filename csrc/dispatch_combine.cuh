@@ -13,6 +13,40 @@ namespace dispatch_combine {
 // Maximum number of EP ranks supported.
 constexpr int kMaxRanks = 64;
 
+// ====================================================================
+// P2P flag operations for cross-GPU synchronization.
+// Follows custom_all_reduce.cuh pattern (lines 159-181).
+// ====================================================================
+using FlagType = uint32_t;
+
+static __device__ __forceinline__ void dc_st_flag_release(
+    FlagType* flag_addr, FlagType flag) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+  asm volatile(
+      "st.release.sys.global.u32 [%1], %0;"
+      ::"r"(flag), "l"(flag_addr));
+#else
+  asm volatile(
+      "membar.sys; st.volatile.global.u32 [%1], %0;"
+      ::"r"(flag), "l"(flag_addr));
+#endif
+}
+
+static __device__ __forceinline__ FlagType dc_ld_flag_acquire(
+    FlagType* flag_addr) {
+  FlagType flag;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+  asm volatile(
+      "ld.acquire.sys.global.u32 %0, [%1];"
+      : "=r"(flag) : "l"(flag_addr));
+#else
+  asm volatile(
+      "ld.volatile.global.u32 %0, [%1]; membar.gl;"
+      : "=r"(flag) : "l"(flag_addr));
+#endif
+  return flag;
+}
+
 // Metadata for each dispatched token-expert pair.
 // Packed into 16 bytes for efficient P2P transfer.
 struct __align__(16) TokenMetadata {
@@ -20,6 +54,16 @@ struct __align__(16) TokenMetadata {
   int32_t source_token_idx;  // Token index on originating rank
   int32_t expert_id;         // Global expert ID
   float topk_weight;         // Router weight for this pair
+};
+
+// P2P barrier signal buffer. One per rank, shared via IPC.
+// Counter is GPU-resident and increments on each barrier
+// call, naturally compatible with CUDA graph replays.
+struct DispatchCombineSignals {
+  // flags[i] is written by rank i to signal readiness.
+  alignas(128) FlagType flags[kMaxRanks];
+  // Monotonically increasing counter.
+  FlagType counter;
 };
 
 // Per-rank buffer configuration passed to CUDA kernels.
@@ -36,6 +80,10 @@ struct DispatchCombineConfig {
   void* remote_combine_meta[kMaxRanks];
   // Pointers to each rank's combine write-offset counter (via IPC).
   int32_t* remote_combine_offsets[kMaxRanks];
+
+  // P2P barrier signal buffers (via IPC).
+  DispatchCombineSignals* self_signals;
+  DispatchCombineSignals* peer_signals[kMaxRanks];
 
   int32_t rank;
   int32_t world_size;
@@ -69,6 +117,64 @@ __global__ void reset_combine_offset_kernel(
   const int32_t rank = config->rank;
   if (config->remote_combine_offsets[rank]) {
     *config->remote_combine_offsets[rank] = 0;
+  }
+}
+
+// ====================================================================
+// P2P flag-based barrier kernels (replace NCCL AllReduce).
+// Launch with 1 block, kMaxRanks threads.
+// ====================================================================
+enum class BarrierMode : int {
+  PURE = 0,                    // Signal + wait only
+  RESET_DISPATCH_COMBINE = 1,  // Reset both offsets + barrier
+  RESET_COMBINE = 2,           // Reset combine offset + barrier
+};
+
+template <BarrierMode mode>
+__global__ void p2p_barrier_kernel(
+    const DispatchCombineConfig* __restrict__ config) {
+  const int32_t rank = config->rank;
+  const int32_t ws = config->world_size;
+  const int32_t tid = threadIdx.x;
+  if (tid >= ws) return;
+
+  // Optional reset (thread 0 only).
+  if constexpr (mode == BarrierMode::RESET_DISPATCH_COMBINE) {
+    if (tid == 0) {
+      if (config->remote_dispatch_offsets[rank])
+        *config->remote_dispatch_offsets[rank] = 0;
+      if (config->remote_combine_offsets[rank])
+        *config->remote_combine_offsets[rank] = 0;
+    }
+  } else if constexpr (mode == BarrierMode::RESET_COMBINE) {
+    if (tid == 0) {
+      if (config->remote_combine_offsets[rank])
+        *config->remote_combine_offsets[rank] = 0;
+    }
+  }
+
+  // Make all preceding writes visible to peers.
+  __threadfence_system();
+
+  // Read counter and compute expected flag value.
+  // Counter is GPU-resident; increments naturally on
+  // each CUDA graph replay.
+  FlagType flag = config->self_signals->counter + 1;
+
+  // Write flag to peer tid's signal buffer at our rank.
+  dc_st_flag_release(
+      &config->peer_signals[tid]->flags[rank], flag);
+
+  // Spin-wait on own signal buffer for peer tid's flag.
+  while (dc_ld_flag_acquire(
+      &config->self_signals->flags[tid]) != flag)
+    ;
+
+  __syncthreads();
+
+  // Update counter (one thread only).
+  if (tid == 0) {
+    config->self_signals->counter = flag;
   }
 }
 
@@ -392,6 +498,13 @@ void scatter_add_weighted(
 // GPU-side buffer operations (CUDA-graph compatible).
 void reset_offsets(torch::Tensor config_tensor);
 void reset_combine_offset(torch::Tensor config_tensor);
+
+// P2P flag-based barriers (replace NCCL AllReduce).
+void p2p_barrier(torch::Tensor config_tensor);
+void p2p_barrier_reset_offsets(
+    torch::Tensor config_tensor);
+void p2p_barrier_reset_combine_offset(
+    torch::Tensor config_tensor);
 void copy_dispatch_recv(
     torch::Tensor output,
     torch::Tensor config_tensor,

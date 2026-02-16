@@ -15,7 +15,6 @@ from typing import Callable, Optional
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig)
@@ -68,9 +67,6 @@ class DispatchCombinePrepareAndFinalize(
         self.p2p_manager.update_experts_per_rank(
             self.experts_per_rank)
 
-        # Cache the EP group coordinator for NCCL barriers.
-        self._ep_group = get_ep_group()
-
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -108,14 +104,12 @@ class DispatchCombinePrepareAndFinalize(
 
         mgr = self.p2p_manager
 
-        # Step 1: Reset offset counters (GPU kernel).
-        mgr.gpu_reset_offsets()
+        # Step 1: Reset offsets + P2P barrier (merged).
+        # Ensures all ranks finish resetting before any
+        # rank launches dispatch.
+        mgr.gpu_p2p_barrier_reset_offsets()
 
-        # Step 2: NCCL barrier - all ranks must finish
-        # resetting before any rank launches dispatch.
-        mgr.nccl_barrier(self._ep_group)
-
-        # Step 3: Launch dispatch P2P kernel.
+        # Step 2: Launch dispatch P2P kernel.
         topk_ids_i32 = topk_ids.to(torch.int32)
         topk_weights_f32 = topk_weights.to(torch.float32)
 
@@ -127,10 +121,10 @@ class DispatchCombinePrepareAndFinalize(
             M, K, topk,
         )
 
-        # Step 4: NCCL barrier - all P2P writes complete.
-        mgr.nccl_barrier(self._ep_group)
+        # Step 3: P2P barrier - all P2P writes complete.
+        mgr.gpu_p2p_barrier()
 
-        # Step 5: Copy from IPC buffers (GPU kernels).
+        # Step 4: Copy from IPC buffers (GPU kernels).
         # These kernels read actual count from offset
         # counters and zero entries beyond actual count.
         mgr.gpu_copy_dispatch_recv()
@@ -267,13 +261,10 @@ class DispatchCombinePrepareAndFinalize(
                         apply_router_weight_on_input),
                 ))
 
-        # Step 2: Reset combine offset (GPU kernel).
-        mgr.gpu_reset_combine_offset()
+        # Step 2: Reset combine offset + P2P barrier.
+        mgr.gpu_p2p_barrier_reset_combine_offset()
 
-        # Step 3: NCCL barrier before combine.
-        mgr.nccl_barrier(self._ep_group)
-
-        # Step 4: Launch combine P2P kernel.
+        # Step 3: Launch combine P2P kernel.
         # The kernel reads actual dispatch_recv count from
         # config and skips entries beyond it.
         # dispatch_meta is the pre-allocated tensor already
@@ -288,14 +279,14 @@ class DispatchCombinePrepareAndFinalize(
             max_recv, K,
         )
 
-        # Step 5: NCCL barrier for combine completion.
-        mgr.nccl_barrier(self._ep_group)
+        # Step 4: P2P barrier for combine completion.
+        mgr.gpu_p2p_barrier()
 
-        # Step 6: Copy combine results (GPU kernels).
+        # Step 5: Copy combine results (GPU kernels).
         mgr.gpu_copy_combine_recv()
         mgr.gpu_copy_combine_meta()
 
-        # Step 7: Scatter-add weighted results to output.
+        # Step 6: Scatter-add weighted results to output.
         # Float32 accumulator for precise atomic scatter-add.
         accum = torch.zeros(
             output.shape, dtype=torch.float32,

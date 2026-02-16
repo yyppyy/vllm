@@ -22,6 +22,9 @@ void copy_combine_recv(torch::Tensor output, torch::Tensor config_tensor,
                        int64_t max_recv, int64_t K);
 void copy_combine_meta(torch::Tensor output, torch::Tensor config_tensor,
                        int64_t max_recv);
+void p2p_barrier(torch::Tensor config_tensor);
+void p2p_barrier_reset_offsets(torch::Tensor config_tensor);
+void p2p_barrier_reset_combine_offset(torch::Tensor config_tensor);
 }  // namespace dispatch_combine
 }  // namespace vllm
 #include "ops.h"
@@ -850,6 +853,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "int max_recv) -> ()");
   dc.impl("copy_combine_meta", torch::kCUDA,
           &vllm::dispatch_combine::copy_combine_meta);
+
+  // P2P flag-based barriers (replace NCCL AllReduce)
+  dc.def(
+      "p2p_barrier(Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier", torch::kCUDA,
+          &vllm::dispatch_combine::p2p_barrier);
+  dc.def(
+      "p2p_barrier_reset_offsets("
+      "Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier_reset_offsets", torch::kCUDA,
+          &vllm::dispatch_combine::p2p_barrier_reset_offsets);
+  dc.def(
+      "p2p_barrier_reset_combine_offset("
+      "Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier_reset_combine_offset", torch::kCUDA,
+          &vllm::dispatch_combine::
+              p2p_barrier_reset_combine_offset);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

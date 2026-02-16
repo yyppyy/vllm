@@ -111,6 +111,16 @@ class DispatchCombineP2PManager:
         self._cuda_rt.cudaMemset(
             self._raw_combine_offset, 0, self._offset_bytes)
 
+        # P2P barrier signal buffer.
+        # Layout: alignas(128) flags[64] (256 bytes)
+        #         + counter (4 bytes) = 260 bytes.
+        # Allocate 512 bytes for safety.
+        self._signal_bytes = 512
+        self._raw_signals = self._cuda_rt.cudaMalloc(
+            self._signal_bytes)
+        self._cuda_rt.cudaMemset(
+            self._raw_signals, 0, self._signal_bytes)
+
         # Exchange CUDA IPC handles for P2P access.
         self._setup_p2p_mappings()
 
@@ -136,10 +146,6 @@ class DispatchCombineP2PManager:
             (self.max_recv, 4),
             dtype=torch.int32,
             device=self._device)
-
-        # NCCL barrier tensor (tiny, for all-reduce barrier).
-        self._barrier_tensor = torch.zeros(
-            1, dtype=torch.int32, device=self._device)
 
         logger.info(
             "DispatchCombineP2PManager initialized: rank=%d,"
@@ -184,6 +190,9 @@ class DispatchCombineP2PManager:
             'combine_offset': to_bytes(
                 cuda_rt.cudaIpcGetMemHandle(
                     self._raw_combine_offset)),
+            'signals': to_bytes(
+                cuda_rt.cudaIpcGetMemHandle(
+                    self._raw_signals)),
         }
 
         all_handles = [None] * self.world_size
@@ -196,6 +205,7 @@ class DispatchCombineP2PManager:
         self.remote_combine_recv_ptrs = []
         self.remote_combine_meta_ptrs = []
         self.remote_combine_offset_ptrs = []
+        self.remote_signals_ptrs = []
         from_bytes = self._bytes_to_handle
 
         for r in range(self.world_size):
@@ -212,6 +222,8 @@ class DispatchCombineP2PManager:
                     self._raw_combine_meta.value)
                 self.remote_combine_offset_ptrs.append(
                     self._raw_combine_offset.value)
+                self.remote_signals_ptrs.append(
+                    self._raw_signals.value)
             else:
                 h = all_handles[r]
                 self.remote_dispatch_recv_ptrs.append(
@@ -238,6 +250,10 @@ class DispatchCombineP2PManager:
                     cuda_rt.cudaIpcOpenMemHandle(
                         from_bytes(
                             h['combine_offset'])).value)
+                self.remote_signals_ptrs.append(
+                    cuda_rt.cudaIpcOpenMemHandle(
+                        from_bytes(
+                            h['signals'])).value)
 
         # Validate all pointers are non-NULL.
         for r in range(self.world_size):
@@ -253,6 +269,8 @@ class DispatchCombineP2PManager:
                 f"NULL combine_meta ptr for rank {r}"
             assert self.remote_combine_offset_ptrs[r], \
                 f"NULL combine_offset ptr for rank {r}"
+            assert self.remote_signals_ptrs[r], \
+                f"NULL signals ptr for rank {r}"
 
     def _build_config_tensor(self) -> torch.Tensor:
         """Build a raw-bytes tensor containing
@@ -299,6 +317,16 @@ class DispatchCombineP2PManager:
                 if r < self.world_size else 0
             data += struct.pack('Q', ptr)
 
+        # self_signals (1 pointer)
+        data += struct.pack(
+            'Q', self.remote_signals_ptrs[self.rank])
+
+        # peer_signals[kMaxRanks]
+        for r in range(max_ranks):
+            ptr = self.remote_signals_ptrs[r] \
+                if r < self.world_size else 0
+            data += struct.pack('Q', ptr)
+
         # Scalar fields
         data += struct.pack('i', self.rank)
         data += struct.pack('i', self.world_size)
@@ -318,7 +346,11 @@ class DispatchCombineP2PManager:
         """Update experts_per_rank in the config tensor."""
         import struct
         max_ranks = 64
-        offset = 6 * max_ranks * 8 + 2 * 4
+        # 6 ptr arrays + self_signals(1) + peer_signals(64)
+        # + rank(4) + world_size(4) = offset to experts_per_rank
+        offset = (6 * max_ranks * 8
+                  + 8 + max_ranks * 8
+                  + 2 * 4)
         packed = struct.pack('i', experts_per_rank)
         cpu_config = self.config_tensor.cpu()
         for i, b in enumerate(packed):
@@ -371,13 +403,22 @@ class DispatchCombineP2PManager:
             self.config_tensor,
             self.max_recv)
 
-    def nccl_barrier(self, ep_group):
-        """GPU-side barrier via NCCL all-reduce.
-        Uses GroupCoordinator.all_reduce which routes
-        through torch.ops.vllm.all_reduce custom op
-        for CUDA graph compatibility."""
-        self._barrier_tensor.fill_(0)
-        ep_group.all_reduce(self._barrier_tensor)
+    def gpu_p2p_barrier(self):
+        """P2P flag-based barrier (GPU kernel)."""
+        torch.ops._C_dispatch_combine.p2p_barrier(
+            self.config_tensor)
+
+    def gpu_p2p_barrier_reset_offsets(self):
+        """Reset dispatch+combine offsets + P2P barrier."""
+        torch.ops._C_dispatch_combine\
+            .p2p_barrier_reset_offsets(
+                self.config_tensor)
+
+    def gpu_p2p_barrier_reset_combine_offset(self):
+        """Reset combine offset + P2P barrier."""
+        torch.ops._C_dispatch_combine\
+            .p2p_barrier_reset_combine_offset(
+                self.config_tensor)
 
     def destroy(self):
         """Release cudaMalloc'd buffers."""
@@ -387,3 +428,4 @@ class DispatchCombineP2PManager:
         self._cuda_rt.cudaFree(self._raw_combine_recv)
         self._cuda_rt.cudaFree(self._raw_combine_meta)
         self._cuda_rt.cudaFree(self._raw_combine_offset)
+        self._cuda_rt.cudaFree(self._raw_signals)
