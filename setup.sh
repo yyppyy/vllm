@@ -3,14 +3,17 @@ set -euo pipefail
 
 incremental=false
 ep_kernels=false
+deepep=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --incremental) incremental=true; shift ;;
     --ep-kernels) ep_kernels=true; shift ;;
+    --deepep) deepep=true; shift ;;
     -h|--help)
-      echo "Usage: $0 [--incremental] [--ep-kernels]"
+      echo "Usage: $0 [--incremental] [--ep-kernels] [--deepep]"
       echo "  --incremental   Only run the final build+install step"
       echo "  --ep-kernels    Build and install pplx-kernels (editable)"
+      echo "  --deepep        Build and install DeepEP (editable)"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -52,10 +55,46 @@ build_ep_kernels() {
   fi
 }
 
+build_deepep() {
+  # Auto-detect CUDA_HOME if not already set
+  if [[ -z "${CUDA_HOME:-}" ]]; then
+    if command -v nvcc &>/dev/null; then
+      CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
+    elif [[ -d /usr/local/cuda ]]; then
+      CUDA_HOME=/usr/local/cuda
+    else
+      echo "ERROR: CUDA_HOME is not set and could not be auto-detected." >&2
+      exit 1
+    fi
+    export CUDA_HOME
+    echo "==> Auto-detected CUDA_HOME=${CUDA_HOME}"
+  fi
+  # Auto-detect GPU arch if not already set
+  if [[ -z "${TORCH_CUDA_ARCH_LIST:-}" ]]; then
+    TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)"
+    export TORCH_CUDA_ARCH_LIST
+    echo "==> Auto-detected TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
+  fi
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  EP_WORKSPACE="$SCRIPT_DIR/ep_kernels_workspace"
+  if "$incremental"; then
+    echo "==> Incremental rebuild of DeepEP..."
+    if [[ -d "$EP_WORKSPACE/DeepEP" ]]; then
+      (cd "$EP_WORKSPACE/DeepEP" && python setup.py build_ext --inplace)
+    else
+      echo "  -> DeepEP not found at $EP_WORKSPACE/DeepEP, skipping (run without --incremental first)"
+    fi
+  else
+    echo "==> Building DeepEP..."
+    bash "$SCRIPT_DIR/tools/ep_kernels/install_deepep.sh" "$EP_WORKSPACE"
+  fi
+}
+
 if "$incremental"; then
   source .venv/bin/activate
   cmake --build --preset release --target install
   if "$ep_kernels"; then build_ep_kernels; fi
+  if "$deepep"; then build_deepep; fi
   exit 0
 fi
 
@@ -72,3 +111,4 @@ cmake --preset release
 cmake --build --preset release --target install
 
 if "$ep_kernels"; then build_ep_kernels; fi
+if "$deepep"; then build_deepep; fi
