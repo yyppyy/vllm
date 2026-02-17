@@ -226,11 +226,13 @@ __global__ void copy_dispatch_meta_kernel(
     actual_count = config->max_recv;
 
   if (entry_idx >= actual_count) {
-    // Zero metadata for entries beyond actual count.
-    // topk_weight=0 ensures scatter_add ignores them.
+    // Padding: use num_experts as expert_id sentinel
+    // so moe_align_block_size skips these entries
+    // (its kernel has: if expert_id >= num_experts continue).
     output[entry_idx * 4 + 0] = 0;
     output[entry_idx * 4 + 1] = 0;
-    output[entry_idx * 4 + 2] = 0;
+    output[entry_idx * 4 + 2] =
+        config->experts_per_rank * config->world_size;
     *reinterpret_cast<float*>(
         &output[entry_idx * 4 + 3]) = 0.0f;
     return;

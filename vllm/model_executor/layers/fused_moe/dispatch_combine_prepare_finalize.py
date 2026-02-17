@@ -149,14 +149,10 @@ class DispatchCombinePrepareAndFinalize(
         dispatch_meta = mgr.dispatch_meta_tensor
 
         # Extract expert IDs from metadata column 2.
+        # Padding entries have expert_id = num_experts
+        # (set by copy_dispatch_meta_kernel), which
+        # moe_align_block_size skips automatically.
         expert_topk_ids = dispatch_meta[:, 2].clone()
-
-        # Remap -1 entries to a safe expert.
-        expert_topk_ids = torch.where(
-            expert_topk_ids == -1,
-            (num_experts - 1
-             if self.rank_expert_offset == 0 else 0),
-            expert_topk_ids)
 
         # Shape as (max_recv, 1) for topk=1.
         expert_topk_ids = expert_topk_ids.unsqueeze(1).to(
@@ -190,14 +186,17 @@ class DispatchCombinePrepareAndFinalize(
                     block_shape=quant_config.block_shape))
 
         # Compute expert token counts.
+        # Padding entries have expert_id = num_experts;
+        # use masked scatter to exclude them (avoids OOB).
         expert_num_tokens = torch.zeros(
             num_experts, dtype=torch.int32,
             device=expert_x.device)
         flat_ids = expert_topk_ids.view(-1)
-        ones = torch.ones_like(
-            flat_ids, dtype=torch.int32)
+        valid_mask = (flat_ids < num_experts).to(
+            torch.int32)
+        safe_ids = flat_ids.clamp(0, num_experts - 1)
         expert_num_tokens.scatter_add_(
-            0, flat_ids.to(torch.int64), ones)
+            0, safe_ids.to(torch.int64), valid_mask)
 
         # Slice to local experts only.
         local_expert_num_tokens = expert_num_tokens[
