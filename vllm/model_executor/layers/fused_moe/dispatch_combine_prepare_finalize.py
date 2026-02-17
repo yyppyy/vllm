@@ -128,18 +128,10 @@ class DispatchCombinePrepareAndFinalize(
             M, K, topk,
         )
 
-        # Step 2: P2P barrier + reset combine offset.
-        # RESET_COMBINE mode: syncs dispatch writes AND
-        # resets combine_offset to 0 (visible to all ranks
-        # via threadfence_system). combine_p2p in finalize
-        # will atomicAdd from 0.
-        mgr.gpu_p2p_barrier_reset_combine_offset()
-
-        # Step 3: Fused stamp/zero + routing extraction.
-        # Replaces stamp_and_zero_dispatch + 8 PyTorch ops
-        # that were in _receiver(). Single kernel computes
-        # expert_topk_ids, expert_topk_weights, and
-        # expert_num_tokens alongside sentinel stamping.
+        # Step 2: Fused barrier + stamp/zero + routing.
+        # Inline barrier(RESET_COMBINE) syncs dispatch
+        # writes and resets combine_offset to 0. Then
+        # stamp/zero + routing extraction in one kernel.
         (expert_topk_ids,
          expert_topk_weights,
          expert_num_tokens) = (
@@ -273,17 +265,11 @@ class DispatchCombinePrepareAndFinalize(
             mc, K,
         )
 
-        # Step 3: P2P barrier + reset dispatch offset.
-        # RESET_DISPATCH mode: syncs combine writes AND
-        # resets dispatch_offset to 0 (visible to all
-        # ranks). Next layer's dispatch_p2p will
-        # atomicAdd from 0.
-        mgr.gpu_p2p_barrier_reset_dispatch()
-
-        # Step 4: Scatter-add from IPC combine buffers
-        # directly into output using native bf16 atomicAdd.
+        # Step 3: Fused barrier + scatter-add from IPC
+        # combine buffers. Inline barrier(RESET_DISPATCH)
+        # syncs combine writes and resets dispatch_offset.
+        # Then scatter-add using native bf16 atomicAdd.
         # cudaMemsetAsync zeros output before kernel.
-        # Eliminates float32 accumulator + bf16 cast.
         mgr.gpu_scatter_add_direct(output, mc)
 
         if do_async:

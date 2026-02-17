@@ -76,8 +76,11 @@ void combine_p2p(
           dispatch_meta.data_ptr());
 
   const int32_t K32 = static_cast<int32_t>(K);
-  // Grid = max_recv; kernel reads actual count from config.
-  dim3 grid(static_cast<int32_t>(max_recv));
+  // Persistent grid; kernel loops over actual entries.
+  int32_t grid_sz = static_cast<int32_t>(max_recv);
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
   AT_DISPATCH_SWITCH(
@@ -410,7 +413,13 @@ void prepare_dispatch_recv(
   const int32_t K32 = static_cast<int32_t>(K);
   const int32_t ne32 =
       static_cast<int32_t>(num_experts);
-  dim3 grid(mc32);
+  // Persistent grid; kernel has inline barrier +
+  // loops over entries.
+  int32_t grid_sz = mc32;
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  if (grid_sz < 1) grid_sz = 1;
+  dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
   AT_DISPATCH_SWITCH(
@@ -461,7 +470,13 @@ void scatter_add_direct(
 
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
-  dim3 grid(mc32);
+  // Persistent grid; kernel has inline barrier +
+  // loops over entries.
+  int32_t grid_sz = mc32;
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  if (grid_sz < 1) grid_sz = 1;
+  dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
   AT_DISPATCH_SWITCH(

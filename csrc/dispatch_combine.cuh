@@ -13,6 +13,13 @@ namespace dispatch_combine {
 // Maximum number of EP ranks supported.
 constexpr int kMaxRanks = 64;
 
+// Persistent grid size for fused kernels.
+// 32 blocks fit on all modern GPUs (>=80 SMs), starting
+// within nanoseconds of each other. This guarantees
+// that inline barrier reads of the counter happen before
+// block 0 increments it (barrier takes microseconds).
+constexpr int kPersistentGrid = 32;
+
 // ====================================================================
 // P2P flag operations for cross-GPU synchronization.
 // Follows custom_all_reduce.cuh pattern (lines 159-181).
@@ -386,68 +393,76 @@ __global__ void dispatch_p2p_kernel(
 // ====================================================================
 // Combine P2P kernel
 // ====================================================================
-// Reads actual dispatch recv count from config offset counter.
-// Grid size should be max_recv for CUDA graph compatibility.
+// Persistent-grid combine: reads actual dispatch recv count
+// from config offset counter. Grid = kPersistentGrid;
+// kernel loops over entries for CUDA graph compatibility.
 template <typename T>
 __global__ void combine_p2p_kernel(
     const T* __restrict__ expert_output,
     const TokenMetadata* __restrict__ dispatch_meta,
     const DispatchCombineConfig* __restrict__ config,
     int32_t K) {
-  const int32_t pair_idx = blockIdx.x;
-
-  // Read actual dispatch recv count from offset counter.
   int32_t M_recv =
       *config->remote_dispatch_offsets[config->rank];
   if (M_recv > config->max_recv)
     M_recv = config->max_recv;
-  if (pair_idx >= M_recv) return;
-
-  const int32_t dest_rank =
-      dispatch_meta[pair_idx].source_rank;
-  const int32_t orig_token_idx =
-      dispatch_meta[pair_idx].source_token_idx;
-  const float weight =
-      dispatch_meta[pair_idx].topk_weight;
-
-  if (dest_rank < 0 || dest_rank >= config->world_size)
-    return;
-
-  if (!config->remote_combine_offsets[dest_rank] ||
-      !config->remote_combine_recv[dest_rank] ||
-      !config->remote_combine_meta[dest_rank]) {
-    return;
-  }
 
   __shared__ int32_t s_write_pos;
-  if (threadIdx.x == 0) {
-    s_write_pos = atomicAdd(
-        config->remote_combine_offsets[dest_rank], 1);
+
+  for (int32_t pair_idx = blockIdx.x;
+       pair_idx < M_recv;
+       pair_idx += gridDim.x) {
+    const int32_t dest_rank =
+        dispatch_meta[pair_idx].source_rank;
+    const int32_t orig_token_idx =
+        dispatch_meta[pair_idx].source_token_idx;
+    const float weight =
+        dispatch_meta[pair_idx].topk_weight;
+
+    if (dest_rank < 0 ||
+        dest_rank >= config->world_size)
+      continue;
+
+    if (!config->remote_combine_offsets[dest_rank] ||
+        !config->remote_combine_recv[dest_rank] ||
+        !config->remote_combine_meta[dest_rank])
+      continue;
+
+    if (threadIdx.x == 0) {
+      s_write_pos = atomicAdd(
+          config->remote_combine_offsets[dest_rank],
+          1);
+    }
+    __syncthreads();
+
+    const int32_t write_pos = s_write_pos;
+    if (write_pos >= config->max_recv) continue;
+
+    T* dest_data = reinterpret_cast<T*>(
+        config->remote_combine_recv[dest_rank]);
+    const T* src_data =
+        expert_output + pair_idx * K;
+    for (int32_t k = threadIdx.x; k < K;
+         k += blockDim.x) {
+      dest_data[write_pos * K + k] = src_data[k];
+    }
+
+    if (threadIdx.x == 0) {
+      TokenMetadata* dest_meta =
+          reinterpret_cast<TokenMetadata*>(
+              config->remote_combine_meta[
+                  dest_rank]);
+      dest_meta[write_pos].source_rank =
+          config->rank;
+      dest_meta[write_pos].source_token_idx =
+          orig_token_idx;
+      dest_meta[write_pos].expert_id =
+          dispatch_meta[pair_idx].expert_id;
+      dest_meta[write_pos].topk_weight = weight;
+    }
+
+    __threadfence_system();
   }
-  __syncthreads();
-
-  const int32_t write_pos = s_write_pos;
-  if (write_pos >= config->max_recv) return;
-
-  T* dest_data = reinterpret_cast<T*>(
-      config->remote_combine_recv[dest_rank]);
-  const T* src_data = expert_output + pair_idx * K;
-  for (int32_t k = threadIdx.x; k < K; k += blockDim.x) {
-    dest_data[write_pos * K + k] = src_data[k];
-  }
-
-  if (threadIdx.x == 0) {
-    TokenMetadata* dest_meta =
-        reinterpret_cast<TokenMetadata*>(
-            config->remote_combine_meta[dest_rank]);
-    dest_meta[write_pos].source_rank = config->rank;
-    dest_meta[write_pos].source_token_idx = orig_token_idx;
-    dest_meta[write_pos].expert_id =
-        dispatch_meta[pair_idx].expert_id;
-    dest_meta[write_pos].topk_weight = weight;
-  }
-
-  __threadfence_system();
 }
 
 // ====================================================================
@@ -525,13 +540,13 @@ __global__ void stamp_and_zero_dispatch_kernel(
 }
 
 // ====================================================================
-// Fused prepare: stamp/zero + extract routing metadata
+// Fused prepare: barrier + stamp/zero + routing metadata
 // ====================================================================
-// Combines stamp_and_zero_dispatch with expert_topk_ids,
-// expert_topk_weights, and expert_num_tokens computation.
-// Eliminates 8 separate PyTorch kernel launches.
+// Fuses p2p_barrier(RESET_COMBINE) + stamp_and_zero_dispatch
+// + routing extraction into one kernel. Block 0 does the
+// cross-GPU barrier; other blocks spin on the counter.
+// Grid = kPersistentGrid, block = kBlockSize.
 // expert_num_tokens must be pre-zeroed before launch.
-// Grid = mc, block = kBlockSize.
 template <typename T>
 __global__ void prepare_dispatch_recv_kernel(
     T* __restrict__ dispatch_recv,
@@ -542,47 +557,94 @@ __global__ void prepare_dispatch_recv_kernel(
     int32_t mc,
     int32_t K,
     int32_t num_experts) {
-  const int32_t idx = blockIdx.x;
-  if (idx >= mc) return;
+  // Phase 1: Inline barrier (RESET_COMBINE).
+  // All blocks read counter before block 0 modifies it.
+  // Safe: kPersistentGrid blocks all start on separate
+  // SMs within nanoseconds; barrier takes microseconds.
+  FlagType expected =
+      config->self_signals->counter + 1;
 
+  if (blockIdx.x == 0) {
+    const int32_t rank = config->rank;
+    const int32_t ws = config->world_size;
+    const int32_t tid = threadIdx.x;
+
+    // Reset combine offset (thread 0).
+    if (tid == 0) {
+      if (config->remote_combine_offsets[rank])
+        *config->remote_combine_offsets[rank] = 0;
+    }
+
+    __threadfence_system();
+
+    if (tid < ws) {
+      dc_st_flag_release(
+          &config->peer_signals[tid]->flags[rank],
+          expected);
+      while (dc_ld_flag_acquire(
+          &config->self_signals->flags[tid])
+              != expected)
+        ;
+    }
+
+    __syncthreads();
+
+    if (tid == 0) {
+      dc_st_flag_release(
+          &config->self_signals->counter,
+          expected);
+    }
+  } else {
+    // Wait for block 0 to complete barrier.
+    if (threadIdx.x == 0) {
+      while (dc_ld_flag_acquire(
+          &config->self_signals->counter)
+              != expected)
+        ;
+    }
+    __syncthreads();
+  }
+
+  // Phase 2: Stamp/zero + routing (persistent loop).
   const int32_t rank = config->rank;
   int32_t actual =
       *config->remote_dispatch_offsets[rank];
   if (actual > config->max_recv)
     actual = config->max_recv;
 
-  if (idx < actual) {
-    // Real entry: extract routing metadata.
-    if (threadIdx.x == 0) {
-      const TokenMetadata* meta =
-          reinterpret_cast<const TokenMetadata*>(
-              config->remote_dispatch_meta[rank]);
-      int32_t eid = meta[idx].expert_id;
-      expert_topk_ids[idx] =
-          static_cast<int64_t>(eid);
-      expert_topk_weights[idx] = 1.0f;
-      if (eid >= 0 && eid < num_experts) {
-        atomicAdd(&expert_num_tokens[eid], 1);
+  for (int32_t idx = blockIdx.x; idx < mc;
+       idx += gridDim.x) {
+    if (idx < actual) {
+      if (threadIdx.x == 0) {
+        const TokenMetadata* meta =
+            reinterpret_cast<const TokenMetadata*>(
+                config->remote_dispatch_meta[rank]);
+        int32_t eid = meta[idx].expert_id;
+        expert_topk_ids[idx] =
+            static_cast<int64_t>(eid);
+        expert_topk_weights[idx] = 1.0f;
+        if (eid >= 0 && eid < num_experts) {
+          atomicAdd(&expert_num_tokens[eid], 1);
+        }
       }
-    }
-  } else {
-    // Stale entry: zero data + stamp sentinel.
-    T* dest = dispatch_recv + idx * K;
-    for (int32_t k = threadIdx.x; k < K;
-         k += blockDim.x) {
-      dest[k] = T(0);
-    }
-    if (threadIdx.x == 0) {
-      TokenMetadata* meta =
-          reinterpret_cast<TokenMetadata*>(
-              config->remote_dispatch_meta[rank]);
-      meta[idx].source_rank = 0;
-      meta[idx].source_token_idx = 0;
-      meta[idx].expert_id = num_experts;
-      meta[idx].topk_weight = 0.0f;
-      expert_topk_ids[idx] =
-          static_cast<int64_t>(num_experts);
-      expert_topk_weights[idx] = 0.0f;
+    } else {
+      T* dest = dispatch_recv + idx * K;
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        dest[k] = T(0);
+      }
+      if (threadIdx.x == 0) {
+        TokenMetadata* meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_dispatch_meta[rank]);
+        meta[idx].source_rank = 0;
+        meta[idx].source_token_idx = 0;
+        meta[idx].expert_id = num_experts;
+        meta[idx].topk_weight = 0.0f;
+        expert_topk_ids[idx] =
+            static_cast<int64_t>(num_experts);
+        expert_topk_weights[idx] = 0.0f;
+      }
     }
   }
 }
@@ -630,28 +692,71 @@ __global__ void scatter_add_v2_kernel(
 }
 
 // ====================================================================
-// Scatter-add direct: write to output dtype (no float32)
+// Scatter-add direct: fused barrier + persistent scatter
 // ====================================================================
-// Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+) to
-// scatter-add directly into the output tensor, eliminating
-// the float32 accumulator + bf16 cast. Output must be
-// pre-zeroed (via cudaMemsetAsync in the host wrapper).
-// Grid = mc, block = kBlockSize.
+// Fuses p2p_barrier(RESET_DISPATCH) + scatter_add into one
+// kernel. Block 0 does cross-GPU barrier; other blocks spin
+// on counter. All blocks then loop over combine entries
+// using native bf16/fp16 atomicAdd (SM_80+/SM_70+).
+// Output must be pre-zeroed via cudaMemsetAsync.
+// Grid = kPersistentGrid, block = kBlockSize.
 template <typename T>
 __global__ void scatter_add_direct_kernel(
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t N_recv,
     int32_t K) {
-  const int32_t idx = blockIdx.x;
-  if (idx >= N_recv) return;
+  // Phase 1: Inline barrier (RESET_DISPATCH).
+  FlagType expected =
+      config->self_signals->counter + 1;
 
+  if (blockIdx.x == 0) {
+    const int32_t rank = config->rank;
+    const int32_t ws = config->world_size;
+    const int32_t tid = threadIdx.x;
+
+    // Reset dispatch offset (thread 0).
+    if (tid == 0) {
+      if (config->remote_dispatch_offsets[rank])
+        *config->remote_dispatch_offsets[rank] = 0;
+    }
+
+    __threadfence_system();
+
+    if (tid < ws) {
+      dc_st_flag_release(
+          &config->peer_signals[tid]->flags[rank],
+          expected);
+      while (dc_ld_flag_acquire(
+          &config->self_signals->flags[tid])
+              != expected)
+        ;
+    }
+
+    __syncthreads();
+
+    if (tid == 0) {
+      dc_st_flag_release(
+          &config->self_signals->counter,
+          expected);
+    }
+  } else {
+    if (threadIdx.x == 0) {
+      while (dc_ld_flag_acquire(
+          &config->self_signals->counter)
+              != expected)
+        ;
+    }
+    __syncthreads();
+  }
+
+  // Phase 2: Scatter-add (persistent loop).
   const int32_t rank = config->rank;
   int32_t actual =
       *config->remote_combine_offsets[rank];
   if (actual > config->max_recv)
     actual = config->max_recv;
-  if (idx >= actual) return;
+  if (actual > N_recv) actual = N_recv;
 
   const TokenMetadata* meta =
       reinterpret_cast<const TokenMetadata*>(
@@ -659,18 +764,21 @@ __global__ void scatter_add_direct_kernel(
   const T* recv = reinterpret_cast<const T*>(
       config->remote_combine_recv[rank]);
 
-  const int32_t token_idx =
-      meta[idx].source_token_idx;
-  const float weight = meta[idx].topk_weight;
-  if (weight == 0.0f) return;
+  for (int32_t idx = blockIdx.x; idx < actual;
+       idx += gridDim.x) {
+    const int32_t token_idx =
+        meta[idx].source_token_idx;
+    const float weight = meta[idx].topk_weight;
+    if (weight == 0.0f) continue;
 
-  for (int32_t k = threadIdx.x; k < K;
-       k += blockDim.x) {
-    float val = static_cast<float>(
-        recv[idx * K + k]);
-    atomicAdd(
-        output + token_idx * K + k,
-        static_cast<T>(val * weight));
+    for (int32_t k = threadIdx.x; k < K;
+         k += blockDim.x) {
+      float val = static_cast<float>(
+          recv[idx * K + k]);
+      atomicAdd(
+          output + token_idx * K + k,
+          static_cast<T>(val * weight));
+    }
   }
 }
 
