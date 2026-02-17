@@ -62,6 +62,12 @@ class DispatchCombinePrepareAndFinalize(
         self.rank_expert_offset = rank_expert_offset
         self.experts_per_rank = num_experts // world_size
         self.max_recv = p2p_manager.max_recv
+        # Tight bound on tokens needing computation.
+        # Total expert assignments = max_num_tokens * topk;
+        # copy kernels pack entries contiguously so
+        # slicing to [:max_compute] is safe.
+        self.max_compute = (
+            max_num_tokens * experts_per_token)
 
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
@@ -142,11 +148,15 @@ class DispatchCombinePrepareAndFinalize(
         expert_map: Optional[torch.Tensor],
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
-        max_recv = self.max_recv
+        mc = self.max_compute
 
-        # Use pre-allocated tensors (fixed size = max_recv).
-        expert_x = mgr.dispatch_recv_tensor
-        dispatch_meta = mgr.dispatch_meta_tensor
+        # Slice to max_compute (= max_num_tokens * topk).
+        # Copy kernels pack real entries at 0..actual_count-1
+        # and actual_count <= max_compute always holds.
+        # This reduces num_tokens for fused_moe_kernel grid,
+        # act_and_mul grid, and intermediate buffer sizes.
+        expert_x = mgr.dispatch_recv_tensor[:mc]
+        dispatch_meta = mgr.dispatch_meta_tensor[:mc]
 
         # Extract expert IDs from metadata column 2.
         # Padding entries have expert_id = num_experts
@@ -154,14 +164,14 @@ class DispatchCombinePrepareAndFinalize(
         # moe_align_block_size skips automatically.
         expert_topk_ids = dispatch_meta[:, 2].clone()
 
-        # Shape as (max_recv, 1) for topk=1.
+        # Shape as (max_compute, 1) for topk=1.
         expert_topk_ids = expert_topk_ids.unsqueeze(1).to(
             torch.int64)
 
         # Weights are all 1.0 for expert computation;
         # actual weights are applied in combine phase.
         expert_topk_weights = torch.ones(
-            (max_recv, 1), dtype=torch.float32,
+            (mc, 1), dtype=torch.float32,
             device=expert_x.device)
 
         # Post-dispatch quantization.
@@ -245,7 +255,7 @@ class DispatchCombinePrepareAndFinalize(
         do_async: bool,
     ) -> Optional[Callable]:
         K = output.shape[-1]
-        max_recv = self.max_recv
+        mc = self.max_compute
         mgr = self.p2p_manager
 
         # Step 1: Apply weights + reduce on dispatched tokens.
@@ -270,16 +280,16 @@ class DispatchCombinePrepareAndFinalize(
         # Step 3: Launch combine P2P kernel.
         # The kernel reads actual dispatch_recv count from
         # config and skips entries beyond it.
-        # dispatch_meta is the pre-allocated tensor already
-        # populated by gpu_copy_dispatch_meta in prepare.
+        # Grid = max_compute (not max_recv) since
+        # actual_count <= max_compute always holds.
         meta_bytes = (
-            mgr.dispatch_meta_tensor.contiguous().view(
-                torch.uint8))
+            mgr.dispatch_meta_tensor[:mc]
+            .contiguous().view(torch.uint8))
         torch.ops._C_dispatch_combine.combine_p2p(
             fused_expert_output,
             meta_bytes,
             mgr.config_tensor,
-            max_recv, K,
+            mc, K,
         )
 
         # Step 4: P2P barrier for combine completion.
@@ -296,13 +306,13 @@ class DispatchCombinePrepareAndFinalize(
             device=output.device)
 
         combine_meta_bytes = (
-            mgr.combine_meta_tensor.contiguous().view(
-                torch.uint8))
+            mgr.combine_meta_tensor[:mc]
+            .contiguous().view(torch.uint8))
         torch.ops._C_dispatch_combine.scatter_add_weighted(
             accum,
-            mgr.combine_recv_tensor,
+            mgr.combine_recv_tensor[:mc],
             combine_meta_bytes,
-            max_recv, K,
+            mc, K,
         )
         output.copy_(accum.to(output.dtype))
 
