@@ -115,6 +115,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = FlashInferAllToAllManager(
                     self.cpu_group)
                 logger.info("Using Flashinfer all2allv manager.")
+            elif all2all_backend == "dispatch_combine":
+                from .all2all import DispatchCombineAll2AllManager
+                self.all2all_manager = DispatchCombineAll2AllManager(
+                    self.cpu_group)
+                logger.info("Using DispatchCombine all2all manager.")
             else:
                 raise ValueError(f"Unknown all2all backend: {all2all_backend}")
 

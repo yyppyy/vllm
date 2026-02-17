@@ -1,5 +1,55 @@
 #include "cache.h"
 #include "cuda_utils.h"
+// Forward declarations for dispatch_combine (defined in dispatch_combine.cu).
+// Cannot include dispatch_combine.cuh here as it contains CUDA device code.
+namespace vllm {
+namespace dispatch_combine {
+void dispatch_p2p(torch::Tensor input, torch::Tensor topk_ids,
+                  torch::Tensor topk_weights, torch::Tensor config_tensor,
+                  int64_t M, int64_t K, int64_t topk);
+void combine_p2p(torch::Tensor expert_output, torch::Tensor dispatch_meta,
+                 torch::Tensor config_tensor, int64_t max_recv, int64_t K);
+void scatter_add_weighted(torch::Tensor output, torch::Tensor combine_recv,
+                          torch::Tensor combine_meta, int64_t N_recv,
+                          int64_t K);
+void reset_offsets(torch::Tensor config_tensor);
+void reset_combine_offset(torch::Tensor config_tensor);
+void copy_dispatch_recv(torch::Tensor output, torch::Tensor config_tensor,
+                        int64_t max_recv, int64_t K);
+void copy_dispatch_meta(torch::Tensor output, torch::Tensor config_tensor,
+                        int64_t max_recv);
+void copy_combine_recv(torch::Tensor output, torch::Tensor config_tensor,
+                       int64_t max_recv, int64_t K);
+void copy_combine_meta(torch::Tensor output, torch::Tensor config_tensor,
+                       int64_t max_recv);
+void p2p_barrier(torch::Tensor config_tensor);
+void p2p_barrier_reset_offsets(torch::Tensor config_tensor);
+void p2p_barrier_reset_combine_offset(torch::Tensor config_tensor);
+void p2p_barrier_reset_dispatch(torch::Tensor config_tensor);
+void stamp_and_zero_dispatch(torch::Tensor dispatch_recv,
+                             torch::Tensor config_tensor,
+                             int64_t mc, int64_t K);
+void scatter_add_v2(torch::Tensor output,
+                    torch::Tensor config_tensor,
+                    int64_t mc, int64_t K,
+                    int64_t dtype_code);
+torch::Tensor wrap_cuda_ptr(torch::Tensor dummy,
+                            int64_t ptr, int64_t dim0,
+                            int64_t dim1,
+                            int64_t dtype_code);
+void prepare_dispatch_recv(torch::Tensor dispatch_recv,
+                           torch::Tensor expert_topk_ids,
+                           torch::Tensor expert_topk_weights,
+                           torch::Tensor expert_num_tokens,
+                           torch::Tensor config_tensor,
+                           int64_t mc, int64_t K,
+                           int64_t num_experts);
+void scatter_add_direct(torch::Tensor output,
+                        torch::Tensor config_tensor,
+                        int64_t mc, int64_t K,
+                        int64_t M);
+}  // namespace dispatch_combine
+}  // namespace vllm
 #include "ops.h"
 #include "core/registration.h"
 
@@ -778,6 +828,115 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   // Max input size in bytes
   custom_ar.def("qr_max_size", &qr_max_size);
 #endif
+}
+
+TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
+                     dc) {
+  // Dispatch-Combine P2P kernels for MoE all2all
+  dc.def(
+      "dispatch_p2p(Tensor input, Tensor topk_ids, Tensor topk_weights, "
+      "Tensor config_tensor, int M, int K, int topk) -> ()");
+  dc.impl("dispatch_p2p", torch::kCUDA,
+          &vllm::dispatch_combine::dispatch_p2p);
+  dc.def(
+      "combine_p2p(Tensor expert_output, Tensor dispatch_meta, "
+      "Tensor config_tensor, int max_recv, int K) -> ()");
+  dc.impl("combine_p2p", torch::kCUDA,
+          &vllm::dispatch_combine::combine_p2p);
+  dc.def(
+      "scatter_add_weighted(Tensor! output, Tensor combine_recv, "
+      "Tensor combine_meta, int N_recv, int K) -> ()");
+  dc.impl("scatter_add_weighted", torch::kCUDA,
+          &vllm::dispatch_combine::scatter_add_weighted);
+
+  // GPU-side buffer operations (CUDA-graph compatible)
+  dc.def("reset_offsets(Tensor config_tensor) -> ()");
+  dc.impl("reset_offsets", torch::kCUDA,
+          &vllm::dispatch_combine::reset_offsets);
+  dc.def("reset_combine_offset(Tensor config_tensor) -> ()");
+  dc.impl("reset_combine_offset", torch::kCUDA,
+          &vllm::dispatch_combine::reset_combine_offset);
+  dc.def(
+      "copy_dispatch_recv(Tensor! output, Tensor config_tensor, "
+      "int max_recv, int K) -> ()");
+  dc.impl("copy_dispatch_recv", torch::kCUDA,
+          &vllm::dispatch_combine::copy_dispatch_recv);
+  dc.def(
+      "copy_dispatch_meta(Tensor! output, Tensor config_tensor, "
+      "int max_recv) -> ()");
+  dc.impl("copy_dispatch_meta", torch::kCUDA,
+          &vllm::dispatch_combine::copy_dispatch_meta);
+  dc.def(
+      "copy_combine_recv(Tensor! output, Tensor config_tensor, "
+      "int max_recv, int K) -> ()");
+  dc.impl("copy_combine_recv", torch::kCUDA,
+          &vllm::dispatch_combine::copy_combine_recv);
+  dc.def(
+      "copy_combine_meta(Tensor! output, Tensor config_tensor, "
+      "int max_recv) -> ()");
+  dc.impl("copy_combine_meta", torch::kCUDA,
+          &vllm::dispatch_combine::copy_combine_meta);
+
+  // P2P flag-based barriers (replace NCCL AllReduce)
+  dc.def(
+      "p2p_barrier(Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier", torch::kCUDA,
+          &vllm::dispatch_combine::p2p_barrier);
+  dc.def(
+      "p2p_barrier_reset_offsets("
+      "Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier_reset_offsets", torch::kCUDA,
+          &vllm::dispatch_combine::p2p_barrier_reset_offsets);
+  dc.def(
+      "p2p_barrier_reset_combine_offset("
+      "Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier_reset_combine_offset", torch::kCUDA,
+          &vllm::dispatch_combine::
+              p2p_barrier_reset_combine_offset);
+  dc.def(
+      "p2p_barrier_reset_dispatch("
+      "Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier_reset_dispatch", torch::kCUDA,
+          &vllm::dispatch_combine::
+              p2p_barrier_reset_dispatch);
+
+  // Fused kernels (eliminate copy overhead)
+  dc.def(
+      "stamp_and_zero_dispatch(Tensor! dispatch_recv, "
+      "Tensor config_tensor, int mc, int K) -> ()");
+  dc.impl("stamp_and_zero_dispatch", torch::kCUDA,
+          &vllm::dispatch_combine::
+              stamp_and_zero_dispatch);
+  dc.def(
+      "scatter_add_v2(Tensor! output, "
+      "Tensor config_tensor, int mc, int K, "
+      "int dtype_code) -> ()");
+  dc.impl("scatter_add_v2", torch::kCUDA,
+          &vllm::dispatch_combine::scatter_add_v2);
+  dc.def(
+      "wrap_cuda_ptr(Tensor dummy, int ptr, int dim0, "
+      "int dim1, int dtype_code) -> Tensor");
+  dc.impl("wrap_cuda_ptr", torch::kCUDA,
+          &vllm::dispatch_combine::wrap_cuda_ptr);
+  dc.def(
+      "prepare_dispatch_recv("
+      "Tensor! dispatch_recv, "
+      "Tensor! expert_topk_ids, "
+      "Tensor! expert_topk_weights, "
+      "Tensor! expert_num_tokens, "
+      "Tensor config_tensor, "
+      "int mc, int K, int num_experts) -> ()");
+  dc.impl("prepare_dispatch_recv", torch::kCUDA,
+          &vllm::dispatch_combine::
+              prepare_dispatch_recv);
+  dc.def(
+      "scatter_add_direct("
+      "Tensor! output, "
+      "Tensor config_tensor, "
+      "int mc, int K, int M) -> ()");
+  dc.impl("scatter_add_direct", torch::kCUDA,
+          &vllm::dispatch_combine::
+              scatter_add_direct);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

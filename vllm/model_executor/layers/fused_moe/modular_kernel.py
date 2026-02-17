@@ -113,6 +113,11 @@ class ExpertTokensMetadata:
   """
     expert_num_tokens: torch.Tensor
     expert_num_tokens_cpu: Optional[torch.Tensor]
+    # Hint for Triton config selection. When set, used
+    # instead of M for try_get_optimal_moe_config.
+    # Needed when the input tensor is a fixed-size buffer
+    # larger than the actual token count (e.g. dispatch_combine).
+    num_tokens_for_config: Optional[int] = None
 
     @staticmethod
     def make_from_list(expert_num_tokens_list: list[int],
@@ -822,7 +827,10 @@ class FusedMoEModularKernel(torch.nn.Module):
 
             return ExpertTokensMetadata(
                 expert_num_tokens=c_expert_num_tokens,
-                expert_num_tokens_cpu=c_expert_num_tokens_cpu)
+                expert_num_tokens_cpu=c_expert_num_tokens_cpu,
+                num_tokens_for_config=(
+                    full_expert_tokens_meta
+                    .num_tokens_for_config))
 
         for chunk_idx in range(num_chunks):
             c_a1q, c_a1q_scale, c_a2_scale, c_topk_ids, c_topk_weights = (

@@ -202,6 +202,7 @@ class CudaPlatformBase(Platform):
                 "deepep_low_latency, pplx, or allgather_reducescatter.")
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+
     @classmethod
     def get_current_memory_usage(cls,
                                  device: Optional[torch.types.Device] = None

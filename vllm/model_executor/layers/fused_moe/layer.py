@@ -58,6 +58,8 @@ if current_platform.is_cuda_alike():
         from .deepep_ht_prepare_finalize import DeepEPHTPrepareAndFinalize
         from .deepep_ll_prepare_finalize import (DEEPEP_QUANT_BLOCK_SHAPE,
                                                  DeepEPLLPrepareAndFinalize)
+    from .dispatch_combine_prepare_finalize import (
+        DispatchCombinePrepareAndFinalize)
 else:
     fused_experts = None  # type: ignore
     FusedMoEPermuteExpertsUnpermute = None  # type: ignore
@@ -210,6 +212,26 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
+            )
+
+        elif moe.moe_parallel_config.use_dispatch_combine_kernels:
+            all_to_all_args = dict(
+                max_num_tokens=moe.max_num_tokens,
+                hidden_dim=moe.hidden_dim,
+                topk=moe.experts_per_token,
+                dtype=moe.in_dtype,
+            )
+            p2p_manager = all2all_manager.get_handle(all_to_all_args)
+            prepare_finalize = DispatchCombinePrepareAndFinalize(
+                p2p_manager=p2p_manager,
+                max_num_tokens=moe.max_num_tokens,
+                num_experts=moe.num_experts,
+                num_local_experts=moe.num_local_experts,
+                experts_per_token=moe.experts_per_token,
+                rank=all2all_manager.rank,
+                world_size=all2all_manager.world_size,
+                rank_expert_offset=all2all_manager.rank
+                * moe.num_local_experts,
             )
 
         return prepare_finalize
@@ -1246,6 +1268,10 @@ class FusedMoE(CustomOp):
         return self.moe_parallel_config.use_deepep_ll_kernels
 
     @property
+    def use_dispatch_combine_kernels(self):
+        return self.moe_parallel_config.use_dispatch_combine_kernels
+
+    @property
     def use_flashinfer_cutlass_kernels(self):
         return (self.moe_quant_config is not None
                 and self.moe_quant_config.quant_dtype == "nvfp4"
@@ -1826,15 +1852,18 @@ class FusedMoE(CustomOp):
         early.
         """
         return (self.use_pplx_kernels or self.use_deepep_ht_kernels
-                or self.use_deepep_ll_kernels)
+                or self.use_deepep_ll_kernels
+                or self.use_dispatch_combine_kernels)
 
     def maybe_all_reduce_tensor_model_parallel(
             self, final_hidden_states: torch.Tensor):
         """
-        The pplx combine kernel reduces across GPU ranks by default.
+        The pplx/deepep/dispatch_combine combine kernels reduce across
+        GPU ranks by default.
         """
         if (self.use_pplx_kernels or self.use_deepep_ht_kernels
-                or self.use_deepep_ll_kernels):
+                or self.use_deepep_ll_kernels
+                or self.use_dispatch_combine_kernels):
             return final_hidden_states
         else:
             return tensor_model_parallel_all_reduce(final_hidden_states)
@@ -2035,6 +2064,7 @@ class FusedMoE(CustomOp):
         do_naive_dispatch_combine: bool = (
             self.dp_size > 1
             and not self.moe_parallel_config.use_deepep_ht_kernels
+            and not self.moe_parallel_config.use_dispatch_combine_kernels
             and not self.moe_config.use_flashinfer_cutlass_kernels)
 
         # If there are shared experts but we are not using a modular kernel, the
