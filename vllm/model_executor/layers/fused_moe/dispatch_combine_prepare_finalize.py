@@ -62,12 +62,6 @@ class DispatchCombinePrepareAndFinalize(
         self.rank_expert_offset = rank_expert_offset
         self.experts_per_rank = num_experts // world_size
         self.max_recv = p2p_manager.max_recv
-        # Tight bound on tokens needing computation.
-        # Total expert assignments = max_num_tokens * topk;
-        # copy kernels pack entries contiguously so
-        # slicing to [:max_compute] is safe.
-        self.max_compute = (
-            max_num_tokens * experts_per_token)
 
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
@@ -101,6 +95,13 @@ class DispatchCombinePrepareAndFinalize(
     ) -> mk.ReceiverType:
         M, K = a1.shape
         topk = topk_ids.size(1)
+
+        # Per-batch tight bound: M tokens * topk experts.
+        # Stored on self for _finalize to read. During
+        # CUDA graph capture this Python assignment runs
+        # once; during replay only recorded CUDA ops run.
+        self._mc = min(
+            M * self.experts_per_token, self.max_recv)
 
         if apply_router_weight_on_input:
             assert topk == 1, (
@@ -148,11 +149,11 @@ class DispatchCombinePrepareAndFinalize(
         expert_map: Optional[torch.Tensor],
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
-        mc = self.max_compute
+        mc = self._mc
 
-        # Slice to max_compute (= max_num_tokens * topk).
+        # Slice to mc (= M * topk for this batch).
         # Copy kernels pack real entries at 0..actual_count-1
-        # and actual_count <= max_compute always holds.
+        # and actual_count <= mc always holds.
         # This reduces num_tokens for fused_moe_kernel grid,
         # act_and_mul grid, and intermediate buffer sizes.
         expert_x = mgr.dispatch_recv_tensor[:mc]
@@ -164,7 +165,7 @@ class DispatchCombinePrepareAndFinalize(
         # moe_align_block_size skips automatically.
         expert_topk_ids = dispatch_meta[:, 2].clone()
 
-        # Shape as (max_compute, 1) for topk=1.
+        # Shape as (mc, 1) for topk=1.
         expert_topk_ids = expert_topk_ids.unsqueeze(1).to(
             torch.int64)
 
@@ -216,13 +217,13 @@ class DispatchCombinePrepareAndFinalize(
 
         # expert_num_tokens_cpu=None for CUDA graph compat
         # (no device-to-host transfer during graph capture).
-        # num_tokens_for_config = max_num_tokens so the
-        # Triton autotuner picks decode-friendly tile sizes
-        # instead of using max_recv (which is much larger).
+        # num_tokens_for_config = actual batch size so the
+        # Triton autotuner picks the same decode-friendly
+        # tile sizes as allgather_reducescatter.
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=local_expert_num_tokens,
             expert_num_tokens_cpu=None,
-            num_tokens_for_config=self.max_num_tokens)
+            num_tokens_for_config=a1_orig.shape[0])
 
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,
@@ -255,7 +256,7 @@ class DispatchCombinePrepareAndFinalize(
         do_async: bool,
     ) -> Optional[Callable]:
         K = output.shape[-1]
-        mc = self.max_compute
+        mc = self._mc
         mgr = self.p2p_manager
 
         # Step 1: Apply weights + reduce on dispatched tokens.
@@ -280,8 +281,8 @@ class DispatchCombinePrepareAndFinalize(
         # Step 3: Launch combine P2P kernel.
         # The kernel reads actual dispatch_recv count from
         # config and skips entries beyond it.
-        # Grid = max_compute (not max_recv) since
-        # actual_count <= max_compute always holds.
+        # Grid = mc (not max_recv) since
+        # actual_count <= mc always holds.
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc]
             .contiguous().view(torch.uint8))
