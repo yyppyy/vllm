@@ -485,7 +485,6 @@ __global__ void scatter_add_weighted_kernel(
 // ====================================================================
 // After post-dispatch barrier, stamps sentinel metadata and
 // zeros stale data for entries beyond actual_count.
-// Also resets BOTH dispatch and combine offset counters.
 // Grid = mc (tight upper bound), block = kBlockSize.
 template <typename T>
 __global__ void stamp_and_zero_dispatch_kernel(
@@ -503,9 +502,6 @@ __global__ void stamp_and_zero_dispatch_kernel(
     actual = config->max_recv;
 
   // Real entries: skip (written by dispatch_p2p).
-  // Offset reset is done by a separate reset_offsets
-  // kernel AFTER this kernel (same stream ordering
-  // ensures stamp reads actual before reset clears).
   if (idx < actual) return;
 
   // Stale entries: zero data for quantization safety.
@@ -525,6 +521,69 @@ __global__ void stamp_and_zero_dispatch_kernel(
     meta[idx].expert_id =
         config->experts_per_rank * config->world_size;
     meta[idx].topk_weight = 0.0f;
+  }
+}
+
+// ====================================================================
+// Fused prepare: stamp/zero + extract routing metadata
+// ====================================================================
+// Combines stamp_and_zero_dispatch with expert_topk_ids,
+// expert_topk_weights, and expert_num_tokens computation.
+// Eliminates 8 separate PyTorch kernel launches.
+// expert_num_tokens must be pre-zeroed before launch.
+// Grid = mc, block = kBlockSize.
+template <typename T>
+__global__ void prepare_dispatch_recv_kernel(
+    T* __restrict__ dispatch_recv,
+    int64_t* __restrict__ expert_topk_ids,
+    float* __restrict__ expert_topk_weights,
+    int32_t* __restrict__ expert_num_tokens,
+    const DispatchCombineConfig* __restrict__ config,
+    int32_t mc,
+    int32_t K,
+    int32_t num_experts) {
+  const int32_t idx = blockIdx.x;
+  if (idx >= mc) return;
+
+  const int32_t rank = config->rank;
+  int32_t actual =
+      *config->remote_dispatch_offsets[rank];
+  if (actual > config->max_recv)
+    actual = config->max_recv;
+
+  if (idx < actual) {
+    // Real entry: extract routing metadata.
+    if (threadIdx.x == 0) {
+      const TokenMetadata* meta =
+          reinterpret_cast<const TokenMetadata*>(
+              config->remote_dispatch_meta[rank]);
+      int32_t eid = meta[idx].expert_id;
+      expert_topk_ids[idx] =
+          static_cast<int64_t>(eid);
+      expert_topk_weights[idx] = 1.0f;
+      if (eid >= 0 && eid < num_experts) {
+        atomicAdd(&expert_num_tokens[eid], 1);
+      }
+    }
+  } else {
+    // Stale entry: zero data + stamp sentinel.
+    T* dest = dispatch_recv + idx * K;
+    for (int32_t k = threadIdx.x; k < K;
+         k += blockDim.x) {
+      dest[k] = T(0);
+    }
+    if (threadIdx.x == 0) {
+      TokenMetadata* meta =
+          reinterpret_cast<TokenMetadata*>(
+              config->remote_dispatch_meta[rank]);
+      meta[idx].source_rank = 0;
+      meta[idx].source_token_idx = 0;
+      meta[idx].expert_id = num_experts;
+      meta[idx].topk_weight = 0.0f;
+      expert_topk_ids[idx] =
+          static_cast<int64_t>(num_experts);
+      expert_topk_weights[idx] = 0.0f;
+    }
   }
 }
 
@@ -567,6 +626,51 @@ __global__ void scatter_add_v2_kernel(
         recv[idx * K + k]);
     atomicAdd(
         output + token_idx * K + k, val * weight);
+  }
+}
+
+// ====================================================================
+// Scatter-add direct: write to output dtype (no float32)
+// ====================================================================
+// Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+) to
+// scatter-add directly into the output tensor, eliminating
+// the float32 accumulator + bf16 cast. Output must be
+// pre-zeroed (via cudaMemsetAsync in the host wrapper).
+// Grid = mc, block = kBlockSize.
+template <typename T>
+__global__ void scatter_add_direct_kernel(
+    T* __restrict__ output,
+    const DispatchCombineConfig* __restrict__ config,
+    int32_t N_recv,
+    int32_t K) {
+  const int32_t idx = blockIdx.x;
+  if (idx >= N_recv) return;
+
+  const int32_t rank = config->rank;
+  int32_t actual =
+      *config->remote_combine_offsets[rank];
+  if (actual > config->max_recv)
+    actual = config->max_recv;
+  if (idx >= actual) return;
+
+  const TokenMetadata* meta =
+      reinterpret_cast<const TokenMetadata*>(
+          config->remote_combine_meta[rank]);
+  const T* recv = reinterpret_cast<const T*>(
+      config->remote_combine_recv[rank]);
+
+  const int32_t token_idx =
+      meta[idx].source_token_idx;
+  const float weight = meta[idx].topk_weight;
+  if (weight == 0.0f) return;
+
+  for (int32_t k = threadIdx.x; k < K;
+       k += blockDim.x) {
+    float val = static_cast<float>(
+        recv[idx * K + k]);
+    atomicAdd(
+        output + token_idx * K + k,
+        static_cast<T>(val * weight));
   }
 }
 
@@ -636,6 +740,19 @@ torch::Tensor wrap_cuda_ptr(
     torch::Tensor dummy,
     int64_t ptr, int64_t dim0, int64_t dim1,
     int64_t dtype_code);
+void prepare_dispatch_recv(
+    torch::Tensor dispatch_recv,
+    torch::Tensor expert_topk_ids,
+    torch::Tensor expert_topk_weights,
+    torch::Tensor expert_num_tokens,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K,
+    int64_t num_experts);
+void scatter_add_direct(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K,
+    int64_t M);
 
 }  // namespace dispatch_combine
 }  // namespace vllm

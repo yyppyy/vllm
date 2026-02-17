@@ -154,6 +154,21 @@ class DispatchCombineP2PManager:
                 ct, self._raw_combine_meta.value,
                 self.max_recv, 4, 2))  # int32
 
+        # Persistent buffers for fused prepare kernel.
+        # Pre-allocated once; reused every MoE layer.
+        # expert_topk_ids: (max_recv,) int64
+        # expert_topk_weights: (max_recv,) float32
+        # expert_num_tokens: set later via
+        # init_prepare_buffers() when num_experts known.
+        self.expert_topk_ids_buf = torch.zeros(
+            self.max_recv, dtype=torch.int64,
+            device=f'cuda:{self._device}')
+        self.expert_topk_weights_buf = torch.zeros(
+            self.max_recv, dtype=torch.float32,
+            device=f'cuda:{self._device}')
+        self.expert_num_tokens_buf = None
+        self._num_experts = None
+
         # Init barrier: sync all ranks after IPC setup.
         # Ensures cudaMemset zeroed offsets are visible
         # cross-GPU before first dispatch_p2p.
@@ -441,6 +456,18 @@ class DispatchCombineP2PManager:
             mc, self.hidden_dim,
             self._dtype_code)
 
+    def gpu_scatter_add_direct(
+            self, output: torch.Tensor, mc: int):
+        """Scatter-add from IPC combine buffers directly
+        into output using native bf16/fp16 atomicAdd.
+        Zeros output via cudaMemsetAsync before launch.
+        Eliminates float32 accumulator + cast."""
+        M = output.shape[0]
+        torch.ops._C_dispatch_combine\
+            .scatter_add_direct(
+                output, self.config_tensor,
+                mc, self.hidden_dim, M)
+
     def gpu_p2p_barrier_reset_dispatch(self):
         """Reset dispatch offset + P2P barrier."""
         torch.ops._C_dispatch_combine\
@@ -452,6 +479,44 @@ class DispatchCombineP2PManager:
         torch.ops._C_dispatch_combine\
             .p2p_barrier_reset_offsets(
                 self.config_tensor)
+
+    def init_prepare_buffers(self, num_experts: int):
+        """Allocate expert_num_tokens buffer once
+        num_experts is known (set by PrepareAndFinalize
+        constructor via update_experts_per_rank)."""
+        if (self.expert_num_tokens_buf is not None
+                and self._num_experts == num_experts):
+            return
+        self._num_experts = num_experts
+        self.expert_num_tokens_buf = torch.zeros(
+            num_experts, dtype=torch.int32,
+            device=f'cuda:{self._device}')
+
+    def gpu_prepare_dispatch_recv(
+            self, mc: int, num_experts: int):
+        """Fused stamp/zero + routing metadata
+        extraction. Replaces stamp_and_zero_dispatch +
+        8 PyTorch ops in _receiver(). Returns
+        (expert_topk_ids, expert_topk_weights,
+         expert_num_tokens) sliced to mc."""
+        if self.expert_num_tokens_buf is None:
+            self.init_prepare_buffers(num_experts)
+        torch.ops._C_dispatch_combine\
+            .prepare_dispatch_recv(
+                self.dispatch_recv_tensor,
+                self.expert_topk_ids_buf,
+                self.expert_topk_weights_buf,
+                self.expert_num_tokens_buf,
+                self.config_tensor,
+                mc, self.hidden_dim,
+                num_experts)
+        return (
+            self.expert_topk_ids_buf[:mc]
+            .unsqueeze(1),
+            self.expert_topk_weights_buf[:mc]
+            .unsqueeze(1),
+            self.expert_num_tokens_buf,
+        )
 
     def gpu_p2p_barrier_reset_combine_offset(self):
         """Reset combine offset + P2P barrier."""

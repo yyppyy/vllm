@@ -37,6 +37,17 @@ torch::Tensor wrap_cuda_ptr(torch::Tensor dummy,
                             int64_t ptr, int64_t dim0,
                             int64_t dim1,
                             int64_t dtype_code);
+void prepare_dispatch_recv(torch::Tensor dispatch_recv,
+                           torch::Tensor expert_topk_ids,
+                           torch::Tensor expert_topk_weights,
+                           torch::Tensor expert_num_tokens,
+                           torch::Tensor config_tensor,
+                           int64_t mc, int64_t K,
+                           int64_t num_experts);
+void scatter_add_direct(torch::Tensor output,
+                        torch::Tensor config_tensor,
+                        int64_t mc, int64_t K,
+                        int64_t M);
 }  // namespace dispatch_combine
 }  // namespace vllm
 #include "ops.h"
@@ -907,6 +918,25 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "int dim1, int dtype_code) -> Tensor");
   dc.impl("wrap_cuda_ptr", torch::kCUDA,
           &vllm::dispatch_combine::wrap_cuda_ptr);
+  dc.def(
+      "prepare_dispatch_recv("
+      "Tensor! dispatch_recv, "
+      "Tensor! expert_topk_ids, "
+      "Tensor! expert_topk_weights, "
+      "Tensor! expert_num_tokens, "
+      "Tensor config_tensor, "
+      "int mc, int K, int num_experts) -> ()");
+  dc.impl("prepare_dispatch_recv", torch::kCUDA,
+          &vllm::dispatch_combine::
+              prepare_dispatch_recv);
+  dc.def(
+      "scatter_add_direct("
+      "Tensor! output, "
+      "Tensor config_tensor, "
+      "int mc, int K, int M) -> ()");
+  dc.impl("scatter_add_direct", torch::kCUDA,
+          &vllm::dispatch_combine::
+              scatter_add_direct);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

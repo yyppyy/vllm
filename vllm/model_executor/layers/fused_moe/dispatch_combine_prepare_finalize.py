@@ -135,14 +135,21 @@ class DispatchCombinePrepareAndFinalize(
         # will atomicAdd from 0.
         mgr.gpu_p2p_barrier_reset_combine_offset()
 
-        # Step 3: Stamp sentinel meta + zero stale data
-        # for entries beyond actual_count in IPC buffer.
-        # dispatch_offset still has actual count (NOT
-        # reset yet) so stamp reads correct value.
-        mgr.gpu_stamp_and_zero_dispatch(self._mc)
+        # Step 3: Fused stamp/zero + routing extraction.
+        # Replaces stamp_and_zero_dispatch + 8 PyTorch ops
+        # that were in _receiver(). Single kernel computes
+        # expert_topk_ids, expert_topk_weights, and
+        # expert_num_tokens alongside sentinel stamping.
+        (expert_topk_ids,
+         expert_topk_weights,
+         expert_num_tokens) = (
+            mgr.gpu_prepare_dispatch_recv(
+                self._mc, num_experts))
 
         return lambda: self._receiver(
-            a1, K, num_experts, quant_config, expert_map)
+            a1, K, num_experts, quant_config,
+            expert_map, expert_topk_ids,
+            expert_topk_weights, expert_num_tokens)
 
     def _receiver(
         self,
@@ -151,32 +158,15 @@ class DispatchCombinePrepareAndFinalize(
         num_experts: int,
         quant_config: FusedMoEQuantConfig,
         expert_map: Optional[torch.Tensor],
+        expert_topk_ids: torch.Tensor,
+        expert_topk_weights: torch.Tensor,
+        expert_num_tokens: torch.Tensor,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
         mc = self._mc
 
-        # Slice IPC-backed tensors to mc (tight bound).
-        # dispatch_p2p wrote real entries at 0..actual-1;
-        # stamp_and_zero zeroed/sentinel-stamped stale
-        # entries at actual..mc-1.
+        # Slice IPC-backed dispatch recv to mc.
         expert_x = mgr.dispatch_recv_tensor[:mc]
-        dispatch_meta = mgr.dispatch_meta_tensor[:mc]
-
-        # Extract expert IDs from metadata column 2.
-        # Padding entries have expert_id = num_experts
-        # (set by stamp_and_zero_dispatch_kernel), which
-        # moe_align_block_size skips automatically.
-        expert_topk_ids = dispatch_meta[:, 2].clone()
-
-        # Shape as (mc, 1) for topk=1.
-        expert_topk_ids = expert_topk_ids.unsqueeze(1).to(
-            torch.int64)
-
-        # Weights are all 1.0 for expert computation;
-        # actual weights are applied in combine phase.
-        expert_topk_weights = torch.ones(
-            (mc, 1), dtype=torch.float32,
-            device=expert_x.device)
 
         # Post-dispatch quantization.
         expert_x_scale = None
@@ -186,31 +176,22 @@ class DispatchCombinePrepareAndFinalize(
                     moe_kernel_quantize_input(
                         expert_x,
                         quant_config.a1_scale,
-                        quant_dtype=quant_config.quant_dtype,
+                        quant_dtype=(
+                            quant_config.quant_dtype),
                         per_act_token_quant=False,
-                        block_shape=quant_config.block_shape))
+                        block_shape=(
+                            quant_config.block_shape)))
         else:
             expert_x, expert_x_scale = (
                 moe_kernel_quantize_input(
                     expert_x,
                     quant_config.a1_scale,
-                    quant_dtype=quant_config.quant_dtype,
+                    quant_dtype=(
+                        quant_config.quant_dtype),
                     per_act_token_quant=(
                         quant_config.per_act_token_quant),
-                    block_shape=quant_config.block_shape))
-
-        # Compute expert token counts.
-        # Padding entries have expert_id = num_experts;
-        # use masked scatter to exclude them (avoids OOB).
-        expert_num_tokens = torch.zeros(
-            num_experts, dtype=torch.int32,
-            device=expert_x.device)
-        flat_ids = expert_topk_ids.view(-1)
-        valid_mask = (flat_ids < num_experts).to(
-            torch.int32)
-        safe_ids = flat_ids.clamp(0, num_experts - 1)
-        expert_num_tokens.scatter_add_(
-            0, safe_ids.to(torch.int64), valid_mask)
+                    block_shape=(
+                        quant_config.block_shape)))
 
         # Slice to local experts only.
         local_expert_num_tokens = expert_num_tokens[
@@ -218,11 +199,8 @@ class DispatchCombinePrepareAndFinalize(
             self.rank_expert_offset
             + self.num_local_experts]
 
-        # expert_num_tokens_cpu=None for CUDA graph compat
-        # (no device-to-host transfer during graph capture).
-        # num_tokens_for_config = actual batch size so the
-        # Triton autotuner picks the same decode-friendly
-        # tile sizes as allgather_reducescatter.
+        # expert_num_tokens_cpu=None for CUDA graph
+        # compat (no D2H during graph capture).
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=local_expert_num_tokens,
             expert_num_tokens_cpu=None,
@@ -230,7 +208,8 @@ class DispatchCombinePrepareAndFinalize(
 
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,
-                expert_topk_ids, expert_topk_weights)
+                expert_topk_ids,
+                expert_topk_weights)
 
     def prepare(
         self,
@@ -302,13 +281,10 @@ class DispatchCombinePrepareAndFinalize(
         mgr.gpu_p2p_barrier_reset_dispatch()
 
         # Step 4: Scatter-add from IPC combine buffers
-        # directly into output. Reads actual_count from
-        # combine offset. No copy kernels needed.
-        accum = torch.zeros(
-            output.shape, dtype=torch.float32,
-            device=output.device)
-        mgr.gpu_scatter_add_v2(accum, mc)
-        output.copy_(accum.to(output.dtype))
+        # directly into output using native bf16 atomicAdd.
+        # cudaMemsetAsync zeros output before kernel.
+        # Eliminates float32 accumulator + bf16 cast.
+        mgr.gpu_scatter_add_direct(output, mc)
 
         if do_async:
             return lambda: None

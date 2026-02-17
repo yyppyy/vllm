@@ -384,6 +384,108 @@ void scatter_add_v2(
   }
 }
 
+void prepare_dispatch_recv(
+    torch::Tensor dispatch_recv,
+    torch::Tensor expert_topk_ids,
+    torch::Tensor expert_topk_weights,
+    torch::Tensor expert_num_tokens,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K,
+    int64_t num_experts) {
+
+  if (mc == 0) return;
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+
+  // Zero expert_num_tokens before kernel launch
+  // (atomicAdd needs zeroed counters).
+  cudaMemsetAsync(
+      expert_num_tokens.data_ptr(), 0,
+      num_experts * sizeof(int32_t), stream);
+
+  const int32_t mc32 = static_cast<int32_t>(mc);
+  const int32_t K32 = static_cast<int32_t>(K);
+  const int32_t ne32 =
+      static_cast<int32_t>(num_experts);
+  dim3 grid(mc32);
+  dim3 block(kBlockSize);
+
+  AT_DISPATCH_SWITCH(
+      dispatch_recv.scalar_type(),
+      "prepare_dispatch_recv",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          prepare_dispatch_recv_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__nv_bfloat16*>(
+                  dispatch_recv.data_ptr()),
+              expert_topk_ids.data_ptr<int64_t>(),
+              expert_topk_weights.data_ptr<float>(),
+              expert_num_tokens.data_ptr<int32_t>(),
+              config, mc32, K32, ne32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          prepare_dispatch_recv_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__half*>(
+                  dispatch_recv.data_ptr()),
+              expert_topk_ids.data_ptr<int64_t>(),
+              expert_topk_weights.data_ptr<float>(),
+              expert_num_tokens.data_ptr<int32_t>(),
+              config, mc32, K32, ne32);
+        })
+  );
+}
+
+void scatter_add_direct(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K,
+    int64_t M) {
+
+  if (mc == 0 || M == 0) return;
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+
+  // Zero output before scatter-add (atomicAdd).
+  cudaMemsetAsync(
+      output.data_ptr(), 0,
+      M * K * output.element_size(), stream);
+
+  const int32_t mc32 = static_cast<int32_t>(mc);
+  const int32_t K32 = static_cast<int32_t>(K);
+  dim3 grid(mc32);
+  dim3 block(kBlockSize);
+
+  AT_DISPATCH_SWITCH(
+      output.scalar_type(),
+      "scatter_add_direct",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          scatter_add_direct_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__nv_bfloat16*>(
+                  output.data_ptr()),
+              config, mc32, K32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          scatter_add_direct_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__half*>(
+                  output.data_ptr()),
+              config, mc32, K32);
+        })
+  );
+}
+
 torch::Tensor wrap_cuda_ptr(
     torch::Tensor dummy,
     int64_t ptr, int64_t dim0, int64_t dim1,
