@@ -692,71 +692,27 @@ __global__ void scatter_add_v2_kernel(
 }
 
 // ====================================================================
-// Scatter-add direct: fused barrier + persistent scatter
+// Scatter-add direct: reads from IPC combine buffers
 // ====================================================================
-// Fuses p2p_barrier(RESET_DISPATCH) + scatter_add into one
-// kernel. Block 0 does cross-GPU barrier; other blocks spin
-// on counter. All blocks then loop over combine entries
-// using native bf16/fp16 atomicAdd (SM_80+/SM_70+).
+// Reads combine recv/meta via IPC pointers in config.
+// Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+).
 // Output must be pre-zeroed via cudaMemsetAsync.
-// Grid = kPersistentGrid, block = kBlockSize.
+// Grid = mc, block = kBlockSize.
 template <typename T>
 __global__ void scatter_add_direct_kernel(
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t N_recv,
     int32_t K) {
-  // Phase 1: Inline barrier (RESET_DISPATCH).
-  FlagType expected =
-      config->self_signals->counter + 1;
+  const int32_t idx = blockIdx.x;
+  if (idx >= N_recv) return;
 
-  if (blockIdx.x == 0) {
-    const int32_t rank = config->rank;
-    const int32_t ws = config->world_size;
-    const int32_t tid = threadIdx.x;
-
-    // Reset dispatch offset (thread 0).
-    if (tid == 0) {
-      if (config->remote_dispatch_offsets[rank])
-        *config->remote_dispatch_offsets[rank] = 0;
-    }
-
-    __threadfence_system();
-
-    if (tid < ws) {
-      dc_st_flag_release(
-          &config->peer_signals[tid]->flags[rank],
-          expected);
-      while (dc_ld_flag_acquire(
-          &config->self_signals->flags[tid])
-              != expected)
-        ;
-    }
-
-    __syncthreads();
-
-    if (tid == 0) {
-      dc_st_flag_release(
-          &config->self_signals->counter,
-          expected);
-    }
-  } else {
-    if (threadIdx.x == 0) {
-      while (dc_ld_flag_acquire(
-          &config->self_signals->counter)
-              != expected)
-        ;
-    }
-    __syncthreads();
-  }
-
-  // Phase 2: Scatter-add (persistent loop).
   const int32_t rank = config->rank;
   int32_t actual =
       *config->remote_combine_offsets[rank];
   if (actual > config->max_recv)
     actual = config->max_recv;
-  if (actual > N_recv) actual = N_recv;
+  if (idx >= actual) return;
 
   const TokenMetadata* meta =
       reinterpret_cast<const TokenMetadata*>(
@@ -764,21 +720,18 @@ __global__ void scatter_add_direct_kernel(
   const T* recv = reinterpret_cast<const T*>(
       config->remote_combine_recv[rank]);
 
-  for (int32_t idx = blockIdx.x; idx < actual;
-       idx += gridDim.x) {
-    const int32_t token_idx =
-        meta[idx].source_token_idx;
-    const float weight = meta[idx].topk_weight;
-    if (weight == 0.0f) continue;
+  const int32_t token_idx =
+      meta[idx].source_token_idx;
+  const float weight = meta[idx].topk_weight;
+  if (weight == 0.0f) return;
 
-    for (int32_t k = threadIdx.x; k < K;
-         k += blockDim.x) {
-      float val = static_cast<float>(
-          recv[idx * K + k]);
-      atomicAdd(
-          output + token_idx * K + k,
-          static_cast<T>(val * weight));
-    }
+  for (int32_t k = threadIdx.x; k < K;
+       k += blockDim.x) {
+    float val = static_cast<float>(
+        recv[idx * K + k]);
+    atomicAdd(
+        output + token_idx * K + k,
+        static_cast<T>(val * weight));
   }
 }
 

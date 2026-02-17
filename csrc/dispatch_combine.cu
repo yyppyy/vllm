@@ -76,10 +76,7 @@ void combine_p2p(
           dispatch_meta.data_ptr());
 
   const int32_t K32 = static_cast<int32_t>(K);
-  // Persistent grid; kernel loops over actual entries.
   int32_t grid_sz = static_cast<int32_t>(max_recv);
-  if (grid_sz > kPersistentGrid)
-    grid_sz = kPersistentGrid;
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
@@ -470,11 +467,7 @@ void scatter_add_direct(
 
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
-  // Persistent grid; kernel has inline barrier +
-  // loops over entries.
   int32_t grid_sz = mc32;
-  if (grid_sz > kPersistentGrid)
-    grid_sz = kPersistentGrid;
   if (grid_sz < 1) grid_sz = 1;
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);

@@ -265,11 +265,14 @@ class DispatchCombinePrepareAndFinalize(
             mc, K,
         )
 
-        # Step 3: Fused barrier + scatter-add from IPC
-        # combine buffers. Inline barrier(RESET_DISPATCH)
-        # syncs combine writes and resets dispatch_offset.
-        # Then scatter-add using native bf16 atomicAdd.
-        # cudaMemsetAsync zeros output before kernel.
+        # Step 3: Post-combine barrier (RESET_DISPATCH).
+        # Syncs combine writes across ranks and resets
+        # dispatch_offset to 0 for the next layer.
+        mgr.gpu_p2p_barrier_reset_dispatch()
+
+        # Step 4: Scatter-add from IPC combine buffers.
+        # Native bf16 atomicAdd; cudaMemsetAsync zeros
+        # output before kernel.
         mgr.gpu_scatter_add_direct(output, mc)
 
         if do_async:
