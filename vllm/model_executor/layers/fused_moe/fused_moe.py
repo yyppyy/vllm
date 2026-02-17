@@ -1894,12 +1894,23 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         if global_num_experts == -1:
             global_num_experts = E
 
+        # Use config hint if available (e.g. dispatch_combine
+        # passes max_num_tokens instead of the larger max_recv
+        # buffer size, so the autotuner picks decode-friendly
+        # tile sizes).
+        config_M = num_tokens
+        if (expert_tokens_meta is not None
+                and expert_tokens_meta.num_tokens_for_config
+                is not None):
+            config_M = min(
+                num_tokens,
+                expert_tokens_meta.num_tokens_for_config)
         config = try_get_optimal_moe_config(
             w1.size(),
             w2.size(),
             top_k_num,
             self.quant_config.config_name(hidden_states.dtype),
-            num_tokens,
+            config_M,
             block_shape=self.block_shape,
         )
 

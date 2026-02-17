@@ -206,9 +206,13 @@ class DispatchCombinePrepareAndFinalize(
 
         # expert_num_tokens_cpu=None for CUDA graph compat
         # (no device-to-host transfer during graph capture).
+        # num_tokens_for_config = max_num_tokens so the
+        # Triton autotuner picks decode-friendly tile sizes
+        # instead of using max_recv (which is much larger).
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=local_expert_num_tokens,
-            expert_num_tokens_cpu=None)
+            expert_num_tokens_cpu=None,
+            num_tokens_for_config=self.max_num_tokens)
 
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,
