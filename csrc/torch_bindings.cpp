@@ -25,6 +25,18 @@ void copy_combine_meta(torch::Tensor output, torch::Tensor config_tensor,
 void p2p_barrier(torch::Tensor config_tensor);
 void p2p_barrier_reset_offsets(torch::Tensor config_tensor);
 void p2p_barrier_reset_combine_offset(torch::Tensor config_tensor);
+void p2p_barrier_reset_dispatch(torch::Tensor config_tensor);
+void stamp_and_zero_dispatch(torch::Tensor dispatch_recv,
+                             torch::Tensor config_tensor,
+                             int64_t mc, int64_t K);
+void scatter_add_v2(torch::Tensor output,
+                    torch::Tensor config_tensor,
+                    int64_t mc, int64_t K,
+                    int64_t dtype_code);
+torch::Tensor wrap_cuda_ptr(torch::Tensor dummy,
+                            int64_t ptr, int64_t dim0,
+                            int64_t dim1,
+                            int64_t dtype_code);
 }  // namespace dispatch_combine
 }  // namespace vllm
 #include "ops.h"
@@ -870,6 +882,31 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
   dc.impl("p2p_barrier_reset_combine_offset", torch::kCUDA,
           &vllm::dispatch_combine::
               p2p_barrier_reset_combine_offset);
+  dc.def(
+      "p2p_barrier_reset_dispatch("
+      "Tensor config_tensor) -> ()");
+  dc.impl("p2p_barrier_reset_dispatch", torch::kCUDA,
+          &vllm::dispatch_combine::
+              p2p_barrier_reset_dispatch);
+
+  // Fused kernels (eliminate copy overhead)
+  dc.def(
+      "stamp_and_zero_dispatch(Tensor! dispatch_recv, "
+      "Tensor config_tensor, int mc, int K) -> ()");
+  dc.impl("stamp_and_zero_dispatch", torch::kCUDA,
+          &vllm::dispatch_combine::
+              stamp_and_zero_dispatch);
+  dc.def(
+      "scatter_add_v2(Tensor! output, "
+      "Tensor config_tensor, int mc, int K, "
+      "int dtype_code) -> ()");
+  dc.impl("scatter_add_v2", torch::kCUDA,
+          &vllm::dispatch_combine::scatter_add_v2);
+  dc.def(
+      "wrap_cuda_ptr(Tensor dummy, int ptr, int dim0, "
+      "int dim1, int dtype_code) -> Tensor");
+  dc.impl("wrap_cuda_ptr", torch::kCUDA,
+          &vllm::dispatch_combine::wrap_cuda_ptr);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

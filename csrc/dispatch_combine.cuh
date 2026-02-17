@@ -128,6 +128,7 @@ enum class BarrierMode : int {
   PURE = 0,                    // Signal + wait only
   RESET_DISPATCH_COMBINE = 1,  // Reset both offsets + barrier
   RESET_COMBINE = 2,           // Reset combine offset + barrier
+  RESET_DISPATCH = 3,          // Reset dispatch offset + barrier
 };
 
 template <BarrierMode mode>
@@ -150,6 +151,11 @@ __global__ void p2p_barrier_kernel(
     if (tid == 0) {
       if (config->remote_combine_offsets[rank])
         *config->remote_combine_offsets[rank] = 0;
+    }
+  } else if constexpr (mode == BarrierMode::RESET_DISPATCH) {
+    if (tid == 0) {
+      if (config->remote_dispatch_offsets[rank])
+        *config->remote_dispatch_offsets[rank] = 0;
     }
   }
 
@@ -475,6 +481,96 @@ __global__ void scatter_add_weighted_kernel(
 }
 
 // ====================================================================
+// Stamp + zero stale dispatch entries (replaces copy kernels)
+// ====================================================================
+// After post-dispatch barrier, stamps sentinel metadata and
+// zeros stale data for entries beyond actual_count.
+// Also resets BOTH dispatch and combine offset counters.
+// Grid = mc (tight upper bound), block = kBlockSize.
+template <typename T>
+__global__ void stamp_and_zero_dispatch_kernel(
+    T* __restrict__ dispatch_recv,  // IPC buffer, in-place
+    const DispatchCombineConfig* __restrict__ config,
+    int32_t mc,
+    int32_t K) {
+  const int32_t idx = blockIdx.x;
+  if (idx >= mc) return;
+
+  const int32_t rank = config->rank;
+  int32_t actual =
+      *config->remote_dispatch_offsets[rank];
+  if (actual > config->max_recv)
+    actual = config->max_recv;
+
+  // Real entries: skip (written by dispatch_p2p).
+  // Offset reset is done by a separate reset_offsets
+  // kernel AFTER this kernel (same stream ordering
+  // ensures stamp reads actual before reset clears).
+  if (idx < actual) return;
+
+  // Stale entries: zero data for quantization safety.
+  T* dest = dispatch_recv + idx * K;
+  for (int32_t k = threadIdx.x; k < K;
+       k += blockDim.x) {
+    dest[k] = T(0);
+  }
+
+  // Stamp sentinel metadata (expert_id = num_experts).
+  if (threadIdx.x == 0) {
+    TokenMetadata* meta =
+        reinterpret_cast<TokenMetadata*>(
+            config->remote_dispatch_meta[rank]);
+    meta[idx].source_rank = 0;
+    meta[idx].source_token_idx = 0;
+    meta[idx].expert_id =
+        config->experts_per_rank * config->world_size;
+    meta[idx].topk_weight = 0.0f;
+  }
+}
+
+// ====================================================================
+// Scatter-add v2: reads directly from IPC buffers
+// ====================================================================
+// Replaces copy_combine_recv + copy_combine_meta +
+// scatter_add_weighted. Reads IPC buffers via config ptrs.
+// Grid = mc, block = kBlockSize.
+template <typename T>
+__global__ void scatter_add_v2_kernel(
+    float* __restrict__ output,
+    const DispatchCombineConfig* __restrict__ config,
+    int32_t N_recv,
+    int32_t K) {
+  const int32_t idx = blockIdx.x;
+  if (idx >= N_recv) return;
+
+  const int32_t rank = config->rank;
+  int32_t actual =
+      *config->remote_combine_offsets[rank];
+  if (actual > config->max_recv)
+    actual = config->max_recv;
+  if (idx >= actual) return;
+
+  const TokenMetadata* meta =
+      reinterpret_cast<const TokenMetadata*>(
+          config->remote_combine_meta[rank]);
+  const T* recv = reinterpret_cast<const T*>(
+      config->remote_combine_recv[rank]);
+
+  const int32_t token_idx =
+      meta[idx].source_token_idx;
+  const float weight = meta[idx].topk_weight;
+  if (weight == 0.0f) return;
+
+  for (int32_t k = threadIdx.x; k < K;
+       k += blockDim.x) {
+    float val = static_cast<float>(
+        recv[idx * K + k]);
+    atomicAdd(
+        output + token_idx * K + k, val * weight);
+  }
+}
+
+// ====================================================================
 // Host-callable wrappers
 // ====================================================================
 void dispatch_p2p(
@@ -507,6 +603,8 @@ void p2p_barrier_reset_offsets(
     torch::Tensor config_tensor);
 void p2p_barrier_reset_combine_offset(
     torch::Tensor config_tensor);
+void p2p_barrier_reset_dispatch(
+    torch::Tensor config_tensor);
 void copy_dispatch_recv(
     torch::Tensor output,
     torch::Tensor config_tensor,
@@ -523,6 +621,21 @@ void copy_combine_meta(
     torch::Tensor output,
     torch::Tensor config_tensor,
     int64_t max_recv);
+
+// New fused kernels (eliminate copy overhead).
+void stamp_and_zero_dispatch(
+    torch::Tensor dispatch_recv,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K);
+void scatter_add_v2(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K,
+    int64_t dtype_code);
+torch::Tensor wrap_cuda_ptr(
+    torch::Tensor dummy,
+    int64_t ptr, int64_t dim0, int64_t dim1,
+    int64_t dtype_code);
 
 }  // namespace dispatch_combine
 }  // namespace vllm

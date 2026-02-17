@@ -295,5 +295,117 @@ void p2p_barrier_reset_combine_offset(
       <<<1, kMaxRanks, 0, stream>>>(config);
 }
 
+void p2p_barrier_reset_dispatch(
+    torch::Tensor config_tensor) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  p2p_barrier_kernel<BarrierMode::RESET_DISPATCH>
+      <<<1, kMaxRanks, 0, stream>>>(config);
+}
+
+// ====================================================================
+// Fused kernels (eliminate copy overhead)
+// ====================================================================
+
+void stamp_and_zero_dispatch(
+    torch::Tensor dispatch_recv,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K) {
+
+  if (mc == 0) return;
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+
+  const int32_t mc32 = static_cast<int32_t>(mc);
+  const int32_t K32 = static_cast<int32_t>(K);
+  dim3 grid(mc32);
+  dim3 block(kBlockSize);
+
+  AT_DISPATCH_SWITCH(
+      dispatch_recv.scalar_type(),
+      "stamp_and_zero_dispatch",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          stamp_and_zero_dispatch_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__nv_bfloat16*>(
+                  dispatch_recv.data_ptr()),
+              config, mc32, K32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          stamp_and_zero_dispatch_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<__half*>(
+                  dispatch_recv.data_ptr()),
+              config, mc32, K32);
+        })
+  );
+}
+
+void scatter_add_v2(
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K,
+    int64_t dtype_code) {
+
+  if (mc == 0) return;
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+
+  TORCH_CHECK(
+      output.scalar_type() == at::ScalarType::Float,
+      "scatter_add_v2: output must be float32");
+
+  const int32_t mc32 = static_cast<int32_t>(mc);
+  const int32_t K32 = static_cast<int32_t>(K);
+  dim3 grid(mc32);
+  dim3 block(kBlockSize);
+
+  // dtype_code: 0=bf16, 1=fp16
+  if (dtype_code == 0) {
+    scatter_add_v2_kernel<__nv_bfloat16>
+        <<<grid, block, 0, stream>>>(
+        output.data_ptr<float>(),
+        config, mc32, K32);
+  } else {
+    scatter_add_v2_kernel<__half>
+        <<<grid, block, 0, stream>>>(
+        output.data_ptr<float>(),
+        config, mc32, K32);
+  }
+}
+
+torch::Tensor wrap_cuda_ptr(
+    torch::Tensor dummy,
+    int64_t ptr, int64_t dim0, int64_t dim1,
+    int64_t dtype_code) {
+  // dtype_code: 0=bf16, 1=fp16, 2=int32
+  at::ScalarType dtype;
+  switch (dtype_code) {
+    case 0: dtype = at::ScalarType::BFloat16; break;
+    case 1: dtype = at::ScalarType::Half; break;
+    case 2: dtype = at::ScalarType::Int; break;
+    default:
+      TORCH_CHECK(false,
+          "wrap_cuda_ptr: unsupported dtype_code=",
+          dtype_code);
+  }
+  auto options = torch::TensorOptions()
+      .dtype(dtype)
+      .device(dummy.device());
+  return torch::from_blob(
+      reinterpret_cast<void*>(ptr),
+      {dim0, dim1}, options);
+}
+
 }  // namespace dispatch_combine
 }  // namespace vllm

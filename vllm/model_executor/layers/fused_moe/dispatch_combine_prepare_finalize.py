@@ -111,12 +111,12 @@ class DispatchCombinePrepareAndFinalize(
 
         mgr = self.p2p_manager
 
-        # Step 1: Reset offsets + P2P barrier (merged).
-        # Ensures all ranks finish resetting before any
-        # rank launches dispatch.
-        mgr.gpu_p2p_barrier_reset_offsets()
-
-        # Step 2: Launch dispatch P2P kernel.
+        # Step 1: Launch dispatch P2P kernel.
+        # No pre-dispatch barrier needed: dispatch_offset
+        # was reset by previous layer's post-combine
+        # barrier (RESET_DISPATCH mode), which includes
+        # threadfence_system for cross-GPU visibility.
+        # First layer uses init barrier + cudaMemset.
         topk_ids_i32 = topk_ids.to(torch.int32)
         topk_weights_f32 = topk_weights.to(torch.float32)
 
@@ -128,14 +128,18 @@ class DispatchCombinePrepareAndFinalize(
             M, K, topk,
         )
 
-        # Step 3: P2P barrier - all P2P writes complete.
-        mgr.gpu_p2p_barrier()
+        # Step 2: P2P barrier + reset combine offset.
+        # RESET_COMBINE mode: syncs dispatch writes AND
+        # resets combine_offset to 0 (visible to all ranks
+        # via threadfence_system). combine_p2p in finalize
+        # will atomicAdd from 0.
+        mgr.gpu_p2p_barrier_reset_combine_offset()
 
-        # Step 4: Copy from IPC buffers (GPU kernels).
-        # These kernels read actual count from offset
-        # counters and zero entries beyond actual count.
-        mgr.gpu_copy_dispatch_recv()
-        mgr.gpu_copy_dispatch_meta()
+        # Step 3: Stamp sentinel meta + zero stale data
+        # for entries beyond actual_count in IPC buffer.
+        # dispatch_offset still has actual count (NOT
+        # reset yet) so stamp reads correct value.
+        mgr.gpu_stamp_and_zero_dispatch(self._mc)
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config, expert_map)
@@ -151,17 +155,16 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
         mc = self._mc
 
-        # Slice to mc (= M * topk for this batch).
-        # Copy kernels pack real entries at 0..actual_count-1
-        # and actual_count <= mc always holds.
-        # This reduces num_tokens for fused_moe_kernel grid,
-        # act_and_mul grid, and intermediate buffer sizes.
+        # Slice IPC-backed tensors to mc (tight bound).
+        # dispatch_p2p wrote real entries at 0..actual-1;
+        # stamp_and_zero zeroed/sentinel-stamped stale
+        # entries at actual..mc-1.
         expert_x = mgr.dispatch_recv_tensor[:mc]
         dispatch_meta = mgr.dispatch_meta_tensor[:mc]
 
         # Extract expert IDs from metadata column 2.
         # Padding entries have expert_id = num_experts
-        # (set by copy_dispatch_meta_kernel), which
+        # (set by stamp_and_zero_dispatch_kernel), which
         # moe_align_block_size skips automatically.
         expert_topk_ids = dispatch_meta[:, 2].clone()
 
@@ -275,14 +278,12 @@ class DispatchCombinePrepareAndFinalize(
                         apply_router_weight_on_input),
                 ))
 
-        # Step 2: Reset combine offset + P2P barrier.
-        mgr.gpu_p2p_barrier_reset_combine_offset()
-
-        # Step 3: Launch combine P2P kernel.
-        # The kernel reads actual dispatch_recv count from
-        # config and skips entries beyond it.
-        # Grid = mc (not max_recv) since
-        # actual_count <= mc always holds.
+        # Step 2: Launch combine P2P kernel.
+        # No pre-combine barrier: combine_offset was reset
+        # by post-dispatch barrier (RESET_COMBINE mode),
+        # visible to all ranks via threadfence_system.
+        # The kernel reads dispatch_offset for actual
+        # dispatch_recv count (not yet reset).
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc]
             .contiguous().view(torch.uint8))
@@ -293,28 +294,20 @@ class DispatchCombinePrepareAndFinalize(
             mc, K,
         )
 
-        # Step 4: P2P barrier for combine completion.
-        mgr.gpu_p2p_barrier()
+        # Step 3: P2P barrier + reset dispatch offset.
+        # RESET_DISPATCH mode: syncs combine writes AND
+        # resets dispatch_offset to 0 (visible to all
+        # ranks). Next layer's dispatch_p2p will
+        # atomicAdd from 0.
+        mgr.gpu_p2p_barrier_reset_dispatch()
 
-        # Step 5: Copy combine results (GPU kernels).
-        mgr.gpu_copy_combine_recv()
-        mgr.gpu_copy_combine_meta()
-
-        # Step 6: Scatter-add weighted results to output.
-        # Float32 accumulator for precise atomic scatter-add.
+        # Step 4: Scatter-add from IPC combine buffers
+        # directly into output. Reads actual_count from
+        # combine offset. No copy kernels needed.
         accum = torch.zeros(
             output.shape, dtype=torch.float32,
             device=output.device)
-
-        combine_meta_bytes = (
-            mgr.combine_meta_tensor[:mc]
-            .contiguous().view(torch.uint8))
-        torch.ops._C_dispatch_combine.scatter_add_weighted(
-            accum,
-            mgr.combine_recv_tensor[:mc],
-            combine_meta_bytes,
-            mc, K,
-        )
+        mgr.gpu_scatter_add_v2(accum, mc)
         output.copy_(accum.to(output.dtype))
 
         if do_async:
