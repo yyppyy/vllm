@@ -2,17 +2,14 @@
 import json
 import matplotlib.pyplot as plt
 from pathlib import Path
-import re
 
 from utils import set_paper_style, get_palette
 
-# Directories containing the results
-EXPERT_PARALLEL_DIR = Path("../results/vllm_results_likaixin_InstructCoder1/results")
-TENSOR_PARALLEL_DIR = Path("../results/vllm_results_likaixin_InstructCoder_tp/results")
+# Base directory containing the results
+# Layout: {BASE_DIR}/8_8_{IS_EP}_0_{BATCH}_0_{COMM_BACKEND}_0_0/bench_result.json
+BASE_DIR = Path("../results/vllm_results_dev")
 OUTPUT_FILE = Path(__file__).parent / "ep_vs_tp.pdf"
 
-# File pattern: bench_result_{num_gpu}_{parallel_degree}_{redundant_experts}_{batch_size_per_gpu}_{routing_algo_id}_{dataset_id}.json
-# Filter criteria
 NUM_GPU = 8
 PARALLEL_DEGREE = 8
 REDUNDANT_EXPERTS = 0
@@ -20,47 +17,31 @@ BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 ROUTING_ALGO_ID = 0
 DATASET_ID = 0
 
-def parse_filename(filename):
-    """Parse the filename to extract parameters."""
-    pattern = r'bench_result_(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_(\d+)\.json'
-    match = re.match(pattern, filename)
-    if match:
-        return {
-            'num_gpu': int(match.group(1)),
-            'parallel_degree': int(match.group(2)),
-            'redundant_experts': int(match.group(3)),
-            'batch_size_per_gpu': int(match.group(4)),
-            'routing_algo_id': int(match.group(5)),
-            'dataset_id': int(match.group(6)),
-        }
-    return None
 
-def load_data(directory):
-    """Load data from JSON files matching the criteria."""
+def load_data(is_ep, comm_backend):
+    """Load data from the new directory structure."""
     data_points = []
 
-    for json_file in directory.glob("bench_result_*.json"):
-        params = parse_filename(json_file.name)
+    for batch_size in BATCH_SIZES:
+        dir_name = (f"{NUM_GPU}_{PARALLEL_DEGREE}_{is_ep}"
+                    f"_{REDUNDANT_EXPERTS}_{batch_size}"
+                    f"_{ROUTING_ALGO_ID}_{comm_backend}"
+                    f"_{DATASET_ID}_{0}")
+        json_file = BASE_DIR / dir_name / "bench_result.json"
 
-        # Check if file matches our criteria
-        if params and \
-           params['num_gpu'] == NUM_GPU and \
-           params['parallel_degree'] == PARALLEL_DEGREE and \
-           params['redundant_experts'] == REDUNDANT_EXPERTS and \
-           params['batch_size_per_gpu'] in BATCH_SIZES and \
-           params['routing_algo_id'] == ROUTING_ALGO_ID and \
-           params['dataset_id'] == DATASET_ID:
+        if not json_file.exists():
+            print(f"Warning: {json_file} not found, skipping")
+            continue
 
-            # Load the JSON file
-            with open(json_file, 'r') as f:
-                data = json.load(f)
+        with open(json_file, 'r') as f:
+            data = json.load(f)
 
-            data_points.append({
-                'batch_size': params['batch_size_per_gpu'],
-                'mean_tpot_ms': data['mean_tpot_ms'],
-                'mean_ttft_ms': data['mean_ttft_ms'],
-                'total_token_throughput': data['total_token_throughput'],
-            })
+        data_points.append({
+            'batch_size': batch_size,
+            'mean_tpot_ms': data['mean_tpot_ms'],
+            'mean_ttft_ms': data['mean_ttft_ms'],
+            'total_token_throughput': data['total_token_throughput'],
+        })
 
     # Sort by batch size for consistent line plotting
     data_points.sort(key=lambda x: x['batch_size'])
@@ -70,8 +51,8 @@ def main():
     set_paper_style()
 
     # Load data from both directories
-    ep_data = load_data(EXPERT_PARALLEL_DIR)
-    tp_data = load_data(TENSOR_PARALLEL_DIR)
+    ep_data = load_data(is_ep=1, comm_backend="dispatch_combine")
+    tp_data = load_data(is_ep=0, comm_backend="allgather_reducescatter")
 
     print(f"Expert Parallel data points: {len(ep_data)}")
     print(f"Tensor Parallel data points: {len(tp_data)}")
