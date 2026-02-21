@@ -38,7 +38,7 @@ def load_data(is_ep, comm_backend):
 
         data_points.append({
             'batch_size': batch_size,
-            'mean_tpot_ms': data['mean_tpot_ms'],
+            'mean_itl_ms': data['mean_itl_ms'],
             'mean_ttft_ms': data['mean_ttft_ms'],
             'total_token_throughput': data['total_token_throughput'],
         })
@@ -63,20 +63,20 @@ def main():
     # Get colors from palette
     colors = get_palette(2, name="tableau10")
 
-    # ===== Plot 1: TPOT vs Throughput =====
+    # ===== Plot 1: ITL vs Throughput =====
     # Plot Expert Parallel series
     if ep_data:
         ep_throughputs = [d['total_token_throughput'] for d in ep_data]
-        ep_tpots = [d['mean_tpot_ms'] for d in ep_data]
+        ep_itls = [d['mean_itl_ms'] for d in ep_data]
         ep_batch_sizes = [d['batch_size'] for d in ep_data]
 
-        ax1.plot(ep_tpots, ep_throughputs, '-o', color=colors[0],
+        ax1.plot(ep_itls, ep_throughputs, '-o', color=colors[0],
                 linewidth=2, markersize=8, label='Expert Parallel')
 
         # Annotate each point with batch size
-        for throughput, tpot, batch_size in zip(ep_throughputs, ep_tpots, ep_batch_sizes):
+        for throughput, itl, batch_size in zip(ep_throughputs, ep_itls, ep_batch_sizes):
             ax1.annotate(f'{batch_size}',
-                       xy=(tpot, throughput),
+                       xy=(itl, throughput),
                        xytext=(5, 5),
                        textcoords='offset points',
                        fontsize=8,
@@ -85,27 +85,27 @@ def main():
     # Plot Tensor Parallel series
     if tp_data:
         tp_throughputs = [d['total_token_throughput'] for d in tp_data]
-        tp_tpots = [d['mean_tpot_ms'] for d in tp_data]
+        tp_itls = [d['mean_itl_ms'] for d in tp_data]
         tp_batch_sizes = [d['batch_size'] for d in tp_data]
 
-        ax1.plot(tp_tpots, tp_throughputs, '-s', color=colors[1],
+        ax1.plot(tp_itls, tp_throughputs, '-s', color=colors[1],
                 linewidth=2, markersize=8, label='Tensor Parallel')
 
         # Annotate each point with batch size
-        for throughput, tpot, batch_size in zip(tp_throughputs, tp_tpots, tp_batch_sizes):
+        for throughput, itl, batch_size in zip(tp_throughputs, tp_itls, tp_batch_sizes):
             ax1.annotate(f'{batch_size}',
-                       xy=(tpot, throughput),
+                       xy=(itl, throughput),
                        xytext=(5, -10),
                        textcoords='offset points',
                        fontsize=8,
                        alpha=0.8)
 
     # Configure plot 1
-    ax1.set_xlabel('Mean TPOT (ms)')
+    ax1.set_xlabel('Mean ITL (ms)')
     ax1.set_ylabel('Total Token Throughput (tokens/s)')
     ax1.legend(loc='best', frameon=False)
     ax1.grid(True, linestyle='--', alpha=0.35)
-    ax1.set_title('TPOT vs Throughput')
+    ax1.set_title('ITL vs Throughput')
 
     # ===== Plot 2: TTFT vs Throughput =====
     # Plot Expert Parallel series
@@ -161,11 +161,11 @@ def main():
     # Print summary
     print("\nExpert Parallel:")
     for d in ep_data:
-        print(f"  Batch size {d['batch_size']}: throughput={d['total_token_throughput']:.2f}, tpot={d['mean_tpot_ms']:.2f}, ttft={d['mean_ttft_ms']:.2f}")
+        print(f"  Batch size {d['batch_size']}: throughput={d['total_token_throughput']:.2f}, itl={d['mean_itl_ms']:.2f}, ttft={d['mean_ttft_ms']:.2f}")
 
     print("\nTensor Parallel:")
     for d in tp_data:
-        print(f"  Batch size {d['batch_size']}: throughput={d['total_token_throughput']:.2f}, tpot={d['mean_tpot_ms']:.2f}, ttft={d['mean_ttft_ms']:.2f}")
+        print(f"  Batch size {d['batch_size']}: throughput={d['total_token_throughput']:.2f}, itl={d['mean_itl_ms']:.2f}, ttft={d['mean_ttft_ms']:.2f}")
 
 if __name__ == "__main__":
     main()
