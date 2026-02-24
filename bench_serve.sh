@@ -48,7 +48,7 @@ if (( USE_EP > 0 )); then
   args+=( --enable-expert-parallel )
   args+=( --enable-eplb )
   EPLB_STEP=$((3 * NUM_PROMPTS))
-  args+=( --eplb-config "{\"window_size\":${EPLB_STEP},\"step_interval\":${EPLB_STEP},\"num_redundant_experts\":${NUM_REPLICAS}}" )
+  args+=( --eplb-config "{\"window_size\":${EPLB_STEP},\"step_interval\":${EPLB_STEP},\"num_redundant_experts\":${NUM_REPLICAS},\"max_rearrangements\":1}" )
   if (( MEM_BOUND_ROUTING > 0 )); then
     args+=( --mem-bound-aware-routing greedy )
   fi

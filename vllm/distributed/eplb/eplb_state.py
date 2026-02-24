@@ -157,6 +157,12 @@ class EplbState:
     This is a constant and is taken from the config.
     """
 
+    rearrangement_count: int = 0
+    """Number of rearrangements performed so far."""
+
+    max_rearrangements: int = -1
+    """Maximum rearrangements allowed. -1 means unlimited."""
+
     @staticmethod
     def build_initial_global_physical_to_logical_map(
         num_routed_experts: int,
@@ -372,6 +378,8 @@ class EplbState:
             expert_load_window_size=expert_load_window_size,
             expert_rearrangement_step=expert_rearrangement_step,
             expert_rearrangement_step_interval=eplb_step_interval,
+            max_rearrangements=parallel_config.eplb_config
+            .max_rearrangements,
         )
 
     def step(self,
@@ -456,7 +464,11 @@ class EplbState:
         if (self.expert_rearrangement_step
                 >= self.expert_rearrangement_step_interval):
             self.expert_rearrangement_step = 0
-            self.rearrange(model)
+            if (self.max_rearrangements < 0
+                    or self.rearrangement_count
+                    < self.max_rearrangements):
+                self.rearrange(model)
+                self.rearrangement_count += 1
 
     def rearrange(
         self,

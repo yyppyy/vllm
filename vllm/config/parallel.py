@@ -58,6 +58,10 @@ class EPLBConfig:
     This is turned off by default since it will cause communication overhead.
     """
 
+    max_rearrangements: int = -1
+    """Maximum number of expert rearrangements allowed. -1 means unlimited.
+    Set to 1 to rebalance once during warmup and freeze for real serving."""
+
 
 @config
 @dataclass
