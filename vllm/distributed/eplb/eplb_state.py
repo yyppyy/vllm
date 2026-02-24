@@ -157,6 +157,12 @@ class EplbState:
     This is a constant and is taken from the config.
     """
 
+    rearrangement_count: int = 0
+    """Number of rearrangements performed so far."""
+
+    max_rearrangements: int = -1
+    """Maximum rearrangements allowed. -1 means unlimited."""
+
     @staticmethod
     def build_initial_global_physical_to_logical_map(
         num_routed_experts: int,
@@ -237,14 +243,13 @@ class EplbState:
             physical_to_logical_map_list,
             device=device,
         )
-        # Assuming 8 GPUs per node, this supports up to
-        # (1023 + 1) / 8 = 128 nodes for now.
-        # TODO(rui): make this configurable
-        MAX_EXPERT_REDUNDANCY = 1
-        assert model.num_redundant_experts <= MAX_EXPERT_REDUNDANCY * model.num_physical_experts, (
-            f"num_redundant_experts {model.num_redundant_experts} "
-            f"must be less than or equal to {MAX_EXPERT_REDUNDANCY}")
-        max_slots_per_logical_expert = MAX_EXPERT_REDUNDANCY + 1
+        # Each logical expert can be replicated at most once per EP rank.
+        # Also account for the degenerate zero-load case where the greedy
+        # algorithm may concentrate all redundant replicas on one expert,
+        # producing logcnt.max() = num_redundant_experts + 1.
+        ep_size = get_ep_group().device_group.size()
+        max_slots_per_logical_expert = max(
+            ep_size, model.num_redundant_experts + 1)
         logical_to_physical_map = torch.full(
             (model.num_logical_experts, max_slots_per_logical_expert),
             -1,
@@ -328,14 +333,24 @@ class EplbState:
             ))
 
             max_physical_slots = new_logical_to_physical_map.shape[-1]
-            assert max_physical_slots <= logical_to_physical_map.shape[-1]
-            new_logical_to_physical_map = torch.nn.functional.pad(
-                new_logical_to_physical_map,
-                (0, logical_to_physical_map.shape[-1] - max_physical_slots),
-                value=-1,
-            )
             physical_to_logical_map = new_physical_to_logical_map.to(device)
-            logical_to_physical_map.copy_(new_logical_to_physical_map)
+            if max_physical_slots > logical_to_physical_map.shape[-1]:
+                logical_to_physical_map = \
+                    new_logical_to_physical_map.to(
+                        device=device,
+                        dtype=logical_to_physical_map.dtype)
+            elif max_physical_slots < logical_to_physical_map.shape[-1]:
+                new_logical_to_physical_map = torch.nn.functional.pad(
+                    new_logical_to_physical_map,
+                    (0, logical_to_physical_map.shape[-1]
+                     - max_physical_slots),
+                    value=-1,
+                )
+                logical_to_physical_map.copy_(
+                    new_logical_to_physical_map)
+            else:
+                logical_to_physical_map.copy_(
+                    new_logical_to_physical_map)
             logical_replica_count.copy_(new_logical_replica_count)
 
         model.set_eplb_state(
@@ -363,6 +378,8 @@ class EplbState:
             expert_load_window_size=expert_load_window_size,
             expert_rearrangement_step=expert_rearrangement_step,
             expert_rearrangement_step_interval=eplb_step_interval,
+            max_rearrangements=parallel_config.eplb_config
+            .max_rearrangements,
         )
 
     def step(self,
@@ -447,7 +464,11 @@ class EplbState:
         if (self.expert_rearrangement_step
                 >= self.expert_rearrangement_step_interval):
             self.expert_rearrangement_step = 0
-            self.rearrange(model)
+            if (self.max_rearrangements < 0
+                    or self.rearrangement_count
+                    < self.max_rearrangements):
+                self.rearrange(model)
+                self.rearrangement_count += 1
 
     def rearrange(
         self,
@@ -571,14 +592,32 @@ class EplbState:
             else:
                 self.physical_to_logical_map.copy_(new_physical_to_logical_map)
             max_physical_slots = new_logical_to_physical_map.shape[-1]
-            assert max_physical_slots <= self.logical_to_physical_map.shape[-1]
-            new_logical_to_physical_map = torch.nn.functional.pad(
-                new_logical_to_physical_map,
-                (0,
-                 self.logical_to_physical_map.shape[-1] - max_physical_slots),
-                value=-1,
-            )
-            self.logical_to_physical_map.copy_(new_logical_to_physical_map)
+            if max_physical_slots > self.logical_to_physical_map.shape[-1]:
+                # New map needs more slots; reallocate.
+                # NOTE: this breaks model layer views of the old tensor.
+                # The initial allocation should be large enough to avoid
+                # this path; if we hit it, log a warning.
+                logger.warning(
+                    "logical_to_physical_map reallocated from %d to "
+                    "%d slots; model layer views may be stale.",
+                    self.logical_to_physical_map.shape[-1],
+                    max_physical_slots)
+                self.logical_to_physical_map = \
+                    new_logical_to_physical_map.to(
+                        device=self.logical_to_physical_map.device,
+                        dtype=self.logical_to_physical_map.dtype)
+            elif max_physical_slots < self.logical_to_physical_map.shape[-1]:
+                new_logical_to_physical_map = torch.nn.functional.pad(
+                    new_logical_to_physical_map,
+                    (0, self.logical_to_physical_map.shape[-1]
+                     - max_physical_slots),
+                    value=-1,
+                )
+                self.logical_to_physical_map.copy_(
+                    new_logical_to_physical_map)
+            else:
+                self.logical_to_physical_map.copy_(
+                    new_logical_to_physical_map)
             self.logical_replica_count.copy_(new_logical_replica_count)
 
         if is_main_rank:

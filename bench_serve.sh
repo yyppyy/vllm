@@ -29,6 +29,7 @@ export NCCL_P2P_LEVEL=NVL
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
 MAX_TOKEN_PER_BATCH=4096
 MAX_REQ_PER_BATCH=$BATCH_SIZE
+NUM_PROMPTS=$((BATCH_SIZE * NUM_GPUS))
 
 args=(
   serve Qwen/Qwen3-30B-A3B
@@ -46,7 +47,8 @@ args=(
 if (( USE_EP > 0 )); then
   args+=( --enable-expert-parallel )
   args+=( --enable-eplb )
-  args+=( --eplb-config "{\"window_size\":100,\"step_interval\":10000000,\"num_redundant_experts\":${NUM_REPLICAS}}" )
+  EPLB_STEP=$((2 * NUM_PROMPTS))
+  args+=( --eplb-config "{\"window_size\":${EPLB_STEP},\"step_interval\":${EPLB_STEP},\"num_redundant_experts\":${NUM_REPLICAS},\"max_rearrangements\":1}" )
   if (( MEM_BOUND_ROUTING > 0 )); then
     args+=( --mem-bound-aware-routing greedy )
   fi
@@ -84,12 +86,32 @@ fi
 
 ################ client #################
 
-MAX_CONCURRENT_REQ=$((BATCH_SIZE * NUM_GPUS))
+WARMUP_PROMPTS=$((1 * NUM_PROMPTS))
 
+# Warmup run: EPLB rebalances during these requests (results discarded)
+warmup_args=(
+    --model Qwen/Qwen3-30B-A3B
+    --dataset-name hf
+    --dataset-path $DATASET_NAME
+    --backend vllm
+    --save-result
+    --result-filename /dev/null
+    --percentile-metrics ttft,tpot,itl,e2el
+    --metric-percentiles 10,20,30,40,50,95,99
+    --ready-check-timeout-sec 2400
+    --port "$PORT"
+    --num-prompts $WARMUP_PROMPTS
+    --max-concurrency $NUM_PROMPTS
+)
+
+echo "=== Warmup: sending $WARMUP_PROMPTS requests ==="
+vllm bench serve "${warmup_args[@]}"
+
+# Real benchmark run (EPLB already rebalanced, no interference)
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
     --dataset-name hf
-    --dataset-path $DATASET_NAME \
+    --dataset-path $DATASET_NAME
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result.json
@@ -97,14 +119,15 @@ cli_args=(
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 2400
     --port "$PORT"
-    --num-prompts $MAX_CONCURRENT_REQ
-    --max-concurrency $MAX_CONCURRENT_REQ
+    --num-prompts $NUM_PROMPTS
+    --max-concurrency $NUM_PROMPTS
 )
 
 # if (( USE_PROFILER > 0 )); then
 #   cli_args+=( --profile )
 # fi
 
+echo "=== Benchmark: sending $NUM_PROMPTS requests ==="
 vllm bench serve "${cli_args[@]}"
 
 

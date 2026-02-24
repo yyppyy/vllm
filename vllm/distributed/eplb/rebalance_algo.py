@@ -219,8 +219,7 @@ def rebalance_experts(
         # use global load-balance policy
         phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
             weight, num_replicas, 1, 1, num_gpus)
-    num_redundant_experts = num_replicas - num_logical_experts
-    maxlogcnt = num_redundant_experts + 1
+    maxlogcnt = logcnt.max().item()
     log2phy: torch.Tensor = torch.full(
         (num_layers, num_logical_experts, maxlogcnt),
         -1,
