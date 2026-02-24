@@ -238,8 +238,12 @@ class EplbState:
             device=device,
         )
         # Each logical expert can be replicated at most once per EP rank.
+        # Also account for the degenerate zero-load case where the greedy
+        # algorithm may concentrate all redundant replicas on one expert,
+        # producing logcnt.max() = num_redundant_experts + 1.
         ep_size = get_ep_group().device_group.size()
-        max_slots_per_logical_expert = ep_size
+        max_slots_per_logical_expert = max(
+            ep_size, model.num_redundant_experts + 1)
         logical_to_physical_map = torch.full(
             (model.num_logical_experts, max_slots_per_logical_expert),
             -1,
@@ -326,7 +330,9 @@ class EplbState:
             physical_to_logical_map = new_physical_to_logical_map.to(device)
             if max_physical_slots > logical_to_physical_map.shape[-1]:
                 logical_to_physical_map = \
-                    new_logical_to_physical_map.to(device)
+                    new_logical_to_physical_map.to(
+                        device=device,
+                        dtype=logical_to_physical_map.dtype)
             elif max_physical_slots < logical_to_physical_map.shape[-1]:
                 new_logical_to_physical_map = torch.nn.functional.pad(
                     new_logical_to_physical_map,
@@ -576,9 +582,18 @@ class EplbState:
             max_physical_slots = new_logical_to_physical_map.shape[-1]
             if max_physical_slots > self.logical_to_physical_map.shape[-1]:
                 # New map needs more slots; reallocate.
+                # NOTE: this breaks model layer views of the old tensor.
+                # The initial allocation should be large enough to avoid
+                # this path; if we hit it, log a warning.
+                logger.warning(
+                    "logical_to_physical_map reallocated from %d to "
+                    "%d slots; model layer views may be stale.",
+                    self.logical_to_physical_map.shape[-1],
+                    max_physical_slots)
                 self.logical_to_physical_map = \
                     new_logical_to_physical_map.to(
-                        self.logical_to_physical_map.device)
+                        device=self.logical_to_physical_map.device,
+                        dtype=self.logical_to_physical_map.dtype)
             elif max_physical_slots < self.logical_to_physical_map.shape[-1]:
                 new_logical_to_physical_map = torch.nn.functional.pad(
                     new_logical_to_physical_map,
