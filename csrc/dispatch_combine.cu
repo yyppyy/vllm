@@ -560,15 +560,11 @@ void dispatch_and_route(
       expert_num_tokens.data_ptr(), 0,
       num_physical_experts * sizeof(int32_t), stream);
 
-  // Zero local expert_counts buffer (receives remote
-  // atomicAdds from all ranks during push all-reduce).
-  // Passed as a tensor to avoid host-side dereference
-  // of device config pointer (CUDA graph compatible).
-  if (NL > 0) {
-    cudaMemsetAsync(
-        expert_counts.data_ptr(), 0,
-        NL * sizeof(int32_t), stream);
-  }
+  // NOTE: expert_counts is NOT zeroed here. It is zeroed
+  // at the end of Phase D inside the kernel (Phase E),
+  // after the barrier guarantees no more remote atomicAdds.
+  // A host-side cudaMemsetAsync would race with remote
+  // ranks' Phase A atomicAdds to this IPC buffer.
 
   // Shared memory: routing_selection_smem[NL]
   //              + rank_active_counts[world_size]

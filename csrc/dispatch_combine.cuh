@@ -908,6 +908,7 @@ __global__ void dispatch_and_route_kernel(
 
     const int32_t logical_id =
         topk_ids[token_idx * topk + slot];
+    if (logical_id < 0 || logical_id >= NL) continue;
     const int32_t rc = static_cast<int32_t>(
         config->logical_replica_count[logical_id]);
     if (replica_idx >= rc) continue;
@@ -1118,23 +1119,34 @@ __global__ void dispatch_and_route_kernel(
                 config->remote_dispatch_meta[rank]);
         const int32_t logical_id =
             meta[idx].expert_id;
+        if (logical_id < 0 || logical_id >= NL) {
+          expert_topk_ids[idx] =
+              static_cast<int64_t>(
+                  num_physical_experts);
+          expert_topk_weights[idx] = 0.0f;
+          meta[idx].topk_weight = 0.0f;
+        } else {
         const int32_t selected_phys =
             config->routing_selection[logical_id];
-        const int32_t selected_rank =
-            selected_phys / epr;
 
-        if (selected_rank == rank) {
+        // Guard: if routing produced -1 (e.g. expert
+        // count was zero due to race), treat as FILTER.
+        if (selected_phys < 0 ||
+            selected_phys >= num_physical_experts) {
+          expert_topk_ids[idx] =
+              static_cast<int64_t>(
+                  num_physical_experts);
+          expert_topk_weights[idx] = 0.0f;
+          meta[idx].topk_weight = 0.0f;
+        } else if (selected_phys / epr == rank) {
           // KEEP: this token's replica is local.
           expert_topk_ids[idx] =
               static_cast<int64_t>(selected_phys);
           expert_topk_weights[idx] =
               meta[idx].topk_weight;
-          if (selected_phys >= 0 &&
-              selected_phys < num_physical_experts) {
-            atomicAdd(
-                &expert_num_tokens[selected_phys],
-                1);
-          }
+          atomicAdd(
+              &expert_num_tokens[selected_phys],
+              1);
         } else {
           // FILTER: not our replica.
           expert_topk_ids[idx] =
@@ -1143,6 +1155,7 @@ __global__ void dispatch_and_route_kernel(
           expert_topk_weights[idx] = 0.0f;
           meta[idx].topk_weight = 0.0f;
         }
+        }  // close logical_id bounds else
       }
     } else {
       // Stale entry: zero data + stamp sentinel.
@@ -1164,6 +1177,25 @@ __global__ void dispatch_and_route_kernel(
                 num_physical_experts);
         expert_topk_weights[idx] = 0.0f;
       }
+    }
+  }
+
+  // ---- Phase E: Zero expert_counts for next invocation ----
+  // Must happen AFTER Phase C reads the counts and AFTER
+  // Phase B barrier guarantees no more remote atomicAdds.
+  // The next layer's combine barrier (RESET_DISPATCH)
+  // includes __threadfence_system() which ensures this
+  // zeroing is visible to all peers before they start
+  // the next dispatch_and_route Phase A atomicAdds.
+  // This avoids a race between host cudaMemsetAsync and
+  // remote ranks' Phase A writes.
+  {
+    int32_t* local_ec =
+        config->remote_expert_counts[rank];
+    for (int32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+         e < NL;
+         e += gridDim.x * blockDim.x) {
+      local_ec[e] = 0;
     }
   }
 }
