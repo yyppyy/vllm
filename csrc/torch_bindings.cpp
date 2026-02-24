@@ -48,6 +48,20 @@ void scatter_add_direct(torch::Tensor output,
                         torch::Tensor config_tensor,
                         int64_t mc, int64_t K,
                         int64_t M);
+void dispatch_and_route(torch::Tensor input,
+                        torch::Tensor topk_ids,
+                        torch::Tensor topk_weights,
+                        torch::Tensor dispatch_recv,
+                        torch::Tensor expert_topk_ids,
+                        torch::Tensor expert_topk_weights,
+                        torch::Tensor expert_num_tokens,
+                        torch::Tensor expert_counts,
+                        torch::Tensor config_tensor,
+                        int64_t M, int64_t K, int64_t topk,
+                        int64_t mc,
+                        int64_t num_physical_experts,
+                        int64_t num_logical_experts,
+                        int64_t world_size);
 }  // namespace dispatch_combine
 }  // namespace vllm
 #include "ops.h"

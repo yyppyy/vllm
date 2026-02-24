@@ -118,7 +118,7 @@ struct DispatchCombineConfig {
 
   // Intra-kernel sync for routing completion
   // (CUDA graph compatible, monotonic counter).
-  int32_t* routing_ready_flag;
+  FlagType* routing_ready_flag;
 };
 
 // ====================================================================
@@ -1089,16 +1089,14 @@ __global__ void dispatch_and_route_kernel(
     // Signal routing complete.
     if (threadIdx.x == 0) {
       dc_st_flag_release(
-          config->routing_ready_flag,
-          static_cast<int32_t>(rf_expected));
+          config->routing_ready_flag, rf_expected);
     }
   } else {
     // Other blocks: spin until routing complete.
     if (threadIdx.x == 0) {
       while (dc_ld_flag_acquire(
-          reinterpret_cast<FlagType*>(
-              config->routing_ready_flag))
-              != static_cast<FlagType>(rf_expected))
+              config->routing_ready_flag)
+              != rf_expected)
         ;
     }
     __syncthreads();
