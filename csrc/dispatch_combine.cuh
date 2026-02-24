@@ -98,6 +98,27 @@ struct DispatchCombineConfig {
   int32_t hidden_dim;
   int32_t max_num_tokens_per_rank;
   int32_t max_recv;  // max entries per recv buffer
+
+  // ---- Integrated routing fields (EPLB) ----
+  // Push-based all-reduce: IPC ptrs to each rank's
+  // expert_counts buffer. During dispatch, each block
+  // atomicAdds to ALL peers' buffers. After barrier,
+  // local buffer has global sum.
+  int32_t* remote_expert_counts[kMaxRanks];
+
+  // GPU-resident routing tables (updated on EPLB rebalance).
+  int32_t* logical_to_physical_map;   // [NL * max_replicas]
+  int64_t* logical_replica_count;     // [NL]
+  int32_t* routing_selection;         // [NL] output
+
+  // Scalars for integrated routing.
+  int32_t num_logical_experts;
+  int32_t max_replicas;               // slots_per_logical
+  int32_t physical_experts_per_rank;
+
+  // Intra-kernel sync for routing completion
+  // (CUDA graph compatible, monotonic counter).
+  int32_t* routing_ready_flag;
 };
 
 // ====================================================================
@@ -418,6 +439,11 @@ __global__ void combine_p2p_kernel(
         dispatch_meta[pair_idx].source_token_idx;
     const float weight =
         dispatch_meta[pair_idx].topk_weight;
+
+    // Skip filtered entries (integrated routing sets
+    // weight=0 for tokens whose chosen replica is not
+    // on this rank).
+    if (weight == 0.0f) continue;
 
     if (dest_rank < 0 ||
         dest_rank >= config->world_size)
@@ -814,6 +840,352 @@ void scatter_add_direct(
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M);
+
+// ====================================================================
+// Fused dispatch + route + filter kernel (integrated EPLB)
+// ====================================================================
+// Single persistent-grid kernel that:
+//   Phase A: Broadcast-dispatches tokens to all replica ranks
+//            + push-based all-reduce (remote atomicAdd to all
+//            peers' expert_counts buffers).
+//   Phase B: P2P barrier (shared: covers dispatch + all-reduce).
+//   Phase C: Deterministic router (block 0, sequential).
+//   Phase D: Filter + stamp/zero + routing metadata.
+//
+// Grid = kPersistentGrid, block = kBlockSize.
+// expert_num_tokens must be pre-zeroed before launch.
+// remote_expert_counts[rank] must be pre-zeroed before launch.
+template <typename T>
+__global__ void dispatch_and_route_kernel(
+    const T* __restrict__ input,
+    const int32_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    T* __restrict__ dispatch_recv,
+    int64_t* __restrict__ expert_topk_ids,
+    float* __restrict__ expert_topk_weights,
+    int32_t* __restrict__ expert_num_tokens,
+    const DispatchCombineConfig* __restrict__ config,
+    int32_t M, int32_t K, int32_t topk,
+    int32_t mc,
+    int32_t num_physical_experts) {
+  const int32_t rank = config->rank;
+  const int32_t ws = config->world_size;
+  const int32_t max_rep = config->max_replicas;
+  const int32_t epr = config->physical_experts_per_rank;
+  const int32_t NL = config->num_logical_experts;
+
+  // Shared memory layout:
+  //   routing_selection_smem[NL]  (int32_t)
+  //   rank_active_counts[ws]     (int32_t)
+  extern __shared__ int32_t shared[];
+  int32_t* routing_selection_smem = shared;
+  int32_t* rank_active_counts = shared + NL;
+
+  // Read routing_ready_flag expected value BEFORE Phase A
+  // (monotonic counter for CUDA graph replay).
+  FlagType rf_expected = 0;
+  if (threadIdx.x == 0) {
+    rf_expected =
+        static_cast<FlagType>(*config->routing_ready_flag) + 1;
+  }
+  // Broadcast rf_expected to all threads via shared mem.
+  __shared__ FlagType s_rf_expected;
+  if (threadIdx.x == 0) s_rf_expected = rf_expected;
+  __syncthreads();
+  rf_expected = s_rf_expected;
+
+  // ---- Phase A: Broadcast dispatch + push all-reduce ----
+  const int32_t total_pairs = M * topk * max_rep;
+  for (int32_t pair_idx = blockIdx.x;
+       pair_idx < total_pairs;
+       pair_idx += gridDim.x) {
+    const int32_t token_idx =
+        pair_idx / (topk * max_rep);
+    const int32_t slot =
+        (pair_idx / max_rep) % topk;
+    const int32_t replica_idx =
+        pair_idx % max_rep;
+
+    const int32_t logical_id =
+        topk_ids[token_idx * topk + slot];
+    const int32_t rc = static_cast<int32_t>(
+        config->logical_replica_count[logical_id]);
+    if (replica_idx >= rc) continue;
+
+    const int32_t phys_id =
+        config->logical_to_physical_map[
+            logical_id * max_rep + replica_idx];
+    const int32_t dest_rank = phys_id / epr;
+
+    if (dest_rank < 0 || dest_rank >= ws) continue;
+    if (!config->remote_dispatch_offsets[dest_rank] ||
+        !config->remote_dispatch_recv[dest_rank] ||
+        !config->remote_dispatch_meta[dest_rank])
+      continue;
+
+    // Atomically claim a write position.
+    __shared__ int32_t s_write_pos;
+    if (threadIdx.x == 0) {
+      s_write_pos = atomicAdd(
+          config->remote_dispatch_offsets[dest_rank],
+          1);
+    }
+    __syncthreads();
+    const int32_t write_pos = s_write_pos;
+    if (write_pos >= config->max_recv) continue;
+
+    // Write token data to remote dispatch_recv.
+    T* dest_data = reinterpret_cast<T*>(
+        config->remote_dispatch_recv[dest_rank]);
+    const T* src_data = input + token_idx * K;
+    for (int32_t k = threadIdx.x; k < K;
+         k += blockDim.x) {
+      dest_data[write_pos * K + k] = src_data[k];
+    }
+
+    // Write metadata (LOGICAL expert_id).
+    if (threadIdx.x == 0) {
+      TokenMetadata* dest_meta =
+          reinterpret_cast<TokenMetadata*>(
+              config->remote_dispatch_meta[dest_rank]);
+      dest_meta[write_pos].source_rank = rank;
+      dest_meta[write_pos].source_token_idx =
+          token_idx;
+      dest_meta[write_pos].expert_id = logical_id;
+      dest_meta[write_pos].topk_weight =
+          topk_weights[token_idx * topk + slot];
+    }
+
+    // Push-based all-reduce: atomicAdd to ALL peers'
+    // expert_counts buffers (once per (token,slot)).
+    if (replica_idx == 0 && threadIdx.x == 0) {
+      for (int32_t r = 0; r < ws; r++) {
+        atomicAdd(
+            &config->remote_expert_counts[r][
+                logical_id],
+            1);
+      }
+    }
+
+    __threadfence_system();
+  }
+
+  // ---- Phase B: P2P barrier (RESET_COMBINE) ----
+  // Shared barrier covers dispatch data writes AND
+  // remote expert_counts atomicAdds.
+  FlagType expected =
+      config->self_signals->counter + 1;
+
+  if (blockIdx.x == 0) {
+    const int32_t tid = threadIdx.x;
+
+    // Reset combine offset (thread 0).
+    if (tid == 0) {
+      if (config->remote_combine_offsets[rank])
+        *config->remote_combine_offsets[rank] = 0;
+    }
+
+    __threadfence_system();
+
+    if (tid < ws) {
+      dc_st_flag_release(
+          &config->peer_signals[tid]->flags[rank],
+          expected);
+      while (dc_ld_flag_acquire(
+          &config->self_signals->flags[tid])
+              != expected)
+        ;
+    }
+
+    __syncthreads();
+
+    if (tid == 0) {
+      dc_st_flag_release(
+          &config->self_signals->counter,
+          expected);
+    }
+  } else {
+    if (threadIdx.x == 0) {
+      while (dc_ld_flag_acquire(
+          &config->self_signals->counter)
+              != expected)
+        ;
+    }
+    __syncthreads();
+  }
+
+  // ---- Phase C: Deterministic router (block 0) ----
+  if (blockIdx.x == 0) {
+    // Read global expert counts from local buffer
+    // (already has sum from push all-reduce).
+    int32_t* expert_counts =
+        config->remote_expert_counts[rank];
+
+    // Initialize shared memory.
+    for (int32_t e = threadIdx.x; e < NL;
+         e += blockDim.x) {
+      routing_selection_smem[e] = -1;
+    }
+    for (int32_t r = threadIdx.x; r < ws;
+         r += blockDim.x) {
+      rank_active_counts[r] = 0;
+    }
+    __syncthreads();
+
+    // Sequential routing (thread 0 only).
+    // Process experts in ascending order for
+    // determinism across all ranks.
+    if (threadIdx.x == 0) {
+      for (int32_t e = 0; e < NL; e++) {
+        const int32_t count = expert_counts[e];
+        if (count == 0) continue;
+
+        int32_t rc = static_cast<int32_t>(
+            config->logical_replica_count[e]);
+        if (rc <= 0) continue;
+        if (rc > max_rep) rc = max_rep;
+
+        if (rc == 1) {
+          const int32_t phys =
+              config->logical_to_physical_map[
+                  e * max_rep];
+          routing_selection_smem[e] = phys;
+          rank_active_counts[phys / epr] += count;
+          continue;
+        }
+
+        // Multiple replicas: pick minimum-loaded rank
+        // (ties: lower rank for determinism).
+        int32_t best_phys = -1;
+        int32_t best_rank = -1;
+        int32_t best_cost = INT_MAX;
+        for (int32_t i = 0; i < rc; i++) {
+          const int32_t phys =
+              config->logical_to_physical_map[
+                  e * max_rep + i];
+          const int32_t r = phys / epr;
+          const int32_t c = rank_active_counts[r];
+          if (c < best_cost ||
+              (c == best_cost && r < best_rank)) {
+            best_cost = c;
+            best_rank = r;
+            best_phys = phys;
+          }
+        }
+        routing_selection_smem[e] = best_phys;
+        rank_active_counts[best_rank] += count;
+      }
+    }
+    __syncthreads();
+
+    // Write routing_selection to global memory.
+    for (int32_t e = threadIdx.x; e < NL;
+         e += blockDim.x) {
+      config->routing_selection[e] =
+          routing_selection_smem[e];
+    }
+    __threadfence();
+
+    // Signal routing complete.
+    if (threadIdx.x == 0) {
+      dc_st_flag_release(
+          config->routing_ready_flag,
+          static_cast<int32_t>(rf_expected));
+    }
+  } else {
+    // Other blocks: spin until routing complete.
+    if (threadIdx.x == 0) {
+      while (dc_ld_flag_acquire(
+          reinterpret_cast<FlagType*>(
+              config->routing_ready_flag))
+              != static_cast<FlagType>(rf_expected))
+        ;
+    }
+    __syncthreads();
+    __threadfence();
+  }
+
+  // ---- Phase D: Filter + stamp/zero + metadata ----
+  int32_t actual =
+      *config->remote_dispatch_offsets[rank];
+  if (actual > config->max_recv)
+    actual = config->max_recv;
+
+  for (int32_t idx = blockIdx.x; idx < mc;
+       idx += gridDim.x) {
+    if (idx < actual) {
+      if (threadIdx.x == 0) {
+        TokenMetadata* meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_dispatch_meta[rank]);
+        const int32_t logical_id =
+            meta[idx].expert_id;
+        const int32_t selected_phys =
+            config->routing_selection[logical_id];
+        const int32_t selected_rank =
+            selected_phys / epr;
+
+        if (selected_rank == rank) {
+          // KEEP: this token's replica is local.
+          expert_topk_ids[idx] =
+              static_cast<int64_t>(selected_phys);
+          expert_topk_weights[idx] =
+              meta[idx].topk_weight;
+          if (selected_phys >= 0 &&
+              selected_phys < num_physical_experts) {
+            atomicAdd(
+                &expert_num_tokens[selected_phys],
+                1);
+          }
+        } else {
+          // FILTER: not our replica.
+          expert_topk_ids[idx] =
+              static_cast<int64_t>(
+                  num_physical_experts);
+          expert_topk_weights[idx] = 0.0f;
+          meta[idx].topk_weight = 0.0f;
+        }
+      }
+    } else {
+      // Stale entry: zero data + stamp sentinel.
+      T* dest = dispatch_recv + idx * K;
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        dest[k] = T(0);
+      }
+      if (threadIdx.x == 0) {
+        TokenMetadata* meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_dispatch_meta[rank]);
+        meta[idx].source_rank = 0;
+        meta[idx].source_token_idx = 0;
+        meta[idx].expert_id = num_physical_experts;
+        meta[idx].topk_weight = 0.0f;
+        expert_topk_ids[idx] =
+            static_cast<int64_t>(
+                num_physical_experts);
+        expert_topk_weights[idx] = 0.0f;
+      }
+    }
+  }
+}
+
+// Host-callable wrapper for fused dispatch+route+filter.
+void dispatch_and_route(
+    torch::Tensor input,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    torch::Tensor dispatch_recv,
+    torch::Tensor expert_topk_ids,
+    torch::Tensor expert_topk_weights,
+    torch::Tensor expert_num_tokens,
+    torch::Tensor expert_counts,
+    torch::Tensor config_tensor,
+    int64_t M, int64_t K, int64_t topk,
+    int64_t mc,
+    int64_t num_physical_experts,
+    int64_t num_logical_experts,
+    int64_t world_size);
 
 }  // namespace dispatch_combine
 }  // namespace vllm

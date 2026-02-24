@@ -517,5 +517,107 @@ torch::Tensor wrap_cuda_ptr(
       {dim0, dim1}, options);
 }
 
+// ====================================================================
+// Fused dispatch + route + filter (integrated EPLB)
+// ====================================================================
+
+void dispatch_and_route(
+    torch::Tensor input,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    torch::Tensor dispatch_recv,
+    torch::Tensor expert_topk_ids,
+    torch::Tensor expert_topk_weights,
+    torch::Tensor expert_num_tokens,
+    torch::Tensor expert_counts,
+    torch::Tensor config_tensor,
+    int64_t M, int64_t K, int64_t topk,
+    int64_t mc,
+    int64_t num_physical_experts,
+    int64_t num_logical_experts,
+    int64_t world_size) {
+
+  if (M == 0) return;
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  DispatchCombineConfig* config =
+      reinterpret_cast<DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+
+  const int32_t M32 = static_cast<int32_t>(M);
+  const int32_t K32 = static_cast<int32_t>(K);
+  const int32_t topk32 = static_cast<int32_t>(topk);
+  const int32_t mc32 = static_cast<int32_t>(mc);
+  const int32_t ne32 =
+      static_cast<int32_t>(num_physical_experts);
+  const int32_t NL =
+      static_cast<int32_t>(num_logical_experts);
+  const int32_t ws =
+      static_cast<int32_t>(world_size);
+
+  // Zero expert_num_tokens (atomicAdd target).
+  cudaMemsetAsync(
+      expert_num_tokens.data_ptr(), 0,
+      num_physical_experts * sizeof(int32_t), stream);
+
+  // Zero local expert_counts buffer (receives remote
+  // atomicAdds from all ranks during push all-reduce).
+  // Passed as a tensor to avoid host-side dereference
+  // of device config pointer (CUDA graph compatible).
+  if (NL > 0) {
+    cudaMemsetAsync(
+        expert_counts.data_ptr(), 0,
+        NL * sizeof(int32_t), stream);
+  }
+
+  // Shared memory: routing_selection_smem[NL]
+  //              + rank_active_counts[world_size]
+  size_t shared_bytes = static_cast<size_t>(
+      (NL + ws) * sizeof(int32_t));
+
+  int32_t grid_sz = mc32;
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  if (grid_sz < 1) grid_sz = 1;
+  dim3 grid(grid_sz);
+  dim3 block(kBlockSize);
+
+  AT_DISPATCH_SWITCH(
+      input.scalar_type(), "dispatch_and_route",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          dispatch_and_route_kernel<__nv_bfloat16>
+              <<<grid, block, shared_bytes, stream>>>(
+              reinterpret_cast<const __nv_bfloat16*>(
+                  input.data_ptr()),
+              topk_ids.data_ptr<int32_t>(),
+              topk_weights.data_ptr<float>(),
+              reinterpret_cast<__nv_bfloat16*>(
+                  dispatch_recv.data_ptr()),
+              expert_topk_ids.data_ptr<int64_t>(),
+              expert_topk_weights.data_ptr<float>(),
+              expert_num_tokens.data_ptr<int32_t>(),
+              config, M32, K32, topk32,
+              mc32, ne32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          dispatch_and_route_kernel<__half>
+              <<<grid, block, shared_bytes, stream>>>(
+              reinterpret_cast<const __half*>(
+                  input.data_ptr()),
+              topk_ids.data_ptr<int32_t>(),
+              topk_weights.data_ptr<float>(),
+              reinterpret_cast<__half*>(
+                  dispatch_recv.data_ptr()),
+              expert_topk_ids.data_ptr<int64_t>(),
+              expert_topk_weights.data_ptr<float>(),
+              expert_num_tokens.data_ptr<int32_t>(),
+              config, M32, K32, topk32,
+              mc32, ne32);
+        })
+  );
+}
+
 }  // namespace dispatch_combine
 }  // namespace vllm

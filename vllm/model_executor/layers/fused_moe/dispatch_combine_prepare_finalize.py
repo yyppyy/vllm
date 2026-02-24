@@ -50,6 +50,7 @@ class DispatchCombinePrepareAndFinalize(
         rank: int,
         world_size: int,
         rank_expert_offset: int,
+        use_integrated_routing: bool = False,
     ):
         super().__init__()
         self.p2p_manager = p2p_manager
@@ -62,6 +63,10 @@ class DispatchCombinePrepareAndFinalize(
         self.rank_expert_offset = rank_expert_offset
         self.experts_per_rank = num_experts // world_size
         self.max_recv = p2p_manager.max_recv
+        self.use_integrated_routing = (
+            use_integrated_routing)
+        # Set by layer.py when integrated routing is on.
+        self.expert_load_view = None
 
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
@@ -96,13 +101,6 @@ class DispatchCombinePrepareAndFinalize(
         M, K = a1.shape
         topk = topk_ids.size(1)
 
-        # Per-batch tight bound: M tokens * topk experts.
-        # Stored on self for _finalize to read. During
-        # CUDA graph capture this Python assignment runs
-        # once; during replay only recorded CUDA ops run.
-        self._mc = min(
-            M * self.experts_per_token, self.max_recv)
-
         if apply_router_weight_on_input:
             assert topk == 1, (
                 "apply_router_weight_on_input only "
@@ -110,6 +108,19 @@ class DispatchCombinePrepareAndFinalize(
             a1 = a1 * topk_weights.to(a1.dtype)
 
         mgr = self.p2p_manager
+
+        if self.use_integrated_routing:
+            return self._prepare_integrated(
+                a1, topk_weights, topk_ids,
+                num_experts, expert_map,
+                quant_config, M, K, topk)
+
+        # Per-batch tight bound: M tokens * topk experts.
+        # Stored on self for _finalize to read. During
+        # CUDA graph capture this Python assignment runs
+        # once; during replay only recorded CUDA ops run.
+        self._mc = min(
+            M * self.experts_per_token, self.max_recv)
 
         # Step 1: Launch dispatch P2P kernel.
         # No pre-dispatch barrier needed: dispatch_offset
@@ -137,6 +148,61 @@ class DispatchCombinePrepareAndFinalize(
          expert_num_tokens) = (
             mgr.gpu_prepare_dispatch_recv(
                 self._mc, num_experts))
+
+        return lambda: self._receiver(
+            a1, K, num_experts, quant_config,
+            expert_map, expert_topk_ids,
+            expert_topk_weights, expert_num_tokens)
+
+    def _prepare_integrated(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: Optional[torch.Tensor],
+        quant_config: FusedMoEQuantConfig,
+        M: int,
+        K: int,
+        topk: int,
+    ) -> mk.ReceiverType:
+        """Integrated routing path: fused dispatch + route.
+
+        topk_ids contain LOGICAL expert IDs. The fused
+        kernel broadcasts tokens to all replica-holding
+        ranks, performs push-based all-reduce of per-expert
+        counts, runs deterministic routing, and filters
+        tokens in a single kernel launch.
+        """
+        mgr = self.p2p_manager
+
+        # Broadcast dispatch: each (token, expert) pair
+        # goes to ALL replicas. mc must account for the
+        # expanded volume.
+        max_replicas = mgr._max_replicas
+        self._mc = min(
+            M * self.experts_per_token * max_replicas,
+            self.max_recv)
+
+        topk_ids_i32 = topk_ids.to(torch.int32)
+        topk_weights_f32 = topk_weights.to(torch.float32)
+
+        # Single fused kernel: dispatch + all-reduce +
+        # barrier + route + filter.
+        (expert_topk_ids,
+         expert_topk_weights,
+         expert_num_tokens) = (
+            mgr.gpu_dispatch_and_route(
+                a1, topk_ids_i32, topk_weights_f32,
+                self._mc, M, K, topk,
+                num_experts))
+
+        # Record per-physical-expert load for EPLB
+        # rebalancing. expert_num_tokens already has
+        # physical expert counts from the fused kernel.
+        elv = getattr(self, 'expert_load_view', None)
+        if elv is not None:
+            elv.add_(expert_num_tokens.to(elv.dtype))
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,

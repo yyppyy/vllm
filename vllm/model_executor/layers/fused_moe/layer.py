@@ -599,6 +599,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         zero_expert_num = getattr(layer, 'zero_expert_num', 0)
         zero_expert_type = getattr(layer, 'zero_expert_type', None)
 
+        # When integrated routing is active, skip
+        # pre-dispatch EPLB mapping — the fused dispatch
+        # kernel handles routing internally with global
+        # demand visibility.
+        _ir = (enable_eplb
+               and self.fused_experts is not None
+               and hasattr(
+                   self.fused_experts, 'prepare_finalize')
+               and getattr(
+                   self.fused_experts.prepare_finalize,
+                   'use_integrated_routing', False))
+        eplb_for_select = enable_eplb and not _ir
+
         topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -612,7 +625,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype,
-            enable_eplb=enable_eplb,
+            enable_eplb=eplb_for_select,
             expert_map=expert_map,
             expert_load_view=expert_load_view,
             logical_to_physical_map=logical_to_physical_map,
@@ -1706,6 +1719,65 @@ class FusedMoE(CustomOp):
         self.expert_load_view = expert_load_view[moe_layer_idx]
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
+
+        # Init/update integrated routing for
+        # dispatch_combine + EPLB.
+        self._maybe_init_integrated_routing()
+
+    def _maybe_init_integrated_routing(self):
+        """Init/update integrated routing on p2p_manager.
+
+        Called from set_eplb_state() when dispatch_combine
+        backend is used with EPLB and mem_bound_aware_routing
+        is enabled. Routes routing decisions into the fused
+        dispatch kernel instead of doing pre-dispatch EPLB
+        mapping on host.
+
+        When mem_bound_aware_routing is not set, EPLB uses
+        the normal dispatch_combine path with pre-dispatch
+        logical-to-physical mapping.
+        """
+        # Only activate when mem_bound_aware_routing is
+        # explicitly requested (e.g. "greedy").
+        mbr = self.moe_parallel_config.mem_bound_aware_routing
+        if not mbr:
+            return
+
+        pf = self._get_prepare_finalize()
+        if pf is None:
+            return
+        if not isinstance(
+                pf, DispatchCombinePrepareAndFinalize):
+            return
+
+        ltp = self.logical_to_physical_map
+        lrc = self.logical_replica_count
+        if ltp is None or lrc is None:
+            return
+
+        mgr = pf.p2p_manager
+        NL = ltp.shape[0]
+        max_replicas = ltp.shape[1]
+        epr = pf.experts_per_rank
+
+        # Allocate IPC buffers (idempotent).
+        mgr.init_integrated_routing(
+            NL, max_replicas, epr)
+        # Push latest routing tables to GPU.
+        mgr.update_routing_tables(ltp, lrc)
+
+        pf.use_integrated_routing = True
+        pf.expert_load_view = self.expert_load_view
+
+    def _get_prepare_finalize(self):
+        """Get the PrepareAndFinalize from quant_method."""
+        qm = getattr(self, 'quant_method', None)
+        if qm is None:
+            return None
+        fe = getattr(qm, 'fused_experts', None)
+        if fe is None:
+            return None
+        return getattr(fe, 'prepare_finalize', None)
 
     def ensure_moe_quant_config(self):
         if self.quant_method.moe_quant_config is None:

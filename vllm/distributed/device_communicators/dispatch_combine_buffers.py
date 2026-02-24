@@ -121,6 +121,20 @@ class DispatchCombineP2PManager:
         self._cuda_rt.cudaMemset(
             self._raw_signals, 0, self._signal_bytes)
 
+        # Integrated routing buffers (EPLB).
+        # Allocated lazily; set to None until
+        # init_integrated_routing() is called.
+        self._raw_expert_counts = None
+        self._raw_routing_selection = None
+        self._raw_routing_ready_flag = None
+        self._routing_map_tensor = None
+        self._routing_count_tensor = None
+        self._num_logical_experts = 0
+        self._max_replicas = 0
+        self._physical_experts_per_rank = 0
+        self.remote_expert_counts_ptrs = []
+        self._integrated_routing_enabled = False
+
         # Exchange CUDA IPC handles for P2P access.
         self._setup_p2p_mappings()
 
@@ -363,6 +377,51 @@ class DispatchCombineP2PManager:
         data += struct.pack('i', self.max_num_tokens)
         data += struct.pack('i', self.max_recv)
 
+        # ---- Integrated routing fields (EPLB) ----
+        # remote_expert_counts[kMaxRanks]
+        for r in range(max_ranks):
+            ptr = (self.remote_expert_counts_ptrs[r]
+                   if (self._integrated_routing_enabled
+                       and r < self.world_size)
+                   else 0)
+            data += struct.pack('Q', ptr)
+
+        # logical_to_physical_map (1 pointer)
+        ptr = (self._routing_map_tensor.data_ptr()
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
+        # logical_replica_count (1 pointer)
+        ptr = (self._routing_count_tensor.data_ptr()
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
+        # routing_selection (1 pointer)
+        ptr = (self._raw_routing_selection.value
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
+        # Scalars for integrated routing
+        data += struct.pack(
+            'i', self._num_logical_experts)
+        data += struct.pack(
+            'i', self._max_replicas)
+        data += struct.pack(
+            'i', self._physical_experts_per_rank)
+
+        # 4 bytes padding for 8-byte alignment of
+        # routing_ready_flag pointer
+        data += struct.pack('i', 0)
+
+        # routing_ready_flag (1 pointer)
+        ptr = (self._raw_routing_ready_flag.value
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
             bytearray(config_bytes), dtype=torch.uint8
@@ -524,6 +583,168 @@ class DispatchCombineP2PManager:
             .p2p_barrier_reset_combine_offset(
                 self.config_tensor)
 
+    # ================================================================
+    # Integrated routing (EPLB) support
+    # ================================================================
+
+    def init_integrated_routing(
+        self,
+        num_logical_experts: int,
+        max_replicas: int,
+        physical_experts_per_rank: int,
+    ):
+        """Allocate buffers for integrated routing.
+
+        Must be called before gpu_dispatch_and_route().
+        Exchanges IPC handles for expert_counts buffer
+        so all ranks can push atomicAdds.
+        """
+        if self._integrated_routing_enabled:
+            return
+
+        self._num_logical_experts = num_logical_experts
+        self._max_replicas = max_replicas
+        self._physical_experts_per_rank = (
+            physical_experts_per_rank)
+
+        cuda_rt = self._cuda_rt
+        dev = f'cuda:{self._device}'
+
+        # Expert counts buffer (IPC-shared for push
+        # all-reduce via remote atomicAdd).
+        ec_bytes = num_logical_experts * 4
+        self._raw_expert_counts = (
+            cuda_rt.cudaMalloc(ec_bytes))
+        cuda_rt.cudaMemset(
+            self._raw_expert_counts, 0, ec_bytes)
+
+        # Routing selection buffer (local only).
+        rs_bytes = num_logical_experts * 4
+        self._raw_routing_selection = (
+            cuda_rt.cudaMalloc(rs_bytes))
+        cuda_rt.cudaMemset(
+            self._raw_routing_selection, 0, rs_bytes)
+
+        # Routing ready flag (local only, 4 bytes).
+        self._raw_routing_ready_flag = (
+            cuda_rt.cudaMalloc(4))
+        cuda_rt.cudaMemset(
+            self._raw_routing_ready_flag, 0, 4)
+
+        # Routing tables (GPU tensors, updated on
+        # EPLB rebalance).
+        self._routing_map_tensor = torch.zeros(
+            num_logical_experts * max_replicas,
+            dtype=torch.int32, device=dev)
+        self._routing_count_tensor = torch.zeros(
+            num_logical_experts,
+            dtype=torch.int64, device=dev)
+
+        # Exchange IPC handles for expert_counts.
+        to_bytes = self._handle_to_bytes
+        local_ec_handle = to_bytes(
+            cuda_rt.cudaIpcGetMemHandle(
+                self._raw_expert_counts))
+        all_ec_handles = [None] * self.world_size
+        dist.all_gather_object(
+            all_ec_handles, local_ec_handle,
+            group=self.cpu_group)
+
+        from_bytes = self._bytes_to_handle
+        self.remote_expert_counts_ptrs = []
+        for r in range(self.world_size):
+            if r == self.rank:
+                self.remote_expert_counts_ptrs.append(
+                    self._raw_expert_counts.value)
+            else:
+                ptr = cuda_rt.cudaIpcOpenMemHandle(
+                    from_bytes(all_ec_handles[r]))
+                self.remote_expert_counts_ptrs.append(
+                    ptr.value)
+
+        # Wrap local expert_counts as a non-owning tensor
+        # for cudaMemsetAsync in the host wrapper (avoids
+        # host-side dereference of device config pointer,
+        # required for CUDA graph compatibility).
+        ct = self.config_tensor  # dummy for device
+        self._expert_counts_tensor = (
+            torch.ops._C_dispatch_combine.wrap_cuda_ptr(
+                ct, self._raw_expert_counts.value,
+                num_logical_experts, 1, 2))  # int32
+
+        # Rebuild config tensor with new fields.
+        self.config_tensor = (
+            self._build_config_tensor())
+
+        self._integrated_routing_enabled = True
+
+        logger.info(
+            "Integrated routing initialized: "
+            "NL=%d, max_replicas=%d, epr=%d",
+            num_logical_experts, max_replicas,
+            physical_experts_per_rank)
+
+    def update_routing_tables(
+        self,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ):
+        """Update GPU-resident routing tables.
+
+        Called when EPLB rebalances expert placement.
+        """
+        assert self._integrated_routing_enabled
+        # logical_to_physical_map: (NL, max_replicas)
+        self._routing_map_tensor.copy_(
+            logical_to_physical_map.to(
+                torch.int32).reshape(-1))
+        self._routing_count_tensor.copy_(
+            logical_replica_count.to(torch.int64))
+
+    def gpu_dispatch_and_route(
+        self,
+        input_tensor: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        mc: int,
+        M: int,
+        K: int,
+        topk: int,
+        num_experts: int,
+    ):
+        """Launch the fused dispatch+route+filter kernel.
+
+        Returns (expert_topk_ids, expert_topk_weights,
+                 expert_num_tokens) sliced to mc.
+        """
+        assert self._integrated_routing_enabled
+        if self.expert_num_tokens_buf is None:
+            self.init_prepare_buffers(num_experts)
+
+        torch.ops._C_dispatch_combine\
+            .dispatch_and_route(
+                input_tensor,
+                topk_ids,
+                topk_weights,
+                self.dispatch_recv_tensor,
+                self.expert_topk_ids_buf,
+                self.expert_topk_weights_buf,
+                self.expert_num_tokens_buf,
+                self._expert_counts_tensor,
+                self.config_tensor,
+                M, K, topk, mc,
+                num_experts,
+                self._num_logical_experts,
+                self.world_size)
+
+        return (
+            self.expert_topk_ids_buf[:mc]
+            .unsqueeze(1),
+            self.expert_topk_weights_buf[:mc]
+            .unsqueeze(1),
+            self.expert_num_tokens_buf,
+        )
+
     def destroy(self):
         """Release cudaMalloc'd buffers."""
         self._cuda_rt.cudaFree(self._raw_dispatch_recv)
@@ -533,3 +754,12 @@ class DispatchCombineP2PManager:
         self._cuda_rt.cudaFree(self._raw_combine_meta)
         self._cuda_rt.cudaFree(self._raw_combine_offset)
         self._cuda_rt.cudaFree(self._raw_signals)
+        if self._raw_expert_counts is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_expert_counts)
+        if self._raw_routing_selection is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_routing_selection)
+        if self._raw_routing_ready_flag is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_routing_ready_flag)

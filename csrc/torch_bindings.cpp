@@ -937,6 +937,26 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
   dc.impl("scatter_add_direct", torch::kCUDA,
           &vllm::dispatch_combine::
               scatter_add_direct);
+
+  // Fused dispatch + route + filter (integrated EPLB)
+  dc.def(
+      "dispatch_and_route("
+      "Tensor input, "
+      "Tensor topk_ids, "
+      "Tensor topk_weights, "
+      "Tensor! dispatch_recv, "
+      "Tensor! expert_topk_ids, "
+      "Tensor! expert_topk_weights, "
+      "Tensor! expert_num_tokens, "
+      "Tensor! expert_counts, "
+      "Tensor config_tensor, "
+      "int M, int K, int topk, "
+      "int mc, int num_physical_experts, "
+      "int num_logical_experts, "
+      "int world_size) -> ()");
+  dc.impl("dispatch_and_route", torch::kCUDA,
+          &vllm::dispatch_combine::
+              dispatch_and_route);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
