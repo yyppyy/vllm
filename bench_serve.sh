@@ -47,7 +47,7 @@ args=(
 if (( USE_EP > 0 )); then
   args+=( --enable-expert-parallel )
   args+=( --enable-eplb )
-  EPLB_STEP=$((3 * NUM_PROMPTS))
+  EPLB_STEP=$((1 * NUM_PROMPTS))
   args+=( --eplb-config "{\"window_size\":${EPLB_STEP},\"step_interval\":${EPLB_STEP},\"num_redundant_experts\":${NUM_REPLICAS},\"max_rearrangements\":1}" )
   if (( MEM_BOUND_ROUTING > 0 )); then
     args+=( --mem-bound-aware-routing greedy )
@@ -86,7 +86,7 @@ fi
 
 ################ client #################
 
-WARMUP_PROMPTS=$((4 * NUM_PROMPTS))
+WARMUP_PROMPTS=$((1 * NUM_PROMPTS))
 
 # Warmup run: EPLB rebalances during these requests (results discarded)
 warmup_args=(
