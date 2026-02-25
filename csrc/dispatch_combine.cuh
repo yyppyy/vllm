@@ -125,6 +125,13 @@ struct DispatchCombineConfig {
   // counter == base + gridDim.x before entering the
   // P2P barrier. Monotonic for CUDA graph replay.
   FlagType* phase_a_done_counter;
+
+  // Local expert counts buffer for batched all-reduce.
+  // Each block atomicAdds its shared-mem counts here;
+  // block 0 reads the aggregate and pushes to all ranks'
+  // remote_expert_counts in one pass (after grid-wide sync).
+  // Zeroed by Phase E; first invocation by cudaMemset.
+  int32_t* local_expert_counts;  // [NL]
 };
 
 // ====================================================================
@@ -883,8 +890,9 @@ __global__ void dispatch_and_route_kernel(
   const int32_t NL = config->num_logical_experts;
 
   // Shared memory layout (reused across phases):
-  // Phase A: s_grp_dest[ws] + s_grp_count[ws]
-  //        + s_ent_lid[64] + s_ent_wt[64] + s_ent_grp[64]
+  // Phase A: s_expert_counts[NL] + s_grp_dest[ws]
+  //        + s_grp_count[ws] + s_ent_lid[64]
+  //        + s_ent_wt[64] + s_ent_grp[64]
   // Phase C: routing_selection_smem[NL]
   //        + rank_active_counts[ws]
   // Phases don't overlap, so same memory is reused.
@@ -913,26 +921,38 @@ __global__ void dispatch_and_route_kernel(
   rf_expected = s_rf_expected;
   pa_base = s_pa_base;
 
-  // ---- Phase A: Broadcast dispatch + push all-reduce ----
+  // ---- Phase A: Broadcast dispatch + batched all-reduce ----
   // Per-token loop: group (slot, replica) by dest_rank to
   // write token data ONCE per unique (token, dest_rank).
+  // Expert counts accumulated in shared memory, flushed to
+  // local device buffer after loop, pushed to all ranks by
+  // block 0 after grid-wide sync.
   // Reuses extern shared[] (Phase C only runs after barrier).
   constexpr int32_t kMaxEntries = 64;  // topk * max_rep
-  int32_t* s_grp_dest  = shared;              // [ws]
-  int32_t* s_grp_count = shared + ws;         // [ws]
-  int32_t* s_ent_lid   = shared + 2 * ws;     // [kMaxEntries]
+  int32_t* s_expert_counts = shared;              // [NL]
+  int32_t* s_grp_dest  = shared + NL;             // [ws]
+  int32_t* s_grp_count = shared + NL + ws;        // [ws]
+  int32_t* s_ent_lid   = shared + NL + 2 * ws;    // [kMaxEntries]
   float*   s_ent_wt    = reinterpret_cast<float*>(
-      s_ent_lid + kMaxEntries);               // [kMaxEntries]
+      s_ent_lid + kMaxEntries);                    // [kMaxEntries]
   int32_t* s_ent_grp   = reinterpret_cast<int32_t*>(
-      s_ent_wt + kMaxEntries);                // [kMaxEntries]
+      s_ent_wt + kMaxEntries);                     // [kMaxEntries]
 
   __shared__ int32_t s_num_groups;
   __shared__ int32_t s_total_entries;
   __shared__ int32_t s_grp_base[64];   // claimed write_pos
 
+  // Step 0: Zero shared expert counts (persistent across
+  // all token iterations; flushed to device mem after loop).
+  for (int32_t e = threadIdx.x; e < NL;
+       e += blockDim.x) {
+    s_expert_counts[e] = 0;
+  }
+  __syncthreads();
+
   for (int32_t t = blockIdx.x; t < M; t += gridDim.x) {
     // Step 1: Thread 0 scans slots+replicas, groups by
-    // dest_rank, pushes all-reduce (once per slot).
+    // dest_rank, accumulates expert counts in shared mem.
     if (threadIdx.x == 0) {
       s_num_groups = 0;
       s_total_entries = 0;
@@ -940,12 +960,8 @@ __global__ void dispatch_and_route_kernel(
         int32_t lid = topk_ids[t * topk + slot];
         if (lid < 0 || lid >= NL) continue;
 
-        // All-reduce push: once per (token, slot).
-        for (int32_t r = 0; r < ws; r++) {
-          atomicAdd(
-              &config->remote_expert_counts[r][lid],
-              1);
-        }
+        // Local count (shared mem, ~1 cycle).
+        s_expert_counts[lid]++;
 
         int32_t rc = static_cast<int32_t>(
             config->logical_replica_count[lid]);
@@ -1038,22 +1054,23 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();  // before next token overwrites smem
   }
 
+  // Flush shared-mem expert counts to local device buffer.
+  // All blocks contribute; local_expert_counts accumulates
+  // this rank's total expert counts for the batch push.
+  for (int32_t e = threadIdx.x; e < NL;
+       e += blockDim.x) {
+    int32_t count = s_expert_counts[e];
+    if (count > 0) {
+      atomicAdd(&config->local_expert_counts[e],
+                count);
+    }
+  }
+
   // ---- Grid-wide sync: wait for ALL blocks to finish
   //      Phase A before block 0 enters P2P barrier. ----
-  // Without this, block 0 could signal peers while other
-  // blocks are still writing dispatch data to remote bufs.
-  //
-  // Three barriers needed:
-  // 1. __syncthreads(): all threads in this block are done
-  //    with Phase A loop (writes are in L1/L2).
-  // 2. __threadfence_system(): each thread flushes its own
-  //    prior writes so they're visible to all devices.
-  // 3. __syncthreads(): wait for ALL threads to complete
-  //    their fence before thread 0 increments the counter.
-  //    Without this, thread 0 could atomicAdd before
-  //    thread 255 finishes flushing, so block 0 would
-  //    see the counter and proceed while some writes are
-  //    still in-flight.
+  // Covers dispatch data writes + local_expert_counts
+  // flushes. Block 0 then pushes aggregated counts to
+  // all remote ranks before the P2P barrier.
   __syncthreads();
   __threadfence_system();
   __syncthreads();
@@ -1070,11 +1087,29 @@ __global__ void dispatch_and_route_kernel(
         ;
     }
     __syncthreads();
+
+    // Batch all-reduce push: block 0 reads aggregated
+    // local counts and pushes to ALL ranks' buffers.
+    // P2P barrier's __threadfence_system() will make
+    // these writes visible to peers.
+    for (int32_t e = threadIdx.x; e < NL;
+         e += blockDim.x) {
+      int32_t count =
+          config->local_expert_counts[e];
+      if (count > 0) {
+        for (int32_t r = 0; r < ws; r++) {
+          atomicAdd(
+              &config->remote_expert_counts[r][e],
+              count);
+        }
+      }
+    }
+    __syncthreads();
   }
 
   // ---- Phase B: P2P barrier (RESET_COMBINE) ----
   // Shared barrier covers dispatch data writes AND
-  // remote expert_counts atomicAdds.
+  // remote expert_counts batch push.
   FlagType expected =
       config->self_signals->counter + 1;
 
@@ -1307,21 +1342,22 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 
-  // ---- Phase E: Zero expert_counts for next invocation ----
+  // ---- Phase E: Zero counts for next invocation ----
   // Must happen AFTER Phase C reads the counts and AFTER
   // Phase B barrier guarantees no more remote atomicAdds.
   // The next layer's combine barrier (RESET_DISPATCH)
   // includes __threadfence_system() which ensures this
   // zeroing is visible to all peers before they start
-  // the next dispatch_and_route Phase A atomicAdds.
-  // This avoids a race between host cudaMemsetAsync and
-  // remote ranks' Phase A writes.
+  // the next dispatch_and_route.
   {
-    int32_t* local_ec =
+    int32_t* remote_ec =
         config->remote_expert_counts[rank];
+    int32_t* local_ec =
+        config->local_expert_counts;
     for (int32_t e = blockIdx.x * blockDim.x + threadIdx.x;
          e < NL;
          e += gridDim.x * blockDim.x) {
+      remote_ec[e] = 0;
       local_ec[e] = 0;
     }
   }

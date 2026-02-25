@@ -568,12 +568,14 @@ void dispatch_and_route(
   // ranks' Phase A atomicAdds to this IPC buffer.
 
   // Shared memory: max of Phase A and Phase C needs.
-  // Phase A: 2*ws + 3*64 ints (grouping arrays).
+  // Phase A: NL + 2*ws + 3*64 ints (expert counts +
+  //   grouping arrays).
   // Phase C: NL + ws ints (routing + active counts).
   // Phases don't overlap, so same memory is reused.
   constexpr int32_t kMaxEntries = 64;
   size_t phase_a_bytes = static_cast<size_t>(
-      (2 * ws + 3 * kMaxEntries) * sizeof(int32_t));
+      (NL + 2 * ws + 3 * kMaxEntries)
+      * sizeof(int32_t));
   size_t phase_c_bytes = static_cast<size_t>(
       (NL + ws) * sizeof(int32_t));
   size_t shared_bytes = phase_a_bytes > phase_c_bytes

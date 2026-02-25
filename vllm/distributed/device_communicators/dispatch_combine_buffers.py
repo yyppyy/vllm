@@ -125,6 +125,7 @@ class DispatchCombineP2PManager:
         # Allocated lazily; set to None until
         # init_integrated_routing() is called.
         self._raw_expert_counts = None
+        self._raw_local_expert_counts = None
         self._raw_routing_selection = None
         self._raw_routing_ready_flag = None
         self._raw_phase_a_done_counter = None
@@ -430,6 +431,12 @@ class DispatchCombineP2PManager:
                else 0)
         data += struct.pack('Q', ptr)
 
+        # local_expert_counts (1 pointer)
+        ptr = (self._raw_local_expert_counts.value
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
             bytearray(config_bytes), dtype=torch.uint8
@@ -654,6 +661,17 @@ class DispatchCombineP2PManager:
         cuda_rt.cudaMemset(
             self._raw_phase_a_done_counter, 0, 4)
 
+        # Local expert counts buffer (local only).
+        # Batched all-reduce: blocks accumulate here,
+        # block 0 pushes aggregate to all ranks.
+        # Zeroed by Phase E; first invocation here.
+        lec_bytes = num_logical_experts * 4
+        self._raw_local_expert_counts = (
+            cuda_rt.cudaMalloc(lec_bytes))
+        cuda_rt.cudaMemset(
+            self._raw_local_expert_counts,
+            0, lec_bytes)
+
         # Routing tables (GPU tensors, updated on
         # EPLB rebalance).
         self._routing_map_tensor = torch.zeros(
@@ -793,3 +811,6 @@ class DispatchCombineP2PManager:
         if self._raw_phase_a_done_counter is not None:
             self._cuda_rt.cudaFree(
                 self._raw_phase_a_done_counter)
+        if self._raw_local_expert_counts is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_local_expert_counts)
