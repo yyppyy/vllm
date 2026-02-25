@@ -688,11 +688,13 @@ class DispatchCombineP2PManager:
                 ct, self._raw_expert_counts.value,
                 num_logical_experts, 1, 2))  # int32
 
+        # Enable flag BEFORE rebuild so _build_config_tensor
+        # packs the routing pointers (not NULL).
+        self._integrated_routing_enabled = True
+
         # Rebuild config tensor with new fields.
         self.config_tensor = (
             self._build_config_tensor())
-
-        self._integrated_routing_enabled = True
 
         logger.info(
             "Integrated routing initialized: "
