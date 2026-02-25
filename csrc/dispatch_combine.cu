@@ -530,6 +530,7 @@ void dispatch_and_route(
     torch::Tensor expert_topk_weights,
     torch::Tensor expert_num_tokens,
     torch::Tensor expert_counts,
+    torch::Tensor data_remap,
     torch::Tensor config_tensor,
     int64_t M, int64_t K, int64_t topk,
     int64_t mc,
@@ -566,10 +567,17 @@ void dispatch_and_route(
   // A host-side cudaMemsetAsync would race with remote
   // ranks' Phase A atomicAdds to this IPC buffer.
 
-  // Shared memory: routing_selection_smem[NL]
-  //              + rank_active_counts[world_size]
-  size_t shared_bytes = static_cast<size_t>(
+  // Shared memory: max of Phase A and Phase C needs.
+  // Phase A: 2*ws + 3*64 ints (grouping arrays).
+  // Phase C: NL + ws ints (routing + active counts).
+  // Phases don't overlap, so same memory is reused.
+  constexpr int32_t kMaxEntries = 64;
+  size_t phase_a_bytes = static_cast<size_t>(
+      (2 * ws + 3 * kMaxEntries) * sizeof(int32_t));
+  size_t phase_c_bytes = static_cast<size_t>(
       (NL + ws) * sizeof(int32_t));
+  size_t shared_bytes = phase_a_bytes > phase_c_bytes
+      ? phase_a_bytes : phase_c_bytes;
 
   int32_t grid_sz = mc32;
   if (grid_sz > kPersistentGrid)
@@ -593,6 +601,7 @@ void dispatch_and_route(
               expert_topk_ids.data_ptr<int64_t>(),
               expert_topk_weights.data_ptr<float>(),
               expert_num_tokens.data_ptr<int32_t>(),
+              data_remap.data_ptr<int32_t>(),
               config, M32, K32, topk32,
               mc32, ne32);
         })
@@ -609,6 +618,7 @@ void dispatch_and_route(
               expert_topk_ids.data_ptr<int64_t>(),
               expert_topk_weights.data_ptr<float>(),
               expert_num_tokens.data_ptr<int32_t>(),
+              data_remap.data_ptr<int32_t>(),
               config, M32, K32, topk32,
               mc32, ne32);
         })

@@ -195,7 +195,8 @@ class DispatchCombinePrepareAndFinalize(
         # barrier + route + filter.
         (expert_topk_ids,
          expert_topk_weights,
-         expert_num_tokens) = (
+         expert_num_tokens,
+         data_remap) = (
             mgr.gpu_dispatch_and_route(
                 a1, topk_ids_i32, topk_weights_f32,
                 self._mc, M, K, topk,
@@ -211,7 +212,8 @@ class DispatchCombinePrepareAndFinalize(
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,
             expert_map, expert_topk_ids,
-            expert_topk_weights, expert_num_tokens)
+            expert_topk_weights, expert_num_tokens,
+            data_remap)
 
     def _receiver(
         self,
@@ -223,12 +225,21 @@ class DispatchCombinePrepareAndFinalize(
         expert_topk_ids: torch.Tensor,
         expert_topk_weights: torch.Tensor,
         expert_num_tokens: torch.Tensor,
+        data_remap: Optional[torch.Tensor] = None,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
         mc = self._mc
 
         # Slice IPC-backed dispatch recv to mc.
         expert_x = mgr.dispatch_recv_tensor[:mc]
+
+        # Expand shared data for co-located expert dedup.
+        # Phase A writes token data once per (token,
+        # dest_rank) group; data_remap maps duplicate
+        # entries to their group leader's data row.
+        # Local HBM gather (~0.03ms), not NVLink.
+        if data_remap is not None:
+            expert_x = expert_x[data_remap]
 
         # Post-dispatch quantization.
         expert_x_scale = None

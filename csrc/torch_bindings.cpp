@@ -56,6 +56,7 @@ void dispatch_and_route(torch::Tensor input,
                         torch::Tensor expert_topk_weights,
                         torch::Tensor expert_num_tokens,
                         torch::Tensor expert_counts,
+                        torch::Tensor data_remap,
                         torch::Tensor config_tensor,
                         int64_t M, int64_t K, int64_t topk,
                         int64_t mc,
@@ -963,6 +964,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "Tensor! expert_topk_weights, "
       "Tensor! expert_num_tokens, "
       "Tensor! expert_counts, "
+      "Tensor! data_remap, "
       "Tensor config_tensor, "
       "int M, int K, int topk, "
       "int mc, int num_physical_experts, "

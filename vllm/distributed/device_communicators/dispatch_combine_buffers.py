@@ -183,6 +183,7 @@ class DispatchCombineP2PManager:
             self.max_recv, dtype=torch.float32,
             device=f'cuda:{self._device}')
         self.expert_num_tokens_buf = None
+        self.data_remap_buf = None
         self._num_experts = None
 
         # Init barrier: sync all ranks after IPC setup.
@@ -558,6 +559,12 @@ class DispatchCombineP2PManager:
         self.expert_num_tokens_buf = torch.zeros(
             num_experts, dtype=torch.int32,
             device=f'cuda:{self._device}')
+        # data_remap: maps dispatch_recv entries to
+        # group leaders for co-located expert dedup.
+        # Identity by default (each entry maps to self).
+        self.data_remap_buf = torch.arange(
+            self.max_recv, dtype=torch.int32,
+            device=f'cuda:{self._device}')
 
     def gpu_prepare_dispatch_recv(
             self, mc: int, num_experts: int):
@@ -749,6 +756,7 @@ class DispatchCombineP2PManager:
                 self.expert_topk_weights_buf,
                 self.expert_num_tokens_buf,
                 self._expert_counts_tensor,
+                self.data_remap_buf,
                 self.config_tensor,
                 M, K, topk, mc,
                 num_experts,
@@ -761,6 +769,7 @@ class DispatchCombineP2PManager:
             self.expert_topk_weights_buf[:mc]
             .unsqueeze(1),
             self.expert_num_tokens_buf,
+            self.data_remap_buf[:mc],
         )
 
     def destroy(self):

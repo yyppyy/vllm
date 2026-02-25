@@ -871,6 +871,7 @@ __global__ void dispatch_and_route_kernel(
     int64_t* __restrict__ expert_topk_ids,
     float* __restrict__ expert_topk_weights,
     int32_t* __restrict__ expert_num_tokens,
+    int32_t* __restrict__ data_remap,
     const DispatchCombineConfig* __restrict__ config,
     int32_t M, int32_t K, int32_t topk,
     int32_t mc,
@@ -881,9 +882,12 @@ __global__ void dispatch_and_route_kernel(
   const int32_t epr = config->physical_experts_per_rank;
   const int32_t NL = config->num_logical_experts;
 
-  // Shared memory layout:
-  //   routing_selection_smem[NL]  (int32_t)
-  //   rank_active_counts[ws]     (int32_t)
+  // Shared memory layout (reused across phases):
+  // Phase A: s_grp_dest[ws] + s_grp_count[ws]
+  //        + s_ent_lid[64] + s_ent_wt[64] + s_ent_grp[64]
+  // Phase C: routing_selection_smem[NL]
+  //        + rank_active_counts[ws]
+  // Phases don't overlap, so same memory is reused.
   extern __shared__ int32_t shared[];
   int32_t* routing_selection_smem = shared;
   int32_t* rank_active_counts = shared + NL;
@@ -910,80 +914,128 @@ __global__ void dispatch_and_route_kernel(
   pa_base = s_pa_base;
 
   // ---- Phase A: Broadcast dispatch + push all-reduce ----
-  const int32_t total_pairs = M * topk * max_rep;
-  for (int32_t pair_idx = blockIdx.x;
-       pair_idx < total_pairs;
-       pair_idx += gridDim.x) {
-    const int32_t token_idx =
-        pair_idx / (topk * max_rep);
-    const int32_t slot =
-        (pair_idx / max_rep) % topk;
-    const int32_t replica_idx =
-        pair_idx % max_rep;
+  // Per-token loop: group (slot, replica) by dest_rank to
+  // write token data ONCE per unique (token, dest_rank).
+  // Reuses extern shared[] (Phase C only runs after barrier).
+  constexpr int32_t kMaxEntries = 64;  // topk * max_rep
+  int32_t* s_grp_dest  = shared;              // [ws]
+  int32_t* s_grp_count = shared + ws;         // [ws]
+  int32_t* s_ent_lid   = shared + 2 * ws;     // [kMaxEntries]
+  float*   s_ent_wt    = reinterpret_cast<float*>(
+      s_ent_lid + kMaxEntries);               // [kMaxEntries]
+  int32_t* s_ent_grp   = reinterpret_cast<int32_t*>(
+      s_ent_wt + kMaxEntries);                // [kMaxEntries]
 
-    const int32_t logical_id =
-        topk_ids[token_idx * topk + slot];
-    if (logical_id < 0 || logical_id >= NL) continue;
-    const int32_t rc = static_cast<int32_t>(
-        config->logical_replica_count[logical_id]);
-    if (replica_idx >= rc) continue;
+  __shared__ int32_t s_num_groups;
+  __shared__ int32_t s_total_entries;
+  __shared__ int32_t s_grp_base[64];   // claimed write_pos
 
-    const int32_t phys_id =
-        config->logical_to_physical_map[
-            logical_id * max_rep + replica_idx];
-    const int32_t dest_rank = phys_id / epr;
-
-    if (dest_rank < 0 || dest_rank >= ws) continue;
-    if (!config->remote_dispatch_offsets[dest_rank] ||
-        !config->remote_dispatch_recv[dest_rank] ||
-        !config->remote_dispatch_meta[dest_rank])
-      continue;
-
-    // Atomically claim a write position.
-    __shared__ int32_t s_write_pos;
+  for (int32_t t = blockIdx.x; t < M; t += gridDim.x) {
+    // Step 1: Thread 0 scans slots+replicas, groups by
+    // dest_rank, pushes all-reduce (once per slot).
     if (threadIdx.x == 0) {
-      s_write_pos = atomicAdd(
-          config->remote_dispatch_offsets[dest_rank],
-          1);
-    }
-    __syncthreads();
-    const int32_t write_pos = s_write_pos;
-    if (write_pos >= config->max_recv) continue;
+      s_num_groups = 0;
+      s_total_entries = 0;
+      for (int32_t slot = 0; slot < topk; slot++) {
+        int32_t lid = topk_ids[t * topk + slot];
+        if (lid < 0 || lid >= NL) continue;
 
-    // Write token data to remote dispatch_recv.
-    T* dest_data = reinterpret_cast<T*>(
-        config->remote_dispatch_recv[dest_rank]);
-    const T* src_data = input + token_idx * K;
-    for (int32_t k = threadIdx.x; k < K;
-         k += blockDim.x) {
-      dest_data[write_pos * K + k] = src_data[k];
-    }
+        // All-reduce push: once per (token, slot).
+        for (int32_t r = 0; r < ws; r++) {
+          atomicAdd(
+              &config->remote_expert_counts[r][lid],
+              1);
+        }
 
-    // Write metadata (LOGICAL expert_id).
-    if (threadIdx.x == 0) {
-      TokenMetadata* dest_meta =
-          reinterpret_cast<TokenMetadata*>(
-              config->remote_dispatch_meta[dest_rank]);
-      dest_meta[write_pos].source_rank = rank;
-      dest_meta[write_pos].source_token_idx =
-          token_idx;
-      dest_meta[write_pos].expert_id = logical_id;
-      dest_meta[write_pos].topk_weight =
-          topk_weights[token_idx * topk + slot];
-    }
-
-    // Push-based all-reduce: atomicAdd to ALL peers'
-    // expert_counts buffers (once per (token,slot)).
-    if (replica_idx == 0 && threadIdx.x == 0) {
-      for (int32_t r = 0; r < ws; r++) {
-        atomicAdd(
-            &config->remote_expert_counts[r][
-                logical_id],
-            1);
+        int32_t rc = static_cast<int32_t>(
+            config->logical_replica_count[lid]);
+        if (rc > max_rep) rc = max_rep;
+        for (int32_t rep = 0; rep < rc; rep++) {
+          int32_t phys =
+              config->logical_to_physical_map[
+                  lid * max_rep + rep];
+          int32_t dr = phys / epr;
+          if (dr < 0 || dr >= ws) continue;
+          if (!config->remote_dispatch_offsets[dr] ||
+              !config->remote_dispatch_recv[dr] ||
+              !config->remote_dispatch_meta[dr])
+            continue;
+          // Find or create group for dest_rank.
+          int32_t g = -1;
+          for (int32_t i = 0; i < s_num_groups; i++) {
+            if (s_grp_dest[i] == dr) {
+              g = i; break;
+            }
+          }
+          if (g == -1) {
+            g = s_num_groups++;
+            s_grp_dest[g] = dr;
+            s_grp_count[g] = 0;
+          }
+          int32_t ei = s_total_entries;
+          if (ei < kMaxEntries) {
+            s_ent_lid[ei] = lid;
+            s_ent_wt[ei] =
+                topk_weights[t * topk + slot];
+            s_ent_grp[ei] = g;
+            s_grp_count[g]++;
+            s_total_entries = ei + 1;
+          }
+        }
       }
     }
+    __syncthreads();
 
-    __threadfence_system();
+    // Step 2: Thread 0 claims contiguous positions.
+    if (threadIdx.x == 0) {
+      for (int32_t g = 0; g < s_num_groups; g++) {
+        s_grp_base[g] = atomicAdd(
+            config->remote_dispatch_offsets[
+                s_grp_dest[g]],
+            s_grp_count[g]);
+      }
+    }
+    __syncthreads();
+
+    // Step 3: Write data ONCE + N metadata per group.
+    // Entries are interleaved across groups in the flat
+    // arrays, so filter by s_ent_grp[ei] == g.
+    for (int32_t g = 0; g < s_num_groups; g++) {
+      int32_t dr = s_grp_dest[g];
+      int32_t base = s_grp_base[g];
+      int32_t n = s_grp_count[g];
+      if (base >= config->max_recv) continue;
+      if (base + n > config->max_recv)
+        n = config->max_recv - base;
+
+      // All threads: write token data ONCE at base.
+      T* dest = reinterpret_cast<T*>(
+          config->remote_dispatch_recv[dr]);
+      const T* src = input + t * K;
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        dest[base * K + k] = src[k];
+      }
+
+      // Thread 0: write metadata for matching entries.
+      if (threadIdx.x == 0) {
+        TokenMetadata* meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_dispatch_meta[dr]);
+        int32_t mi = 0;
+        for (int32_t ei = 0;
+             ei < s_total_entries && mi < n;
+             ei++) {
+          if (s_ent_grp[ei] != g) continue;
+          meta[base + mi].source_rank = rank;
+          meta[base + mi].source_token_idx = t;
+          meta[base + mi].expert_id = s_ent_lid[ei];
+          meta[base + mi].topk_weight = s_ent_wt[ei];
+          mi++;
+        }
+      }
+    }
+    __syncthreads();  // before next token overwrites smem
   }
 
   // ---- Grid-wide sync: wait for ALL blocks to finish
@@ -1153,7 +1205,7 @@ __global__ void dispatch_and_route_kernel(
     __threadfence();
   }
 
-  // ---- Phase D: Filter + stamp/zero + metadata ----
+  // ---- Phase D: Filter + stamp/zero + data_remap ----
   int32_t actual =
       *config->remote_dispatch_offsets[rank];
   if (actual > config->max_recv)
@@ -1163,6 +1215,29 @@ __global__ void dispatch_and_route_kernel(
        idx += gridDim.x) {
     if (idx < actual) {
       if (threadIdx.x == 0) {
+        // Compute data_remap: find group leader.
+        // Contiguous entries with same (source_rank,
+        // source_token_idx) share data at the first
+        // entry (Phase A writes data once per group).
+        const TokenMetadata* meta_r =
+            reinterpret_cast<const TokenMetadata*>(
+                config->remote_dispatch_meta[rank]);
+        int32_t leader = idx;
+        if (idx > 0) {
+          int32_t sr = meta_r[idx].source_rank;
+          int32_t st = meta_r[idx].source_token_idx;
+          int32_t check = idx - 1;
+          while (check >= 0
+                 && meta_r[check].source_rank == sr
+                 && meta_r[check].source_token_idx
+                     == st) {
+            leader = check;
+            check--;
+          }
+        }
+        data_remap[idx] = leader;
+
+        // Filtering logic: route to selected replica.
         TokenMetadata* meta =
             reinterpret_cast<TokenMetadata*>(
                 config->remote_dispatch_meta[rank]);
@@ -1207,7 +1282,10 @@ __global__ void dispatch_and_route_kernel(
         }  // close logical_id bounds else
       }
     } else {
-      // Stale entry: zero data + stamp sentinel.
+      // Stale entry: identity remap + zero + sentinel.
+      if (threadIdx.x == 0) {
+        data_remap[idx] = idx;
+      }
       T* dest = dispatch_recv + idx * K;
       for (int32_t k = threadIdx.x; k < K;
            k += blockDim.x) {
@@ -1259,6 +1337,7 @@ void dispatch_and_route(
     torch::Tensor expert_topk_weights,
     torch::Tensor expert_num_tokens,
     torch::Tensor expert_counts,
+    torch::Tensor data_remap,
     torch::Tensor config_tensor,
     int64_t M, int64_t K, int64_t topk,
     int64_t mc,
