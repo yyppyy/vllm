@@ -119,6 +119,12 @@ struct DispatchCombineConfig {
   // Intra-kernel sync for routing completion
   // (CUDA graph compatible, monotonic counter).
   FlagType* routing_ready_flag;
+
+  // Grid-wide sync: all blocks increment this counter
+  // after Phase A completes. Block 0 spins until
+  // counter == base + gridDim.x before entering the
+  // P2P barrier. Monotonic for CUDA graph replay.
+  FlagType* phase_a_done_counter;
 };
 
 // ====================================================================
@@ -854,7 +860,8 @@ void scatter_add_direct(
 //
 // Grid = kPersistentGrid, block = kBlockSize.
 // expert_num_tokens must be pre-zeroed before launch.
-// remote_expert_counts[rank] must be pre-zeroed before launch.
+// remote_expert_counts[rank] is self-zeroing via Phase E
+// (first invocation: zeroed during init_integrated_routing).
 template <typename T>
 __global__ void dispatch_and_route_kernel(
     const T* __restrict__ input,
@@ -881,18 +888,26 @@ __global__ void dispatch_and_route_kernel(
   int32_t* routing_selection_smem = shared;
   int32_t* rank_active_counts = shared + NL;
 
-  // Read routing_ready_flag expected value BEFORE Phase A
-  // (monotonic counter for CUDA graph replay).
+  // Read monotonic counter base values BEFORE Phase A
+  // (for CUDA graph replay compatibility).
   FlagType rf_expected = 0;
+  FlagType pa_base = 0;
   if (threadIdx.x == 0) {
     rf_expected =
         static_cast<FlagType>(*config->routing_ready_flag) + 1;
+    pa_base =
+        static_cast<FlagType>(*config->phase_a_done_counter);
   }
-  // Broadcast rf_expected to all threads via shared mem.
+  // Broadcast to all threads via shared mem.
   __shared__ FlagType s_rf_expected;
-  if (threadIdx.x == 0) s_rf_expected = rf_expected;
+  __shared__ FlagType s_pa_base;
+  if (threadIdx.x == 0) {
+    s_rf_expected = rf_expected;
+    s_pa_base = pa_base;
+  }
   __syncthreads();
   rf_expected = s_rf_expected;
+  pa_base = s_pa_base;
 
   // ---- Phase A: Broadcast dispatch + push all-reduce ----
   const int32_t total_pairs = M * topk * max_rep;
@@ -969,6 +984,32 @@ __global__ void dispatch_and_route_kernel(
     }
 
     __threadfence_system();
+  }
+
+  // ---- Grid-wide sync: wait for ALL blocks to finish
+  //      Phase A before block 0 enters P2P barrier. ----
+  // Without this, block 0 could signal peers while other
+  // blocks are still writing dispatch data to remote bufs.
+  // __syncthreads() ensures all threads in THIS block are
+  // done. __threadfence_system() ensures this block's
+  // remote writes are visible to all devices. Thread 0
+  // then atomicAdds the counter. Block 0 spins until all
+  // blocks have incremented.
+  __syncthreads();
+  __threadfence_system();
+  if (threadIdx.x == 0) {
+    atomicAdd(config->phase_a_done_counter,
+              static_cast<FlagType>(1));
+  }
+  if (blockIdx.x == 0) {
+    if (threadIdx.x == 0) {
+      FlagType target = pa_base + gridDim.x;
+      while (dc_ld_flag_acquire(
+                 config->phase_a_done_counter)
+              < target)
+        ;
+    }
+    __syncthreads();
   }
 
   // ---- Phase B: P2P barrier (RESET_COMBINE) ----
