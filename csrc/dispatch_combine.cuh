@@ -891,12 +891,12 @@ __global__ void dispatch_and_route_kernel(
   // Phase A: s_expert_counts[NL] + s_grp_dest[ws]
   //        + s_grp_count[ws] + s_ent_lid[64]
   //        + s_ent_wt[64] + s_ent_grp[64]
-  // Phase C: routing_selection_smem[NL]
+  // Phase C: s_expert_sum[NL] + s_replica_count[NL]
+  //        + s_l2p_map[NL*max_rep]
+  //        + routing_selection_smem[NL]
   //        + rank_active_counts[ws]
   // Phases don't overlap, so same memory is reused.
   extern __shared__ int32_t shared[];
-  int32_t* routing_selection_smem = shared;
-  int32_t* rank_active_counts = shared + NL;
 
   // Read monotonic counter base values BEFORE Phase A
   // (for CUDA graph replay compatibility).
@@ -1086,20 +1086,21 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
-    // Batch all-reduce push: block 0 reads aggregated
-    // local counts and pushes to ALL ranks' buffers.
-    // P2P barrier's __threadfence_system() will make
+    // Allgather push: block 0 writes local counts to
+    // per-sender section [rank*NL .. (rank+1)*NL) on
+    // each remote rank's expert_counts buffer.
+    // Regular stores (fire-and-forget), NOT atomicAdd.
+    // No contention: each sender owns its section.
+    // P2P barrier's __threadfence_system() makes
     // these writes visible to peers.
     for (int32_t e = threadIdx.x; e < NL;
          e += blockDim.x) {
       int32_t count =
           config->local_expert_counts[e];
-      if (count > 0) {
-        for (int32_t r = 0; r < ws; r++) {
-          atomicAdd(
-              &config->remote_expert_counts[r][e],
-              count);
-        }
+      for (int32_t r = 0; r < ws; r++) {
+        reinterpret_cast<int32_t*>(
+            config->remote_expert_counts[r])
+                [rank * NL + e] = count;
       }
     }
     __syncthreads();
@@ -1149,43 +1150,74 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();
   }
 
-  // ---- Phase C: Deterministic router (block 0) ----
-  if (blockIdx.x == 0) {
-    // Read global expert counts from local buffer
-    // (already has sum from push all-reduce).
-    int32_t* expert_counts =
-        config->remote_expert_counts[rank];
+  // Read actual dispatch count (available after barrier).
+  int32_t actual =
+      *config->remote_dispatch_offsets[rank];
+  if (actual > config->max_recv)
+    actual = config->max_recv;
 
-    // Initialize shared memory.
+  // ---- Phase C (block 0) + Phase D1 (blocks 1-31) ----
+  // Block 0: parallel preload + deterministic router.
+  // Blocks 1-31: zero stale entries (concurrent with C).
+  if (blockIdx.x == 0) {
+    // Reuse shared[] for Phase C preload layout.
+    int32_t* s_expert_sum = shared;           // [NL]
+    int32_t* s_replica_count = shared + NL;   // [NL]
+    int32_t* s_l2p_map = shared + 2 * NL;    // [NL*mr]
+    int32_t* routing_sel =
+        shared + 2 * NL + NL * max_rep;       // [NL]
+    int32_t* rank_active = routing_sel + NL;   // [ws]
+
+    // All threads: parallel preload from global to smem.
+    // Sum expert counts across allgather sections.
+    int32_t* ec_buf =
+        reinterpret_cast<int32_t*>(
+            config->remote_expert_counts[rank]);
     for (int32_t e = threadIdx.x; e < NL;
          e += blockDim.x) {
-      routing_selection_smem[e] = -1;
+      int32_t sum = 0;
+      for (int32_t s = 0; s < ws; s++) {
+        sum += ec_buf[s * NL + e];
+      }
+      s_expert_sum[e] = sum;
+    }
+    for (int32_t e = threadIdx.x; e < NL;
+         e += blockDim.x) {
+      s_replica_count[e] = static_cast<int32_t>(
+          config->logical_replica_count[e]);
+    }
+    for (int32_t i = threadIdx.x;
+         i < NL * max_rep;
+         i += blockDim.x) {
+      s_l2p_map[i] =
+          config->logical_to_physical_map[i];
+    }
+    for (int32_t e = threadIdx.x; e < NL;
+         e += blockDim.x) {
+      routing_sel[e] = -1;
     }
     for (int32_t r = threadIdx.x; r < ws;
          r += blockDim.x) {
-      rank_active_counts[r] = 0;
+      rank_active[r] = 0;
     }
     __syncthreads();
 
     // Sequential routing (thread 0 only).
-    // Process experts in ascending order for
-    // determinism across all ranks.
+    // All reads from shared memory (~1 cycle each).
     if (threadIdx.x == 0) {
       for (int32_t e = 0; e < NL; e++) {
-        const int32_t count = expert_counts[e];
+        const int32_t count = s_expert_sum[e];
         if (count == 0) continue;
 
-        int32_t rc = static_cast<int32_t>(
-            config->logical_replica_count[e]);
+        int32_t rc = s_replica_count[e];
         if (rc <= 0) continue;
         if (rc > max_rep) rc = max_rep;
 
         if (rc == 1) {
           const int32_t phys =
-              config->logical_to_physical_map[
-                  e * max_rep];
-          routing_selection_smem[e] = phys;
-          rank_active_counts[phys / epr] += count;
+              s_l2p_map[e * max_rep];
+          routing_sel[e] = phys;
+          rank_active[phys / epr] += count;
           continue;
         }
 
@@ -1196,10 +1228,9 @@ __global__ void dispatch_and_route_kernel(
         int32_t best_cost = INT_MAX;
         for (int32_t i = 0; i < rc; i++) {
           const int32_t phys =
-              config->logical_to_physical_map[
-                  e * max_rep + i];
+              s_l2p_map[e * max_rep + i];
           const int32_t r = phys / epr;
-          const int32_t c = rank_active_counts[r];
+          const int32_t c = rank_active[r];
           if (c < best_cost ||
               (c == best_cost && r < best_rank)) {
             best_cost = c;
@@ -1207,8 +1238,8 @@ __global__ void dispatch_and_route_kernel(
             best_phys = phys;
           }
         }
-        routing_selection_smem[e] = best_phys;
-        rank_active_counts[best_rank] += count;
+        routing_sel[e] = best_phys;
+        rank_active[best_rank] += count;
       }
     }
     __syncthreads();
@@ -1216,8 +1247,7 @@ __global__ void dispatch_and_route_kernel(
     // Write routing_selection to global memory.
     for (int32_t e = threadIdx.x; e < NL;
          e += blockDim.x) {
-      config->routing_selection[e] =
-          routing_selection_smem[e];
+      config->routing_selection[e] = routing_sel[e];
     }
     __threadfence();
 
@@ -1227,7 +1257,34 @@ __global__ void dispatch_and_route_kernel(
           config->routing_ready_flag, rf_expected);
     }
   } else {
-    // Other blocks: spin until routing complete.
+    // Phase D1: Zero stale entries (blocks 1-31,
+    // concurrent with Phase C on block 0).
+    for (int32_t idx = blockIdx.x; idx < mc;
+         idx += gridDim.x) {
+      if (idx >= actual) {
+        T* dest = dispatch_recv + idx * K;
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x) {
+          dest[k] = T(0);
+        }
+        if (threadIdx.x == 0) {
+          TokenMetadata* meta =
+              reinterpret_cast<TokenMetadata*>(
+                  config->remote_dispatch_meta[rank]);
+          meta[idx].source_rank = 0;
+          meta[idx].source_token_idx = 0;
+          meta[idx].expert_id = num_physical_experts;
+          meta[idx].topk_weight = 0.0f;
+          data_remap[idx] = idx;
+          expert_topk_ids[idx] =
+              static_cast<int64_t>(
+                  num_physical_experts);
+          expert_topk_weights[idx] = 0.0f;
+        }
+      }
+    }
+
+    // Wait for routing to complete.
     if (threadIdx.x == 0) {
       while (dc_ld_flag_acquire(
               config->routing_ready_flag)
@@ -1238,20 +1295,15 @@ __global__ void dispatch_and_route_kernel(
     __threadfence();
   }
 
-  // ---- Phase D: Filter + stamp/zero + data_remap ----
-  int32_t actual =
-      *config->remote_dispatch_offsets[rank];
-  if (actual > config->max_recv)
-    actual = config->max_recv;
-
+  // ---- Phase D2: Filter real entries + block 0 stale ----
+  // All blocks: process entries assigned to this block.
+  // Real entries (idx < actual): routing filter.
+  // Block 0 stale entries: zero (missed by D1).
   for (int32_t idx = blockIdx.x; idx < mc;
        idx += gridDim.x) {
     if (idx < actual) {
       if (threadIdx.x == 0) {
-        // Compute data_remap: find group leader.
-        // Contiguous entries with same (source_rank,
-        // source_token_idx) share data at the first
-        // entry (Phase A writes data once per group).
+        // data_remap: find group leader.
         const TokenMetadata* meta_r =
             reinterpret_cast<const TokenMetadata*>(
                 config->remote_dispatch_meta[rank]);
@@ -1270,7 +1322,7 @@ __global__ void dispatch_and_route_kernel(
         }
         data_remap[idx] = leader;
 
-        // Filtering logic: route to selected replica.
+        // Filtering: route to selected replica.
         TokenMetadata* meta =
             reinterpret_cast<TokenMetadata*>(
                 config->remote_dispatch_meta[rank]);
@@ -1286,8 +1338,6 @@ __global__ void dispatch_and_route_kernel(
         const int32_t selected_phys =
             config->routing_selection[logical_id];
 
-        // Guard: if routing produced -1 (e.g. expert
-        // count was zero due to race), treat as FILTER.
         if (selected_phys < 0 ||
             selected_phys >= num_physical_experts) {
           expert_topk_ids[idx] =
@@ -1314,11 +1364,8 @@ __global__ void dispatch_and_route_kernel(
         }
         }  // close logical_id bounds else
       }
-    } else {
-      // Stale entry: identity remap + zero + sentinel.
-      if (threadIdx.x == 0) {
-        data_remap[idx] = idx;
-      }
+    } else if (blockIdx.x == 0) {
+      // Block 0 stale entries (not zeroed in D1).
       T* dest = dispatch_recv + idx * K;
       for (int32_t k = threadIdx.x; k < K;
            k += blockDim.x) {
@@ -1332,6 +1379,7 @@ __global__ void dispatch_and_route_kernel(
         meta[idx].source_token_idx = 0;
         meta[idx].expert_id = num_physical_experts;
         meta[idx].topk_weight = 0.0f;
+        data_remap[idx] = idx;
         expert_topk_ids[idx] =
             static_cast<int64_t>(
                 num_physical_experts);
@@ -1341,21 +1389,23 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase E: Zero counts for next invocation ----
-  // Must happen AFTER Phase C reads the counts and AFTER
-  // Phase B barrier guarantees no more remote atomicAdds.
+  // Zero this rank's allgather section + local counts.
+  // Other ranks' sections are zeroed by their owners.
   // The next layer's combine barrier (RESET_DISPATCH)
   // includes __threadfence_system() which ensures this
   // zeroing is visible to all peers before they start
   // the next dispatch_and_route.
   {
     int32_t* remote_ec =
-        config->remote_expert_counts[rank];
+        reinterpret_cast<int32_t*>(
+            config->remote_expert_counts[rank]);
     int32_t* local_ec =
         config->local_expert_counts;
-    for (int32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int32_t e = blockIdx.x * blockDim.x
+             + threadIdx.x;
          e < NL;
          e += gridDim.x * blockDim.x) {
-      remote_ec[e] = 0;
+      remote_ec[rank * NL + e] = 0;
       local_ec[e] = 0;
     }
   }

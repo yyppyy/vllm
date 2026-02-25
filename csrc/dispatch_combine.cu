@@ -77,6 +77,9 @@ void combine_p2p(
 
   const int32_t K32 = static_cast<int32_t>(K);
   int32_t grid_sz = static_cast<int32_t>(max_recv);
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  if (grid_sz < 1) grid_sz = 1;
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
@@ -562,22 +565,26 @@ void dispatch_and_route(
       num_physical_experts * sizeof(int32_t), stream);
 
   // NOTE: expert_counts is NOT zeroed here. It is zeroed
-  // at the end of Phase D inside the kernel (Phase E),
-  // after the barrier guarantees no more remote atomicAdds.
-  // A host-side cudaMemsetAsync would race with remote
-  // ranks' Phase A atomicAdds to this IPC buffer.
+  // at the end of the kernel (Phase E). A host-side
+  // cudaMemsetAsync would race with remote ranks'
+  // Phase A allgather writes to this IPC buffer.
 
   // Shared memory: max of Phase A and Phase C needs.
   // Phase A: NL + 2*ws + 3*64 ints (expert counts +
   //   grouping arrays).
-  // Phase C: NL + ws ints (routing + active counts).
+  // Phase C: 3*NL + NL*kMaxRep + ws ints
+  //   (s_expert_sum[NL] + s_replica_count[NL]
+  //    + s_l2p_map[NL*kMaxRep] + routing_sel[NL]
+  //    + rank_active[ws]).
   // Phases don't overlap, so same memory is reused.
   constexpr int32_t kMaxEntries = 64;
+  constexpr int32_t kMaxRep = 2;
   size_t phase_a_bytes = static_cast<size_t>(
       (NL + 2 * ws + 3 * kMaxEntries)
       * sizeof(int32_t));
   size_t phase_c_bytes = static_cast<size_t>(
-      (NL + ws) * sizeof(int32_t));
+      (3 * NL + NL * kMaxRep + ws)
+      * sizeof(int32_t));
   size_t shared_bytes = phase_a_bytes > phase_c_bytes
       ? phase_a_bytes : phase_c_bytes;
 

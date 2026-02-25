@@ -632,9 +632,11 @@ class DispatchCombineP2PManager:
         cuda_rt = self._cuda_rt
         dev = f'cuda:{self._device}'
 
-        # Expert counts buffer (IPC-shared for push
-        # all-reduce via remote atomicAdd).
-        ec_bytes = num_logical_experts * 4
+        # Expert counts buffer (IPC-shared, allgather
+        # pattern). Layout: ws sections of NL int32s.
+        # Sender s writes to section [s*NL, (s+1)*NL).
+        # Receiver sums all sections after barrier.
+        ec_bytes = self.world_size * num_logical_experts * 4
         self._raw_expert_counts = (
             cuda_rt.cudaMalloc(ec_bytes))
         cuda_rt.cudaMemset(
@@ -711,7 +713,8 @@ class DispatchCombineP2PManager:
         self._expert_counts_tensor = (
             torch.ops._C_dispatch_combine.wrap_cuda_ptr(
                 ct, self._raw_expert_counts.value,
-                num_logical_experts, 1, 2))  # int32
+                self.world_size * num_logical_experts,
+                1, 2))  # int32
 
         # Enable flag BEFORE rebuild so _build_config_tensor
         # packs the routing pointers (not NULL).
