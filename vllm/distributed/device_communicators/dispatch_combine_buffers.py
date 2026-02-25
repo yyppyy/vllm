@@ -135,6 +135,7 @@ class DispatchCombineP2PManager:
         self._physical_experts_per_rank = 0
         self.remote_expert_counts_ptrs = []
         self._integrated_routing_enabled = False
+        self._experts_per_rank = 0
 
         # Exchange CUDA IPC handles for P2P access.
         self._setup_p2p_mappings()
@@ -372,8 +373,7 @@ class DispatchCombineP2PManager:
         # Scalar fields
         data += struct.pack('i', self.rank)
         data += struct.pack('i', self.world_size)
-        # experts_per_rank set later via update_experts_per_rank
-        data += struct.pack('i', 0)
+        data += struct.pack('i', self._experts_per_rank)
         data += struct.pack('i', self.hidden_dim)
         data += struct.pack('i', self.max_num_tokens)
         data += struct.pack('i', self.max_recv)
@@ -438,6 +438,7 @@ class DispatchCombineP2PManager:
     def update_experts_per_rank(self, experts_per_rank: int):
         """Update experts_per_rank in the config tensor."""
         import struct
+        self._experts_per_rank = experts_per_rank
         max_ranks = 64
         # 6 ptr arrays + self_signals(1) + peer_signals(64)
         # + rank(4) + world_size(4) = offset to experts_per_rank

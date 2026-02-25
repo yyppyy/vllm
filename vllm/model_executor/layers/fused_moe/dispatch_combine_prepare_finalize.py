@@ -176,13 +176,17 @@ class DispatchCombinePrepareAndFinalize(
         """
         mgr = self.p2p_manager
 
-        # Broadcast dispatch: each (token, expert) pair
-        # goes to ALL replicas. mc must account for the
-        # expanded volume.
-        max_replicas = mgr._max_replicas
-        self._mc = min(
-            M * self.experts_per_token * max_replicas,
-            self.max_recv)
+        # Use max_recv as mc to guarantee M_recv <= mc.
+        # Broadcast dispatch sends (token, expert) pairs
+        # to ALL replica-holding ranks. With W source
+        # ranks and stochastic routing, the actual inbound
+        # count (M_recv) can exceed a tight per-rank bound
+        # due to routing imbalance. Using max_recv ensures
+        # the expert output buffer (sized to mc) is large
+        # enough for the combine kernel, which iterates up
+        # to M_recv. Overhead is negligible: sentinel
+        # entries are skipped by moe_align_block_size.
+        self._mc = self.max_recv
 
         topk_ids_i32 = topk_ids.to(torch.int32)
         topk_weights_f32 = topk_weights.to(torch.float32)

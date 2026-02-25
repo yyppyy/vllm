@@ -990,13 +990,21 @@ __global__ void dispatch_and_route_kernel(
   //      Phase A before block 0 enters P2P barrier. ----
   // Without this, block 0 could signal peers while other
   // blocks are still writing dispatch data to remote bufs.
-  // __syncthreads() ensures all threads in THIS block are
-  // done. __threadfence_system() ensures this block's
-  // remote writes are visible to all devices. Thread 0
-  // then atomicAdds the counter. Block 0 spins until all
-  // blocks have incremented.
+  //
+  // Three barriers needed:
+  // 1. __syncthreads(): all threads in this block are done
+  //    with Phase A loop (writes are in L1/L2).
+  // 2. __threadfence_system(): each thread flushes its own
+  //    prior writes so they're visible to all devices.
+  // 3. __syncthreads(): wait for ALL threads to complete
+  //    their fence before thread 0 increments the counter.
+  //    Without this, thread 0 could atomicAdd before
+  //    thread 255 finishes flushing, so block 0 would
+  //    see the counter and proceed while some writes are
+  //    still in-flight.
   __syncthreads();
   __threadfence_system();
+  __syncthreads();
   if (threadIdx.x == 0) {
     atomicAdd(config->phase_a_done_counter,
               static_cast<FlagType>(1));
