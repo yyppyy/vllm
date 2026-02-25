@@ -421,7 +421,6 @@ __global__ void dispatch_p2p_kernel(
     dest_meta[write_pos].topk_weight = weight;
   }
 
-  __threadfence_system();
 }
 
 // ====================================================================
@@ -500,7 +499,6 @@ __global__ void combine_p2p_kernel(
       dest_meta[write_pos].topk_weight = weight;
     }
 
-    __threadfence_system();
   }
 }
 
@@ -1002,14 +1000,14 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
-    // Step 2: Thread 0 claims contiguous positions.
-    if (threadIdx.x == 0) {
-      for (int32_t g = 0; g < s_num_groups; g++) {
-        s_grp_base[g] = atomicAdd(
-            config->remote_dispatch_offsets[
-                s_grp_dest[g]],
-            s_grp_count[g]);
-      }
+    // Step 2: Claim contiguous write positions.
+    // Threads 0..num_groups-1 each claim one group
+    // concurrently (different NVLink links).
+    if (threadIdx.x < s_num_groups) {
+      s_grp_base[threadIdx.x] = atomicAdd(
+          config->remote_dispatch_offsets[
+              s_grp_dest[threadIdx.x]],
+          s_grp_count[threadIdx.x]);
     }
     __syncthreads();
 
