@@ -304,6 +304,16 @@ __global__ void combine_p2p_kernel(
   for (int32_t pair_idx = blockIdx.x;
        pair_idx < M_recv;
        pair_idx += gridDim.x) {
+    // Section-aware stale skip: entries outside valid
+    // section bounds are stale (no sentinel needed).
+    int32_t ss_d = config->dispatch_section_size;
+    int32_t sec = pair_idx / ss_d;
+    int32_t off = pair_idx % ss_d;
+    if (sec >= ws_c
+        || off >= config->
+            remote_dispatch_offsets[rank_c][sec])
+      continue;
+
     const int32_t dest_rank =
         dispatch_meta[pair_idx].source_rank;
     const int32_t orig_token_idx =
@@ -311,9 +321,7 @@ __global__ void combine_p2p_kernel(
     const float weight =
         dispatch_meta[pair_idx].topk_weight;
 
-    // Skip filtered entries (integrated routing sets
-    // weight=0 for tokens whose chosen replica is not
-    // on this rank).
+    // Skip routing-filtered entries (weight==0).
     if (weight == 0.0f) continue;
 
     if (dest_rank < 0 ||
@@ -468,19 +476,12 @@ __global__ void prepare_dispatch_recv_kernel(
         }
       }
     } else {
-      T* dest = dispatch_recv + idx * K;
-      for (int32_t k = threadIdx.x; k < K;
-           k += blockDim.x) {
-        dest[k] = T(0);
-      }
+      // Stale: K-data zeroing removed (never consumed,
+      // bounded by expert_num_tokens). Metadata sentinels
+      // removed (combine_p2p is section-aware).
+      // Only expert_topk_ids/weights needed by
+      // moe_align_block_size downstream.
       if (threadIdx.x == 0) {
-        TokenMetadata* meta =
-            reinterpret_cast<TokenMetadata*>(
-                config->remote_dispatch_meta[rank]);
-        meta[idx].source_rank = -1;
-        meta[idx].source_token_idx = 0;
-        meta[idx].expert_id = num_experts;
-        meta[idx].topk_weight = 0.0f;
         expert_topk_ids[idx] =
             static_cast<int64_t>(num_experts);
         expert_topk_weights[idx] = 0.0f;
@@ -579,6 +580,16 @@ __global__ void combine_and_scatter_kernel(
   for (int32_t pair_idx = blockIdx.x;
        pair_idx < mc;
        pair_idx += gridDim.x) {
+    // Section-aware stale skip: entries outside valid
+    // section bounds are stale (no sentinel needed).
+    int32_t ss_d = config->dispatch_section_size;
+    int32_t sec_d = pair_idx / ss_d;
+    int32_t off_d = pair_idx % ss_d;
+    if (sec_d >= ws
+        || off_d >= config->
+            remote_dispatch_offsets[rank][sec_d])
+      continue;
+
     const int32_t dest_rank =
         dispatch_meta[pair_idx].source_rank;
     const int32_t orig_token_idx =
@@ -586,6 +597,7 @@ __global__ void combine_and_scatter_kernel(
     const float weight =
         dispatch_meta[pair_idx].topk_weight;
 
+    // Skip routing-filtered entries (weight==0).
     if (weight == 0.0f) continue;
     if (dest_rank < 0 || dest_rank >= ws) continue;
     if (!config->remote_combine_offsets[dest_rank] ||
@@ -1105,11 +1117,10 @@ __global__ void dar_phase_c_kernel(
   __threadfence();
 }
 
-// ---- Phase D1: Stamp stale entry metadata ----
-// Grid = kPersistentGrid, block = kBlockSize.
-// All blocks participate (unlike fused kernel where
-// block 0 was occupied by Phase C).
-// K-data zeroing removed: stale data is never consumed.
+// ---- Phase D1: No-op (stale stamping removed) ----
+// Combine kernels now use section-aware bounds checks
+// to skip stale entries. D2 fills sentinel defaults
+// for expert_topk_ids/weights/data_remap.
 template <typename T>
 __global__ void dar_phase_d1_kernel(
     T* __restrict__ dispatch_recv,
@@ -1119,41 +1130,15 @@ __global__ void dar_phase_d1_kernel(
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc, int32_t K,
     int32_t num_physical_experts) {
-  const int32_t rank = config->rank;
-  const int32_t ws = config->world_size;
-  const int32_t ss = config->dispatch_section_size;
-
-  for (int32_t idx = blockIdx.x; idx < mc;
-       idx += gridDim.x) {
-    int32_t sec = idx / ss;
-    int32_t off = idx % ss;
-    bool is_real = (sec < ws)
-        && (off < config->
-            remote_dispatch_offsets[rank][sec]);
-    if (!is_real && threadIdx.x == 0) {
-      // Stamp metadata sentinels so combine_p2p
-      // skips stale entries (weight==0 check).
-      // K-data zeroing removed: stale data is never
-      // consumed (bounded by expert_num_tokens).
-      TokenMetadata* meta =
-          reinterpret_cast<TokenMetadata*>(
-              config->remote_dispatch_meta[rank]);
-      meta[idx].source_rank = -1;
-      meta[idx].source_token_idx = 0;
-      meta[idx].expert_id = num_physical_experts;
-      meta[idx].topk_weight = 0.0f;
-      data_remap[idx] = idx;
-      expert_topk_ids[idx] =
-          static_cast<int64_t>(
-              num_physical_experts);
-      expert_topk_weights[idx] = 0.0f;
-    }
-  }
+  // No-op: kept for API compatibility with split-phase
+  // profiling path (VLLM_DC_SPLIT_KERNELS=1).
 }
 
-// ---- Phase D2: Routing filter ----
+// ---- Phase D2: Fill defaults + section-aware routing ----
 // Grid = kPersistentGrid, block = kBlockSize.
-// Only processes REAL entries (stale handled by D1).
+// Two passes: (1) fill sentinel defaults for all mc
+// entries (streaming writes, no branches); (2) process
+// real entries only via section-aware iteration.
 // expert_num_tokens must be pre-zeroed before launch.
 __global__ void dar_phase_d2_kernel(
     int64_t* __restrict__ expert_topk_ids,
@@ -1176,21 +1161,36 @@ __global__ void dar_phase_d2_kernel(
       reinterpret_cast<TokenMetadata*>(
           config->remote_dispatch_meta[rank]);
 
+  // Pass 1: Fill sentinel defaults for ALL entries.
+  // Stale entries keep these; real entries overwrite.
+  const int64_t sentinel =
+      static_cast<int64_t>(num_physical_experts);
   for (int32_t base = blockIdx.x * blockDim.x;
        base < mc;
        base += gridDim.x * blockDim.x) {
     int32_t idx = base + threadIdx.x;
     if (idx < mc) {
-      int32_t sec = idx / ss;
-      int32_t off = idx % ss;
-      bool is_real = (sec < ws)
-          && (off < config->
-              remote_dispatch_offsets[rank][sec]);
-      if (is_real) {
+      expert_topk_ids[idx] = sentinel;
+      expert_topk_weights[idx] = 0.0f;
+      data_remap[idx] = idx;
+    }
+  }
+
+  // Pass 2: Process real entries by section.
+  for (int32_t s = 0; s < ws; s++) {
+    int32_t section_start = s * ss;
+    int32_t count =
+        config->remote_dispatch_offsets[rank][s];
+    for (int32_t base = blockIdx.x * blockDim.x;
+         base < count;
+         base += gridDim.x * blockDim.x) {
+      int32_t off = base + threadIdx.x;
+      if (off < count) {
+        int32_t idx = section_start + off;
+
         // Backward scan for group leader.
-        int32_t section_start = sec * ss;
         int32_t leader = idx;
-        if (idx > section_start) {
+        if (off > 0) {
           int32_t sr = meta_r[idx].source_rank;
           int32_t st =
               meta_r[idx].source_token_idx;
@@ -1210,10 +1210,7 @@ __global__ void dar_phase_d2_kernel(
             meta_r[idx].expert_id;
         if (logical_id < 0
             || logical_id >= NL) {
-          expert_topk_ids[idx] =
-              static_cast<int64_t>(
-                  num_physical_experts);
-          expert_topk_weights[idx] = 0.0f;
+          // Sentinel already written by fill.
           meta_w[idx].topk_weight = 0.0f;
         } else {
           const int32_t sel =
@@ -1221,10 +1218,6 @@ __global__ void dar_phase_d2_kernel(
                   logical_id];
           if (sel < 0
               || sel >= num_physical_experts) {
-            expert_topk_ids[idx] =
-                static_cast<int64_t>(
-                    num_physical_experts);
-            expert_topk_weights[idx] = 0.0f;
             meta_w[idx].topk_weight = 0.0f;
           } else if (sel / epr == rank) {
             // KEEP: local replica.
@@ -1236,10 +1229,6 @@ __global__ void dar_phase_d2_kernel(
                 &expert_num_tokens[sel], 1);
           } else {
             // FILTER: not our replica.
-            expert_topk_ids[idx] =
-                static_cast<int64_t>(
-                    num_physical_experts);
-            expert_topk_weights[idx] = 0.0f;
             meta_w[idx].topk_weight = 0.0f;
           }
         }
@@ -1754,6 +1743,17 @@ __global__ void dispatch_and_route_kernel(
          e += blockDim.x) {
       config->routing_selection[e] = routing_sel[e];
     }
+
+    // Fill block 0's share of sentinel defaults
+    // (blocks 1-31 do the rest concurrently above).
+    const int64_t b0_sentinel =
+        static_cast<int64_t>(num_physical_experts);
+    for (int32_t idx = threadIdx.x; idx < mc;
+         idx += gridDim.x * blockDim.x) {
+      expert_topk_ids[idx] = b0_sentinel;
+      expert_topk_weights[idx] = 0.0f;
+      data_remap[idx] = idx;
+    }
     __threadfence();
 
     // Signal routing complete.
@@ -1762,33 +1762,21 @@ __global__ void dispatch_and_route_kernel(
           config->routing_ready_flag, rf_expected);
     }
   } else {
-    // Phase D1: Stamp stale entries (blocks 1-31,
-    // concurrent with Phase C on block 0).
-    // K-data zeroing removed: stale data is never
-    // consumed (bounded by expert_num_tokens).
-    // Only metadata sentinels are needed so
-    // combine_p2p skips stale entries (weight==0).
-    for (int32_t idx = blockIdx.x; idx < mc;
-         idx += gridDim.x) {
-      int32_t ss_d1 = config->dispatch_section_size;
-      int32_t sec_d1 = idx / ss_d1;
-      int32_t off_d1 = idx % ss_d1;
-      bool real_d1 = (sec_d1 < ws)
-          && (off_d1 < config->
-              remote_dispatch_offsets[rank][sec_d1]);
-      if (!real_d1 && threadIdx.x == 0) {
-        TokenMetadata* meta =
-            reinterpret_cast<TokenMetadata*>(
-                config->remote_dispatch_meta[rank]);
-        meta[idx].source_rank = -1;
-        meta[idx].source_token_idx = 0;
-        meta[idx].expert_id = num_physical_experts;
-        meta[idx].topk_weight = 0.0f;
-        data_remap[idx] = idx;
-        expert_topk_ids[idx] =
-            static_cast<int64_t>(
-                num_physical_experts);
+    // Phase D1: Fill sentinel defaults (blocks 1-31,
+    // concurrent with Phase C on block 0). Streaming
+    // writes with no branches — fully overlapped with
+    // Phase C latency. Block 0's share is filled after
+    // Phase C completes (above).
+    const int64_t d1_sentinel =
+        static_cast<int64_t>(num_physical_experts);
+    for (int32_t base = blockIdx.x * blockDim.x;
+         base < mc;
+         base += gridDim.x * blockDim.x) {
+      int32_t idx = base + threadIdx.x;
+      if (idx < mc) {
+        expert_topk_ids[idx] = d1_sentinel;
         expert_topk_weights[idx] = 0.0f;
+        data_remap[idx] = idx;
       }
     }
 
@@ -1803,9 +1791,9 @@ __global__ void dispatch_and_route_kernel(
     __threadfence();
   }
 
-  // ---- Phase D2: Parallel filter + routing metadata ----
-  // All blocks: 256 entries per block per iteration.
-  // Each thread processes one entry independently.
+  // ---- Phase D2: Section-aware routing filter ----
+  // Sentinel defaults already filled by D1 (blocks 1-31)
+  // and block 0 above. Only process real entries.
   {
     const TokenMetadata* meta_r =
         reinterpret_cast<const TokenMetadata*>(
@@ -1816,22 +1804,20 @@ __global__ void dispatch_and_route_kernel(
     const int32_t ss_d2 =
         config->dispatch_section_size;
 
-    for (int32_t base = blockIdx.x * blockDim.x;
-         base < mc;
-         base += gridDim.x * blockDim.x) {
-      int32_t idx = base + threadIdx.x;
-      if (idx < mc) {
-        int32_t sec = idx / ss_d2;
-        int32_t off = idx % ss_d2;
-        bool is_real = (sec < ws)
-            && (off < config->
-                remote_dispatch_offsets[rank][sec]);
-        if (is_real) {
-          // Backward scan for group leader (bounded
-          // by section start).
-          int32_t section_start = sec * ss_d2;
+    for (int32_t s = 0; s < ws; s++) {
+      int32_t section_start = s * ss_d2;
+      int32_t count =
+          config->remote_dispatch_offsets[rank][s];
+      for (int32_t base = blockIdx.x * blockDim.x;
+           base < count;
+           base += gridDim.x * blockDim.x) {
+        int32_t off = base + threadIdx.x;
+        if (off < count) {
+          int32_t idx = section_start + off;
+
+          // Backward scan for group leader.
           int32_t leader = idx;
-          if (idx > section_start) {
+          if (off > 0) {
             int32_t sr = meta_r[idx].source_rank;
             int32_t st =
                 meta_r[idx].source_token_idx;
@@ -1851,10 +1837,7 @@ __global__ void dispatch_and_route_kernel(
               meta_r[idx].expert_id;
           if (logical_id < 0
               || logical_id >= NL) {
-            expert_topk_ids[idx] =
-                static_cast<int64_t>(
-                    num_physical_experts);
-            expert_topk_weights[idx] = 0.0f;
+            // Sentinel already written by fill.
             meta_w[idx].topk_weight = 0.0f;
           } else {
             const int32_t sel =
@@ -1862,10 +1845,6 @@ __global__ void dispatch_and_route_kernel(
                     logical_id];
             if (sel < 0
                 || sel >= num_physical_experts) {
-              expert_topk_ids[idx] =
-                  static_cast<int64_t>(
-                      num_physical_experts);
-              expert_topk_weights[idx] = 0.0f;
               meta_w[idx].topk_weight = 0.0f;
             } else if (sel / epr == rank) {
               // KEEP: local replica.
@@ -1877,58 +1856,10 @@ __global__ void dispatch_and_route_kernel(
                   &expert_num_tokens[sel], 1);
             } else {
               // FILTER: not our replica.
-              expert_topk_ids[idx] =
-                  static_cast<int64_t>(
-                      num_physical_experts);
-              expert_topk_weights[idx] = 0.0f;
               meta_w[idx].topk_weight = 0.0f;
             }
           }
-        } else {
-          // Stale: set metadata. Data zeroed
-          // by D1 (blocks 1-31) or below (block 0).
-          meta_w[idx].source_rank = -1;
-          meta_w[idx].source_token_idx = 0;
-          meta_w[idx].expert_id =
-              num_physical_experts;
-          meta_w[idx].topk_weight = 0.0f;
-          data_remap[idx] = idx;
-          expert_topk_ids[idx] =
-              static_cast<int64_t>(
-                  num_physical_experts);
-          expert_topk_weights[idx] = 0.0f;
         }
-      }
-    }
-  }
-
-  // Block 0: stamp metadata for stale entries at its
-  // stride (0, 32, 64, ...) which Phase D1 couldn't
-  // cover (block 0 was doing Phase C). K-data zeroing
-  // removed: stale data is never consumed.
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const int32_t ss_z =
-        config->dispatch_section_size;
-    TokenMetadata* meta =
-        reinterpret_cast<TokenMetadata*>(
-            config->remote_dispatch_meta[rank]);
-    for (int32_t idx = 0; idx < mc;
-         idx += gridDim.x) {
-      int32_t sec = idx / ss_z;
-      int32_t off = idx % ss_z;
-      bool is_real = (sec < ws)
-          && (off < config->
-              remote_dispatch_offsets[rank][sec]);
-      if (!is_real) {
-        meta[idx].source_rank = -1;
-        meta[idx].source_token_idx = 0;
-        meta[idx].expert_id = num_physical_experts;
-        meta[idx].topk_weight = 0.0f;
-        data_remap[idx] = idx;
-        expert_topk_ids[idx] =
-            static_cast<int64_t>(
-                num_physical_experts);
-        expert_topk_weights[idx] = 0.0f;
       }
     }
   }
