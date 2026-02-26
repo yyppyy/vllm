@@ -1134,11 +1134,12 @@ __global__ void dar_phase_d1_kernel(
   // profiling path (VLLM_DC_SPLIT_KERNELS=1).
 }
 
-// ---- Phase D2: Fill defaults + section-aware routing ----
+// ---- Phase D2: Single-pass fill + routing filter ----
 // Grid = kPersistentGrid, block = kBlockSize.
-// Two passes: (1) fill sentinel defaults for all mc
-// entries (streaming writes, no branches); (2) process
-// real entries only via section-aware iteration.
+// For each entry: write sentinel defaults, then check
+// if real and overwrite with routing results. Single
+// pass avoids cross-block race between fill and routing
+// when section boundaries don't align with grid stride.
 // expert_num_tokens must be pre-zeroed before launch.
 __global__ void dar_phase_d2_kernel(
     int64_t* __restrict__ expert_topk_ids,
@@ -1161,36 +1162,31 @@ __global__ void dar_phase_d2_kernel(
       reinterpret_cast<TokenMetadata*>(
           config->remote_dispatch_meta[rank]);
 
-  // Pass 1: Fill sentinel defaults for ALL entries.
-  // Stale entries keep these; real entries overwrite.
   const int64_t sentinel =
       static_cast<int64_t>(num_physical_experts);
+
   for (int32_t base = blockIdx.x * blockDim.x;
        base < mc;
        base += gridDim.x * blockDim.x) {
     int32_t idx = base + threadIdx.x;
     if (idx < mc) {
+      // Write sentinel defaults for ALL entries.
+      // Stale entries keep these; real entries
+      // overwrite below (same thread, no race).
       expert_topk_ids[idx] = sentinel;
       expert_topk_weights[idx] = 0.0f;
       data_remap[idx] = idx;
-    }
-  }
 
-  // Pass 2: Process real entries by section.
-  for (int32_t s = 0; s < ws; s++) {
-    int32_t section_start = s * ss;
-    int32_t count =
-        config->remote_dispatch_offsets[rank][s];
-    for (int32_t base = blockIdx.x * blockDim.x;
-         base < count;
-         base += gridDim.x * blockDim.x) {
-      int32_t off = base + threadIdx.x;
-      if (off < count) {
-        int32_t idx = section_start + off;
-
+      // Section-aware real check.
+      int32_t sec = idx / ss;
+      int32_t off = idx % ss;
+      if (sec < ws
+          && off < config->
+              remote_dispatch_offsets[rank][sec]) {
         // Backward scan for group leader.
+        int32_t section_start = sec * ss;
         int32_t leader = idx;
-        if (off > 0) {
+        if (idx > section_start) {
           int32_t sr = meta_r[idx].source_rank;
           int32_t st =
               meta_r[idx].source_token_idx;
@@ -1210,7 +1206,6 @@ __global__ void dar_phase_d2_kernel(
             meta_r[idx].expert_id;
         if (logical_id < 0
             || logical_id >= NL) {
-          // Sentinel already written by fill.
           meta_w[idx].topk_weight = 0.0f;
         } else {
           const int32_t sel =
@@ -1743,17 +1738,6 @@ __global__ void dispatch_and_route_kernel(
          e += blockDim.x) {
       config->routing_selection[e] = routing_sel[e];
     }
-
-    // Fill block 0's share of sentinel defaults
-    // (blocks 1-31 do the rest concurrently above).
-    const int64_t b0_sentinel =
-        static_cast<int64_t>(num_physical_experts);
-    for (int32_t idx = threadIdx.x; idx < mc;
-         idx += gridDim.x * blockDim.x) {
-      expert_topk_ids[idx] = b0_sentinel;
-      expert_topk_weights[idx] = 0.0f;
-      data_remap[idx] = idx;
-    }
     __threadfence();
 
     // Signal routing complete.
@@ -1762,25 +1746,7 @@ __global__ void dispatch_and_route_kernel(
           config->routing_ready_flag, rf_expected);
     }
   } else {
-    // Phase D1: Fill sentinel defaults (blocks 1-31,
-    // concurrent with Phase C on block 0). Streaming
-    // writes with no branches — fully overlapped with
-    // Phase C latency. Block 0's share is filled after
-    // Phase C completes (above).
-    const int64_t d1_sentinel =
-        static_cast<int64_t>(num_physical_experts);
-    for (int32_t base = blockIdx.x * blockDim.x;
-         base < mc;
-         base += gridDim.x * blockDim.x) {
-      int32_t idx = base + threadIdx.x;
-      if (idx < mc) {
-        expert_topk_ids[idx] = d1_sentinel;
-        expert_topk_weights[idx] = 0.0f;
-        data_remap[idx] = idx;
-      }
-    }
-
-    // Wait for routing to complete.
+    // Wait for routing to complete (blocks 1-31).
     if (threadIdx.x == 0) {
       while (dc_ld_flag_acquire(
               config->routing_ready_flag)
@@ -1791,9 +1757,10 @@ __global__ void dispatch_and_route_kernel(
     __threadfence();
   }
 
-  // ---- Phase D2: Section-aware routing filter ----
-  // Sentinel defaults already filled by D1 (blocks 1-31)
-  // and block 0 above. Only process real entries.
+  // ---- Phase D2: Single-pass fill + routing filter ----
+  // For each entry: write sentinel defaults, then check
+  // if real and overwrite. Single pass ensures no cross-
+  // block race between fill and routing.
   {
     const TokenMetadata* meta_r =
         reinterpret_cast<const TokenMetadata*>(
@@ -1803,21 +1770,29 @@ __global__ void dispatch_and_route_kernel(
             config->remote_dispatch_meta[rank]);
     const int32_t ss_d2 =
         config->dispatch_section_size;
+    const int64_t d2_sentinel =
+        static_cast<int64_t>(num_physical_experts);
 
-    for (int32_t s = 0; s < ws; s++) {
-      int32_t section_start = s * ss_d2;
-      int32_t count =
-          config->remote_dispatch_offsets[rank][s];
-      for (int32_t base = blockIdx.x * blockDim.x;
-           base < count;
-           base += gridDim.x * blockDim.x) {
-        int32_t off = base + threadIdx.x;
-        if (off < count) {
-          int32_t idx = section_start + off;
+    for (int32_t base = blockIdx.x * blockDim.x;
+         base < mc;
+         base += gridDim.x * blockDim.x) {
+      int32_t idx = base + threadIdx.x;
+      if (idx < mc) {
+        // Write sentinel defaults for ALL entries.
+        expert_topk_ids[idx] = d2_sentinel;
+        expert_topk_weights[idx] = 0.0f;
+        data_remap[idx] = idx;
 
+        // Section-aware real check.
+        int32_t sec = idx / ss_d2;
+        int32_t off = idx % ss_d2;
+        if (sec < ws
+            && off < config->
+                remote_dispatch_offsets[rank][sec]) {
           // Backward scan for group leader.
+          int32_t section_start = sec * ss_d2;
           int32_t leader = idx;
-          if (off > 0) {
+          if (idx > section_start) {
             int32_t sr = meta_r[idx].source_rank;
             int32_t st =
                 meta_r[idx].source_token_idx;
@@ -1837,7 +1812,6 @@ __global__ void dispatch_and_route_kernel(
               meta_r[idx].expert_id;
           if (logical_id < 0
               || logical_id >= NL) {
-            // Sentinel already written by fill.
             meta_w[idx].topk_weight = 0.0f;
           } else {
             const int32_t sel =
