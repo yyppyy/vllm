@@ -292,86 +292,80 @@ __global__ void combine_p2p_kernel(
     const TokenMetadata* __restrict__ dispatch_meta,
     const DispatchCombineConfig* __restrict__ config,
     int32_t K) {
-  // With per-sender sections, iterate the full mc range
-  // (passed as kernel grid size). Per-entry is_real check
-  // uses section-aware logic. M_recv = mc (max possible).
+  // Section-aware iteration: loop only over real entries
+  // in each sender's section. Avoids iterating all mc
+  // entries (65536) when only ~800 are real, eliminating
+  // expensive runtime integer div/mod per stale entry.
   const int32_t rank_c = config->rank;
   const int32_t ws_c = config->world_size;
-  int32_t M_recv = config->max_recv;
+  const int32_t ss_d = config->dispatch_section_size;
 
   __shared__ int32_t s_write_pos;
 
-  for (int32_t pair_idx = blockIdx.x;
-       pair_idx < M_recv;
-       pair_idx += gridDim.x) {
-    // Section-aware stale skip: entries outside valid
-    // section bounds are stale (no sentinel needed).
-    int32_t ss_d = config->dispatch_section_size;
-    int32_t sec = pair_idx / ss_d;
-    int32_t off = pair_idx % ss_d;
-    if (sec >= ws_c
-        || off >= config->
-            remote_dispatch_offsets[rank_c][sec])
-      continue;
+  for (int32_t s = 0; s < ws_c; s++) {
+    int32_t section_start = s * ss_d;
+    int32_t count = config->
+        remote_dispatch_offsets[rank_c][s];
+    for (int32_t pair_idx = section_start + blockIdx.x;
+         pair_idx < section_start + count;
+         pair_idx += gridDim.x) {
 
-    const int32_t dest_rank =
-        dispatch_meta[pair_idx].source_rank;
-    const int32_t orig_token_idx =
-        dispatch_meta[pair_idx].source_token_idx;
-    const float weight =
-        dispatch_meta[pair_idx].topk_weight;
+      const int32_t dest_rank =
+          dispatch_meta[pair_idx].source_rank;
+      const int32_t orig_token_idx =
+          dispatch_meta[pair_idx].source_token_idx;
+      const float weight =
+          dispatch_meta[pair_idx].topk_weight;
 
-    // Skip routing-filtered entries (weight==0).
-    if (weight == 0.0f) continue;
+      // Skip routing-filtered entries (weight==0).
+      if (weight == 0.0f) continue;
 
-    if (dest_rank < 0 ||
-        dest_rank >= config->world_size)
-      continue;
+      if (dest_rank < 0 ||
+          dest_rank >= config->world_size)
+        continue;
 
-    if (!config->remote_combine_offsets[dest_rank] ||
-        !config->remote_combine_recv[dest_rank] ||
-        !config->remote_combine_meta[dest_rank])
-      continue;
+      if (!config->remote_combine_offsets[dest_rank] ||
+          !config->remote_combine_recv[dest_rank] ||
+          !config->remote_combine_meta[dest_rank])
+        continue;
 
-    if (threadIdx.x == 0) {
-      // Local atomicAdd for position claiming.
-      int32_t local_off = atomicAdd(
-          &config->local_combine_counters[dest_rank],
-          1);
-      int32_t ss = config->combine_section_size;
-      // Section overflow: drop if section full.
-      s_write_pos = (local_off < ss)
-          ? config->rank * ss + local_off
-          : config->max_recv;
+      if (threadIdx.x == 0) {
+        int32_t local_off = atomicAdd(
+            &config->local_combine_counters[
+                dest_rank], 1);
+        int32_t ss = config->combine_section_size;
+        s_write_pos = (local_off < ss)
+            ? config->rank * ss + local_off
+            : config->max_recv;
+      }
+      __syncthreads();
+
+      const int32_t write_pos = s_write_pos;
+      if (write_pos >= config->max_recv) continue;
+
+      T* dest_data = reinterpret_cast<T*>(
+          config->remote_combine_recv[dest_rank]);
+      const T* src_data =
+          expert_output + pair_idx * K;
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        dest_data[write_pos * K + k] = src_data[k];
+      }
+
+      if (threadIdx.x == 0) {
+        TokenMetadata* dest_meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_combine_meta[
+                    dest_rank]);
+        dest_meta[write_pos].source_rank =
+            config->rank;
+        dest_meta[write_pos].source_token_idx =
+            orig_token_idx;
+        dest_meta[write_pos].expert_id =
+            dispatch_meta[pair_idx].expert_id;
+        dest_meta[write_pos].topk_weight = weight;
+      }
     }
-    __syncthreads();
-
-    const int32_t write_pos = s_write_pos;
-    if (write_pos >= config->max_recv) continue;
-
-    T* dest_data = reinterpret_cast<T*>(
-        config->remote_combine_recv[dest_rank]);
-    const T* src_data =
-        expert_output + pair_idx * K;
-    for (int32_t k = threadIdx.x; k < K;
-         k += blockDim.x) {
-      dest_data[write_pos * K + k] = src_data[k];
-    }
-
-    if (threadIdx.x == 0) {
-      TokenMetadata* dest_meta =
-          reinterpret_cast<TokenMetadata*>(
-              config->remote_combine_meta[
-                  dest_rank]);
-      dest_meta[write_pos].source_rank =
-          config->rank;
-      dest_meta[write_pos].source_token_idx =
-          orig_token_idx;
-      dest_meta[write_pos].expert_id =
-          dispatch_meta[pair_idx].expert_id;
-      dest_meta[write_pos].topk_weight = weight;
-    }
-
   }
 }
 
@@ -496,25 +490,15 @@ __global__ void prepare_dispatch_recv_kernel(
 // Reads combine recv/meta via IPC pointers in config.
 // Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+).
 // Output must be pre-zeroed via cudaMemsetAsync.
-// Grid = mc, block = kBlockSize.
+// Grid = kPersistentGrid, block = kBlockSize.
 template <typename T>
 __global__ void scatter_add_direct_kernel(
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
-    int32_t N_recv,
     int32_t K) {
-  const int32_t idx = blockIdx.x;
-  if (idx >= N_recv) return;
-
   const int32_t rank = config->rank;
-  // Section-aware: check if this entry is real.
+  const int32_t ws = config->world_size;
   const int32_t ss_c = config->combine_section_size;
-  const int32_t sec_c = idx / ss_c;
-  const int32_t off_c = idx % ss_c;
-  if (sec_c >= config->world_size) return;
-  if (off_c >= config->
-      remote_combine_offsets[rank][sec_c])
-    return;
 
   const TokenMetadata* meta =
       reinterpret_cast<const TokenMetadata*>(
@@ -522,18 +506,29 @@ __global__ void scatter_add_direct_kernel(
   const T* recv = reinterpret_cast<const T*>(
       config->remote_combine_recv[rank]);
 
-  const int32_t token_idx =
-      meta[idx].source_token_idx;
-  const float weight = meta[idx].topk_weight;
-  if (weight == 0.0f) return;
+  // Section-aware iteration: only visit real entries.
+  for (int32_t s = 0; s < ws; s++) {
+    int32_t section_start = s * ss_c;
+    int32_t count = config->
+        remote_combine_offsets[rank][s];
+    for (int32_t idx = section_start + blockIdx.x;
+         idx < section_start + count;
+         idx += gridDim.x) {
 
-  for (int32_t k = threadIdx.x; k < K;
-       k += blockDim.x) {
-    float val = static_cast<float>(
-        recv[idx * K + k]);
-    atomicAdd(
-        output + token_idx * K + k,
-        static_cast<T>(val * weight));
+      int32_t token_idx =
+          meta[idx].source_token_idx;
+      float weight = meta[idx].topk_weight;
+      if (weight == 0.0f) continue;
+
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        float val = static_cast<float>(
+            recv[idx * K + k]);
+        atomicAdd(
+            output + token_idx * K + k,
+            static_cast<T>(val * weight));
+      }
+    }
   }
 }
 
@@ -573,72 +568,76 @@ __global__ void combine_and_scatter_kernel(
   FlagType barrier_expected = s_barrier_expected;
 
   // ---- Phase 1: Combine P2P writes ----
-  // Same logic as combine_p2p_kernel: read dispatch
-  // metadata, send weighted expert output to source
-  // rank's combine recv buffer.
+  // Section-aware iteration: loop only over real entries
+  // in each sender's section, avoiding 65536-entry
+  // full-range scan with expensive runtime div/mod.
   __shared__ int32_t s_write_pos;
-  for (int32_t pair_idx = blockIdx.x;
-       pair_idx < mc;
-       pair_idx += gridDim.x) {
-    // Section-aware stale skip: entries outside valid
-    // section bounds are stale (no sentinel needed).
-    int32_t ss_d = config->dispatch_section_size;
-    int32_t sec_d = pair_idx / ss_d;
-    int32_t off_d = pair_idx % ss_d;
-    if (sec_d >= ws
-        || off_d >= config->
-            remote_dispatch_offsets[rank][sec_d])
-      continue;
+  {
+    const int32_t ss_d = config->dispatch_section_size;
+    for (int32_t s = 0; s < ws; s++) {
+      int32_t section_start = s * ss_d;
+      int32_t count = config->
+          remote_dispatch_offsets[rank][s];
+      for (int32_t pair_idx =
+               section_start + blockIdx.x;
+           pair_idx < section_start + count;
+           pair_idx += gridDim.x) {
 
-    const int32_t dest_rank =
-        dispatch_meta[pair_idx].source_rank;
-    const int32_t orig_token_idx =
-        dispatch_meta[pair_idx].source_token_idx;
-    const float weight =
-        dispatch_meta[pair_idx].topk_weight;
+        const int32_t dest_rank =
+            dispatch_meta[pair_idx].source_rank;
+        const int32_t orig_token_idx =
+            dispatch_meta[pair_idx].source_token_idx;
+        const float weight =
+            dispatch_meta[pair_idx].topk_weight;
 
-    // Skip routing-filtered entries (weight==0).
-    if (weight == 0.0f) continue;
-    if (dest_rank < 0 || dest_rank >= ws) continue;
-    if (!config->remote_combine_offsets[dest_rank] ||
-        !config->remote_combine_recv[dest_rank] ||
-        !config->remote_combine_meta[dest_rank])
-      continue;
+        if (weight == 0.0f) continue;
+        if (dest_rank < 0 || dest_rank >= ws)
+          continue;
+        if (!config->
+                remote_combine_offsets[dest_rank] ||
+            !config->
+                remote_combine_recv[dest_rank] ||
+            !config->
+                remote_combine_meta[dest_rank])
+          continue;
 
-    if (threadIdx.x == 0) {
-      int32_t local_off = atomicAdd(
-          &config->local_combine_counters[
-              dest_rank], 1);
-      int32_t ss = config->combine_section_size;
-      s_write_pos = (local_off < ss)
-          ? rank * ss + local_off
-          : config->max_recv;
-    }
-    __syncthreads();
+        if (threadIdx.x == 0) {
+          int32_t local_off = atomicAdd(
+              &config->local_combine_counters[
+                  dest_rank], 1);
+          int32_t ss = config->combine_section_size;
+          s_write_pos = (local_off < ss)
+              ? rank * ss + local_off
+              : config->max_recv;
+        }
+        __syncthreads();
 
-    const int32_t write_pos = s_write_pos;
-    if (write_pos >= config->max_recv) continue;
+        const int32_t write_pos = s_write_pos;
+        if (write_pos >= config->max_recv) continue;
 
-    T* dest_data = reinterpret_cast<T*>(
-        config->remote_combine_recv[dest_rank]);
-    const T* src_data =
-        expert_output + pair_idx * K;
-    for (int32_t k = threadIdx.x; k < K;
-         k += blockDim.x) {
-      dest_data[write_pos * K + k] = src_data[k];
-    }
+        T* dest_data = reinterpret_cast<T*>(
+            config->remote_combine_recv[dest_rank]);
+        const T* src_data =
+            expert_output + pair_idx * K;
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x) {
+          dest_data[write_pos * K + k] =
+              src_data[k];
+        }
 
-    if (threadIdx.x == 0) {
-      TokenMetadata* dest_meta =
-          reinterpret_cast<TokenMetadata*>(
-              config->remote_combine_meta[
-                  dest_rank]);
-      dest_meta[write_pos].source_rank = rank;
-      dest_meta[write_pos].source_token_idx =
-          orig_token_idx;
-      dest_meta[write_pos].expert_id =
-          dispatch_meta[pair_idx].expert_id;
-      dest_meta[write_pos].topk_weight = weight;
+        if (threadIdx.x == 0) {
+          TokenMetadata* dest_meta =
+              reinterpret_cast<TokenMetadata*>(
+                  config->remote_combine_meta[
+                      dest_rank]);
+          dest_meta[write_pos].source_rank = rank;
+          dest_meta[write_pos].source_token_idx =
+              orig_token_idx;
+          dest_meta[write_pos].expert_id =
+              dispatch_meta[pair_idx].expert_id;
+          dest_meta[write_pos].topk_weight = weight;
+        }
+      }
     }
   }
 
@@ -706,35 +705,37 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 3: Scatter-add from combine buffer ----
-  // Section-aware iteration over local combine recv.
-  const int32_t ss_c = config->combine_section_size;
-  const TokenMetadata* cmeta =
-      reinterpret_cast<const TokenMetadata*>(
-          config->remote_combine_meta[rank]);
-  const T* crecv = reinterpret_cast<const T*>(
-      config->remote_combine_recv[rank]);
+  // Section-aware iteration: only visit real entries.
+  {
+    const int32_t ss_c = config->combine_section_size;
+    const TokenMetadata* cmeta =
+        reinterpret_cast<const TokenMetadata*>(
+            config->remote_combine_meta[rank]);
+    const T* crecv = reinterpret_cast<const T*>(
+        config->remote_combine_recv[rank]);
 
-  for (int32_t idx = blockIdx.x; idx < mc;
-       idx += gridDim.x) {
-    int32_t sec = idx / ss_c;
-    int32_t off = idx % ss_c;
-    if (sec >= ws) continue;
-    if (off >= config->
-        remote_combine_offsets[rank][sec])
-      continue;
+    for (int32_t s = 0; s < ws; s++) {
+      int32_t section_start = s * ss_c;
+      int32_t count = config->
+          remote_combine_offsets[rank][s];
+      for (int32_t idx = section_start + blockIdx.x;
+           idx < section_start + count;
+           idx += gridDim.x) {
 
-    int32_t token_idx =
-        cmeta[idx].source_token_idx;
-    float wt = cmeta[idx].topk_weight;
-    if (wt == 0.0f) continue;
+        int32_t token_idx =
+            cmeta[idx].source_token_idx;
+        float wt = cmeta[idx].topk_weight;
+        if (wt == 0.0f) continue;
 
-    for (int32_t k = threadIdx.x; k < K;
-         k += blockDim.x) {
-      float val = static_cast<float>(
-          crecv[idx * K + k]);
-      atomicAdd(
-          output + token_idx * K + k,
-          static_cast<T>(val * wt));
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x) {
+          float val = static_cast<float>(
+              crecv[idx * K + k]);
+          atomicAdd(
+              output + token_idx * K + k,
+              static_cast<T>(val * wt));
+        }
+      }
     }
   }
 }

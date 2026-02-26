@@ -212,9 +212,8 @@ void scatter_add_direct(
       output.data_ptr(), 0,
       M * K * output.element_size(), stream);
 
-  const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
-  int32_t grid_sz = mc32;
+  int32_t grid_sz = kPersistentGrid;
   if (grid_sz < 1) grid_sz = 1;
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
@@ -228,7 +227,7 @@ void scatter_add_direct(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              config, K32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -236,7 +235,7 @@ void scatter_add_direct(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              config, K32);
         })
   );
 }
