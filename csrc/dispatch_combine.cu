@@ -241,6 +241,66 @@ void scatter_add_direct(
   );
 }
 
+void combine_and_scatter(
+    torch::Tensor expert_output,
+    torch::Tensor dispatch_meta,
+    torch::Tensor output,
+    torch::Tensor config_tensor,
+    int64_t mc, int64_t K,
+    int64_t M) {
+
+  if (mc == 0 || M == 0) return;
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+  const TokenMetadata* meta =
+      reinterpret_cast<const TokenMetadata*>(
+          dispatch_meta.data_ptr());
+
+  // Zero output before scatter-add (atomicAdd).
+  cudaMemsetAsync(
+      output.data_ptr(), 0,
+      M * K * output.element_size(), stream);
+
+  const int32_t mc32 = static_cast<int32_t>(mc);
+  const int32_t K32 = static_cast<int32_t>(K);
+  int32_t grid_sz = mc32;
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  if (grid_sz < 1) grid_sz = 1;
+  dim3 grid(grid_sz);
+  dim3 block(kBlockSize);
+
+  AT_DISPATCH_SWITCH(
+      output.scalar_type(),
+      "combine_and_scatter",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          combine_and_scatter_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __nv_bfloat16*>(
+                  expert_output.data_ptr()),
+              meta,
+              reinterpret_cast<__nv_bfloat16*>(
+                  output.data_ptr()),
+              config, mc32, K32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          combine_and_scatter_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __half*>(
+                  expert_output.data_ptr()),
+              meta,
+              reinterpret_cast<__half*>(
+                  output.data_ptr()),
+              config, mc32, K32);
+        })
+  );
+}
+
 torch::Tensor wrap_cuda_ptr(
     torch::Tensor dummy,
     int64_t ptr, int64_t dim0, int64_t dim1,

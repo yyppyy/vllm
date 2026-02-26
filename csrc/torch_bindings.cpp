@@ -26,6 +26,12 @@ void scatter_add_direct(torch::Tensor output,
                         torch::Tensor config_tensor,
                         int64_t mc, int64_t K,
                         int64_t M);
+void combine_and_scatter(torch::Tensor expert_output,
+                         torch::Tensor dispatch_meta,
+                         torch::Tensor output,
+                         torch::Tensor config_tensor,
+                         int64_t mc, int64_t K,
+                         int64_t M);
 void dispatch_and_route(torch::Tensor input,
                         torch::Tensor topk_ids,
                         torch::Tensor topk_weights,
@@ -874,6 +880,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
   dc.impl("scatter_add_direct", torch::kCUDA,
           &vllm::dispatch_combine::
               scatter_add_direct);
+
+  // Fused combine + barrier + scatter-add
+  dc.def(
+      "combine_and_scatter("
+      "Tensor expert_output, "
+      "Tensor dispatch_meta, "
+      "Tensor! output, "
+      "Tensor config_tensor, "
+      "int mc, int K, int M) -> ()");
+  dc.impl("combine_and_scatter", torch::kCUDA,
+          &vllm::dispatch_combine::
+              combine_and_scatter);
 
   // Fused dispatch + route + filter (integrated EPLB)
   dc.def(

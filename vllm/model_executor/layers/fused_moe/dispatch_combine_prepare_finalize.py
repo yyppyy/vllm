@@ -115,12 +115,10 @@ class DispatchCombinePrepareAndFinalize(
                 num_experts, expert_map,
                 quant_config, M, K, topk)
 
-        # Per-batch tight bound: M tokens * topk experts.
-        # Stored on self for _finalize to read. During
-        # CUDA graph capture this Python assignment runs
-        # once; during replay only recorded CUDA ops run.
-        self._mc = min(
-            M * self.experts_per_token, self.max_recv)
+        # Per-sender sections: entries are spread across
+        # ws sections in the recv buffer, so mc must cover
+        # the full buffer to reach all sections.
+        self._mc = self.max_recv
 
         # Step 1: Launch dispatch P2P kernel.
         # No pre-dispatch barrier needed: dispatch_offset
@@ -176,16 +174,10 @@ class DispatchCombinePrepareAndFinalize(
         """
         mgr = self.p2p_manager
 
-        # Per-batch tight bound on inbound entries.
-        # Broadcast dispatch sends each (token, slot) to
-        # ALL replica-holding ranks. Worst case: all W
-        # source ranks' entries land on this rank. With
-        # max_rep=2 replicas per expert: ws*M*topk*2.
-        # Capped at max_recv (IPC buffer size).
-        self._mc = min(
-            M * self.experts_per_token
-            * self.world_size_ * 2,
-            self.max_recv)
+        # Per-sender sections: entries are spread across
+        # ws sections in the recv buffer, so mc must cover
+        # the full buffer to reach all sections.
+        self._mc = self.max_recv
 
         topk_ids_i32 = topk_ids.to(torch.int32)
         topk_weights_f32 = topk_weights.to(torch.float32)
@@ -329,31 +321,18 @@ class DispatchCombinePrepareAndFinalize(
                         apply_router_weight_on_input),
                 ))
 
-        # Step 2: Launch combine P2P kernel.
-        # No pre-combine barrier: combine_offset was reset
-        # by post-dispatch barrier (RESET_COMBINE mode),
-        # visible to all ranks via threadfence_system.
-        # The kernel reads dispatch_offset for actual
-        # dispatch_recv count (not yet reset).
+        # Step 2: Fused combine + barrier + scatter-add.
+        # Single kernel replaces combine_p2p +
+        # barrier_reset_dispatch + scatter_add_direct.
+        # Saves ~10us kernel launch overhead.
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc]
             .contiguous().view(torch.uint8))
-        torch.ops._C_dispatch_combine.combine_p2p(
+        mgr.gpu_combine_and_scatter(
             fused_expert_output,
             meta_bytes,
-            mgr.config_tensor,
-            mc, K,
-        )
-
-        # Step 3: Post-combine barrier (RESET_DISPATCH).
-        # Syncs combine writes across ranks and resets
-        # dispatch_offset to 0 for the next layer.
-        mgr.gpu_p2p_barrier_reset_dispatch()
-
-        # Step 4: Scatter-add from IPC combine buffers.
-        # Native bf16 atomicAdd; cudaMemsetAsync zeros
-        # output before kernel.
-        mgr.gpu_scatter_add_direct(output, mc)
+            output,
+            mc)
 
         if do_async:
             return lambda: None

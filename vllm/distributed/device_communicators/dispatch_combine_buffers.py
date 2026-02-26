@@ -28,10 +28,12 @@ class DispatchCombineP2PManager:
     Buffer layout per rank (all allocated via cudaMalloc):
     - dispatch_recv: (max_recv * hidden_dim * dtype_size) bytes
     - dispatch_meta: (max_recv * 16) bytes  (4 int32s per entry)
-    - dispatch_offset: 4 bytes (1 int32 atomic counter)
+    - dispatch_offset: (64 * 4) bytes (int32[kMaxRanks] per-sender)
     - combine_recv: (max_recv * hidden_dim * dtype_size) bytes
     - combine_meta: (max_recv * 16) bytes
-    - combine_offset: 4 bytes
+    - combine_offset: (64 * 4) bytes (int32[kMaxRanks] per-sender)
+    - local_dispatch_counters: (64 * 4) bytes (int32[kMaxRanks])
+    - local_combine_counters: (64 * 4) bytes (int32[kMaxRanks])
 
     Non-owning PyTorch tensor views over IPC buffers
     (via wrap_cuda_ptr):
@@ -74,7 +76,8 @@ class DispatchCombineP2PManager:
         self._recv_bytes = (
             self.max_recv * hidden_dim * self._dtype_size)
         self._meta_bytes = self.max_recv * 4 * 4
-        self._offset_bytes = 4
+        # Per-sender section offsets: int32[kMaxRanks].
+        self._offset_bytes = 4 * 64
 
         from .cuda_wrapper import CudaRTLibrary
         self._cuda_rt = CudaRTLibrary()
@@ -109,6 +112,28 @@ class DispatchCombineP2PManager:
             self._offset_bytes)
         self._cuda_rt.cudaMemset(
             self._raw_combine_offset, 0, self._offset_bytes)
+
+        # Local per-destination counters for local atomicAdd.
+        # Position = rank * section_size + local_counter.
+        self._local_counter_bytes = 4 * 64  # int32[kMaxRanks]
+        self._raw_local_dispatch_counters = (
+            self._cuda_rt.cudaMalloc(
+                self._local_counter_bytes))
+        self._cuda_rt.cudaMemset(
+            self._raw_local_dispatch_counters, 0,
+            self._local_counter_bytes)
+        self._raw_local_combine_counters = (
+            self._cuda_rt.cudaMalloc(
+                self._local_counter_bytes))
+        self._cuda_rt.cudaMemset(
+            self._raw_local_combine_counters, 0,
+            self._local_counter_bytes)
+
+        # Grid-wide sync counter for fused combine kernel.
+        self._raw_combine_done_counter = (
+            self._cuda_rt.cudaMalloc(4))
+        self._cuda_rt.cudaMemset(
+            self._raw_combine_done_counter, 0, 4)
 
         # P2P barrier signal buffer.
         # Layout: alignas(128) flags[64] (256 bytes)
@@ -425,6 +450,20 @@ class DispatchCombineP2PManager:
                else 0)
         data += struct.pack('Q', ptr)
 
+        # ---- Per-sender section support ----
+        section_size = (self.max_recv // self.world_size
+                        if self.world_size > 0 else 0)
+        data += struct.pack('i', section_size)  # dispatch
+        data += struct.pack('i', section_size)  # combine
+        data += struct.pack(
+            'Q', self._raw_local_dispatch_counters.value)
+        data += struct.pack(
+            'Q', self._raw_local_combine_counters.value)
+
+        # combine_done_counter (1 pointer)
+        data += struct.pack(
+            'Q', self._raw_combine_done_counter.value)
+
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
             bytearray(config_bytes), dtype=torch.uint8
@@ -472,6 +511,24 @@ class DispatchCombineP2PManager:
         torch.ops._C_dispatch_combine\
             .p2p_barrier_reset_dispatch(
                 self.config_tensor)
+
+    def gpu_combine_and_scatter(
+            self,
+            expert_output: torch.Tensor,
+            dispatch_meta: torch.Tensor,
+            output: torch.Tensor,
+            mc: int):
+        """Fused combine P2P + barrier + scatter-add.
+        Replaces combine_p2p + barrier_reset_dispatch +
+        scatter_add_direct in a single kernel launch."""
+        M = output.shape[0]
+        torch.ops._C_dispatch_combine\
+            .combine_and_scatter(
+                expert_output,
+                dispatch_meta,
+                output,
+                self.config_tensor,
+                mc, self.hidden_dim, M)
 
     def init_prepare_buffers(self, num_experts: int):
         """Allocate expert_num_tokens buffer once
@@ -713,6 +770,12 @@ class DispatchCombineP2PManager:
         self._cuda_rt.cudaFree(self._raw_combine_recv)
         self._cuda_rt.cudaFree(self._raw_combine_meta)
         self._cuda_rt.cudaFree(self._raw_combine_offset)
+        self._cuda_rt.cudaFree(
+            self._raw_local_dispatch_counters)
+        self._cuda_rt.cudaFree(
+            self._raw_local_combine_counters)
+        self._cuda_rt.cudaFree(
+            self._raw_combine_done_counter)
         self._cuda_rt.cudaFree(self._raw_signals)
         if self._raw_expert_counts is not None:
             self._cuda_rt.cudaFree(
