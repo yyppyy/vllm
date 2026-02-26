@@ -196,6 +196,7 @@ void prepare_dispatch_recv(
 
 void scatter_add_direct(
     torch::Tensor output,
+    torch::Tensor float_buf,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M) {
@@ -207,10 +208,12 @@ void scatter_add_direct(
       reinterpret_cast<const DispatchCombineConfig*>(
           config_tensor.data_ptr());
 
-  // Zero output before scatter-add (atomicAdd).
+  // Zero float accumulation buffer (native float
+  // atomicAdd avoids emulated bf16 CAS on SM_80).
+  const int32_t MK = static_cast<int32_t>(M * K);
   cudaMemsetAsync(
-      output.data_ptr(), 0,
-      M * K * output.element_size(), stream);
+      float_buf.data_ptr(), 0,
+      M * K * sizeof(float), stream);
 
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
@@ -219,6 +222,8 @@ void scatter_add_direct(
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
+  float* float_ptr = float_buf.data_ptr<float>();
+
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
       "scatter_add_direct",
@@ -226,17 +231,30 @@ void scatter_add_direct(
         [&] {
           scatter_add_direct_kernel<__nv_bfloat16>
               <<<grid, block, 0, stream>>>(
+              float_ptr, config, mc32, K32);
+          // Convert float -> bf16 into output.
+          int32_t conv_grid = (MK + kBlockSize - 1)
+              / kBlockSize;
+          if (conv_grid > 1024) conv_grid = 1024;
+          convert_float_to_T_kernel<__nv_bfloat16>
+              <<<conv_grid, kBlockSize, 0, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              float_ptr, MK);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
           scatter_add_direct_kernel<__half>
               <<<grid, block, 0, stream>>>(
+              float_ptr, config, mc32, K32);
+          int32_t conv_grid = (MK + kBlockSize - 1)
+              / kBlockSize;
+          if (conv_grid > 1024) conv_grid = 1024;
+          convert_float_to_T_kernel<__half>
+              <<<conv_grid, kBlockSize, 0, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              float_ptr, MK);
         })
   );
 }
@@ -245,6 +263,7 @@ void combine_and_scatter(
     torch::Tensor expert_output,
     torch::Tensor dispatch_meta,
     torch::Tensor output,
+    torch::Tensor float_buf,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M) {
@@ -259,10 +278,12 @@ void combine_and_scatter(
       reinterpret_cast<const TokenMetadata*>(
           dispatch_meta.data_ptr());
 
-  // Zero output before scatter-add (atomicAdd).
+  // Zero float accumulation buffer (native float
+  // atomicAdd avoids emulated bf16 CAS on SM_80).
+  const int32_t MK = static_cast<int32_t>(M * K);
   cudaMemsetAsync(
-      output.data_ptr(), 0,
-      M * K * output.element_size(), stream);
+      float_buf.data_ptr(), 0,
+      M * K * sizeof(float), stream);
 
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
@@ -272,6 +293,8 @@ void combine_and_scatter(
   if (grid_sz < 1) grid_sz = 1;
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
+
+  float* float_ptr = float_buf.data_ptr<float>();
 
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
@@ -283,9 +306,17 @@ void combine_and_scatter(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
               meta,
+              float_ptr,
+              config, mc32, K32);
+          // Convert float -> bf16 into output.
+          int32_t conv_grid = (MK + kBlockSize - 1)
+              / kBlockSize;
+          if (conv_grid > 1024) conv_grid = 1024;
+          convert_float_to_T_kernel<__nv_bfloat16>
+              <<<conv_grid, kBlockSize, 0, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              float_ptr, MK);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -294,9 +325,16 @@ void combine_and_scatter(
               reinterpret_cast<const __half*>(
                   expert_output.data_ptr()),
               meta,
+              float_ptr,
+              config, mc32, K32);
+          int32_t conv_grid = (MK + kBlockSize - 1)
+              / kBlockSize;
+          if (conv_grid > 1024) conv_grid = 1024;
+          convert_float_to_T_kernel<__half>
+              <<<conv_grid, kBlockSize, 0, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              float_ptr, MK);
         })
   );
 }

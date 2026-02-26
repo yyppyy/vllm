@@ -23,12 +23,14 @@ void prepare_dispatch_recv(torch::Tensor dispatch_recv,
                            int64_t mc, int64_t K,
                            int64_t num_experts);
 void scatter_add_direct(torch::Tensor output,
+                        torch::Tensor float_buf,
                         torch::Tensor config_tensor,
                         int64_t mc, int64_t K,
                         int64_t M);
 void combine_and_scatter(torch::Tensor expert_output,
                          torch::Tensor dispatch_meta,
                          torch::Tensor output,
+                         torch::Tensor float_buf,
                          torch::Tensor config_tensor,
                          int64_t mc, int64_t K,
                          int64_t M);
@@ -896,6 +898,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
   dc.def(
       "scatter_add_direct("
       "Tensor! output, "
+      "Tensor! float_buf, "
       "Tensor config_tensor, "
       "int mc, int K, int M) -> ()");
   dc.impl("scatter_add_direct", torch::kCUDA,
@@ -908,6 +911,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "Tensor expert_output, "
       "Tensor dispatch_meta, "
       "Tensor! output, "
+      "Tensor! float_buf, "
       "Tensor config_tensor, "
       "int mc, int K, int M) -> ()");
   dc.impl("combine_and_scatter", torch::kCUDA,

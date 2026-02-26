@@ -200,6 +200,15 @@ class DispatchCombineP2PManager:
         self.data_remap_buf = None
         self._num_experts = None
 
+        # Float scratch for scatter-add accumulation.
+        # Native float atomicAdd avoids emulated bf16
+        # CAS on SM_80 (A100). Pre-allocated at max
+        # size for CUDA graph compatibility.
+        self.scatter_float_buf = torch.zeros(
+            max_num_tokens * hidden_dim,
+            dtype=torch.float32,
+            device=f'cuda:{self._device}')
+
         # Init barrier: sync all ranks after IPC setup.
         # Ensures cudaMemset zeroed offsets are visible
         # cross-GPU before first dispatch_p2p.
@@ -497,13 +506,14 @@ class DispatchCombineP2PManager:
 
     def gpu_scatter_add_direct(
             self, output: torch.Tensor, mc: int):
-        """Scatter-add from IPC combine buffers directly
-        into output using native bf16/fp16 atomicAdd.
-        Zeros output via cudaMemsetAsync before launch."""
+        """Scatter-add via float accumulation buffer.
+        Native float atomicAdd + convert to output dtype.
+        Float buf zeroed via cudaMemsetAsync."""
         M = output.shape[0]
         torch.ops._C_dispatch_combine\
             .scatter_add_direct(
-                output, self.config_tensor,
+                output, self.scatter_float_buf,
+                self.config_tensor,
                 mc, self.hidden_dim, M)
 
     def gpu_p2p_barrier_reset_dispatch(self):
@@ -519,14 +529,16 @@ class DispatchCombineP2PManager:
             output: torch.Tensor,
             mc: int):
         """Fused combine P2P + barrier + scatter-add.
-        Replaces combine_p2p + barrier_reset_dispatch +
-        scatter_add_direct in a single kernel launch."""
+        Uses float accumulation buffer for scatter-add
+        (native atomicAdd), then converts to output
+        dtype."""
         M = output.shape[0]
         torch.ops._C_dispatch_combine\
             .combine_and_scatter(
                 expert_output,
                 dispatch_meta,
                 output,
+                self.scatter_float_buf,
                 self.config_tensor,
                 mc, self.hidden_dim, M)
 

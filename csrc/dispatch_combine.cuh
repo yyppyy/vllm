@@ -493,12 +493,13 @@ __global__ void prepare_dispatch_recv_kernel(
 // Scatter-add direct: reads from IPC combine buffers
 // ====================================================================
 // Reads combine recv/meta via IPC pointers in config.
-// Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+).
-// Output must be pre-zeroed via cudaMemsetAsync.
+// Scatter-adds to a float accumulation buffer using
+// native float atomicAdd (avoids emulated bf16 CAS
+// on SM_80). float_output must be pre-zeroed.
 // Grid = mc, block = kBlockSize.
 template <typename T>
 __global__ void scatter_add_direct_kernel(
-    T* __restrict__ output,
+    float* __restrict__ float_output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t N_recv,
     int32_t K) {
@@ -531,8 +532,23 @@ __global__ void scatter_add_direct_kernel(
     float val = static_cast<float>(
         recv[idx * K + k]);
     atomicAdd(
-        output + token_idx * K + k,
-        static_cast<T>(val * weight));
+        float_output + token_idx * K + k,
+        val * weight);
+  }
+}
+
+// Convert float accumulation buffer to model dtype.
+// Launched after scatter-add completes.
+template <typename T>
+__global__ void convert_float_to_T_kernel(
+    T* __restrict__ output,
+    const float* __restrict__ float_buf,
+    int32_t N) {
+  for (int32_t i = blockIdx.x * blockDim.x
+           + threadIdx.x;
+       i < N;
+       i += gridDim.x * blockDim.x) {
+    output[i] = static_cast<T>(float_buf[i]);
   }
 }
 
@@ -544,14 +560,16 @@ __global__ void scatter_add_direct_kernel(
 // Phase 1: Combine P2P writes (persistent grid loop).
 // Grid-wide sync: all blocks done writing.
 // Phase 2: Inline P2P barrier (RESET_DISPATCH).
-// Phase 3: Scatter-add from local combine buffer.
-// Output must be pre-zeroed via cudaMemsetAsync.
+// Phase 3: Scatter-add to float accumulation buffer
+// (native float atomicAdd). float_output must be
+// pre-zeroed via cudaMemsetAsync; host wrapper
+// launches convert_float_to_T_kernel afterwards.
 // Grid = kPersistentGrid, block = kBlockSize.
 template <typename T>
 __global__ void combine_and_scatter_kernel(
     const T* __restrict__ expert_output,
     const TokenMetadata* __restrict__ dispatch_meta,
-    T* __restrict__ output,
+    float* __restrict__ float_output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc, int32_t K) {
   const int32_t rank = config->rank;
@@ -721,8 +739,8 @@ __global__ void combine_and_scatter_kernel(
       float val = static_cast<float>(
           crecv[idx * K + k]);
       atomicAdd(
-          output + token_idx * K + k,
-          static_cast<T>(val * wt));
+          float_output + token_idx * K + k,
+          val * wt);
     }
   }
 }
@@ -761,6 +779,7 @@ void prepare_dispatch_recv(
     int64_t num_experts);
 void scatter_add_direct(
     torch::Tensor output,
+    torch::Tensor float_buf,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M);
@@ -768,6 +787,7 @@ void combine_and_scatter(
     torch::Tensor expert_output,
     torch::Tensor dispatch_meta,
     torch::Tensor output,
+    torch::Tensor float_buf,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M);
@@ -1105,10 +1125,11 @@ __global__ void dar_phase_c_kernel(
   __threadfence();
 }
 
-// ---- Phase D1: Zero stale entries ----
+// ---- Phase D1: Stamp stale entry metadata ----
 // Grid = kPersistentGrid, block = kBlockSize.
 // All blocks participate (unlike fused kernel where
 // block 0 was occupied by Phase C).
+// K-data zeroing removed: stale data is never consumed.
 template <typename T>
 __global__ void dar_phase_d1_kernel(
     T* __restrict__ dispatch_recv,
@@ -1129,26 +1150,23 @@ __global__ void dar_phase_d1_kernel(
     bool is_real = (sec < ws)
         && (off < config->
             remote_dispatch_offsets[rank][sec]);
-    if (!is_real) {
-      T* dest = dispatch_recv + idx * K;
-      for (int32_t k = threadIdx.x; k < K;
-           k += blockDim.x) {
-        dest[k] = T(0);
-      }
-      if (threadIdx.x == 0) {
-        TokenMetadata* meta =
-            reinterpret_cast<TokenMetadata*>(
-                config->remote_dispatch_meta[rank]);
-        meta[idx].source_rank = -1;
-        meta[idx].source_token_idx = 0;
-        meta[idx].expert_id = num_physical_experts;
-        meta[idx].topk_weight = 0.0f;
-        data_remap[idx] = idx;
-        expert_topk_ids[idx] =
-            static_cast<int64_t>(
-                num_physical_experts);
-        expert_topk_weights[idx] = 0.0f;
-      }
+    if (!is_real && threadIdx.x == 0) {
+      // Stamp metadata sentinels so combine_p2p
+      // skips stale entries (weight==0 check).
+      // K-data zeroing removed: stale data is never
+      // consumed (bounded by expert_num_tokens).
+      TokenMetadata* meta =
+          reinterpret_cast<TokenMetadata*>(
+              config->remote_dispatch_meta[rank]);
+      meta[idx].source_rank = -1;
+      meta[idx].source_token_idx = 0;
+      meta[idx].expert_id = num_physical_experts;
+      meta[idx].topk_weight = 0.0f;
+      data_remap[idx] = idx;
+      expert_topk_ids[idx] =
+          static_cast<int64_t>(
+              num_physical_experts);
+      expert_topk_weights[idx] = 0.0f;
     }
   }
 }
@@ -1764,10 +1782,12 @@ __global__ void dispatch_and_route_kernel(
           config->routing_ready_flag, rf_expected);
     }
   } else {
-    // Phase D1: Zero stale entries (blocks 1-31,
+    // Phase D1: Stamp stale entries (blocks 1-31,
     // concurrent with Phase C on block 0).
-    // Section-aware: entry is real if its offset within
-    // its section is less than that section's count.
+    // K-data zeroing removed: stale data is never
+    // consumed (bounded by expert_num_tokens).
+    // Only metadata sentinels are needed so
+    // combine_p2p skips stale entries (weight==0).
     for (int32_t idx = blockIdx.x; idx < mc;
          idx += gridDim.x) {
       int32_t ss_d1 = config->dispatch_section_size;
@@ -1776,26 +1796,19 @@ __global__ void dispatch_and_route_kernel(
       bool real_d1 = (sec_d1 < ws)
           && (off_d1 < config->
               remote_dispatch_offsets[rank][sec_d1]);
-      if (!real_d1) {
-        T* dest = dispatch_recv + idx * K;
-        for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x) {
-          dest[k] = T(0);
-        }
-        if (threadIdx.x == 0) {
-          TokenMetadata* meta =
-              reinterpret_cast<TokenMetadata*>(
-                  config->remote_dispatch_meta[rank]);
-          meta[idx].source_rank = -1;
-          meta[idx].source_token_idx = 0;
-          meta[idx].expert_id = num_physical_experts;
-          meta[idx].topk_weight = 0.0f;
-          data_remap[idx] = idx;
-          expert_topk_ids[idx] =
-              static_cast<int64_t>(
-                  num_physical_experts);
-          expert_topk_weights[idx] = 0.0f;
-        }
+      if (!real_d1 && threadIdx.x == 0) {
+        TokenMetadata* meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_dispatch_meta[rank]);
+        meta[idx].source_rank = -1;
+        meta[idx].source_token_idx = 0;
+        meta[idx].expert_id = num_physical_experts;
+        meta[idx].topk_weight = 0.0f;
+        data_remap[idx] = idx;
+        expert_topk_ids[idx] =
+            static_cast<int64_t>(
+                num_physical_experts);
+        expert_topk_weights[idx] = 0.0f;
       }
     }
 
@@ -1909,13 +1922,16 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 
-  // Block 0: cooperative stale data zeroing.
-  // Entries at stride gridDim.x (0, 32, 64, ...) were
-  // NOT zeroed by Phase D1 (block 0 was doing Phase C).
-  // All threads cooperate to zero K values per entry.
-  if (blockIdx.x == 0) {
+  // Block 0: stamp metadata for stale entries at its
+  // stride (0, 32, 64, ...) which Phase D1 couldn't
+  // cover (block 0 was doing Phase C). K-data zeroing
+  // removed: stale data is never consumed.
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
     const int32_t ss_z =
         config->dispatch_section_size;
+    TokenMetadata* meta =
+        reinterpret_cast<TokenMetadata*>(
+            config->remote_dispatch_meta[rank]);
     for (int32_t idx = 0; idx < mc;
          idx += gridDim.x) {
       int32_t sec = idx / ss_z;
@@ -1924,11 +1940,15 @@ __global__ void dispatch_and_route_kernel(
           && (off < config->
               remote_dispatch_offsets[rank][sec]);
       if (!is_real) {
-        T* dest = dispatch_recv + idx * K;
-        for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x) {
-          dest[k] = T(0);
-        }
+        meta[idx].source_rank = -1;
+        meta[idx].source_token_idx = 0;
+        meta[idx].expert_id = num_physical_experts;
+        meta[idx].topk_weight = 0.0f;
+        data_remap[idx] = idx;
+        expert_topk_ids[idx] =
+            static_cast<int64_t>(
+                num_physical_experts);
+        expert_topk_weights[idx] = 0.0f;
       }
     }
   }
