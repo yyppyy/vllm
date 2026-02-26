@@ -147,11 +147,8 @@ void prepare_dispatch_recv(
       reinterpret_cast<const DispatchCombineConfig*>(
           config_tensor.data_ptr());
 
-  // Zero expert_num_tokens before kernel launch
-  // (atomicAdd needs zeroed counters).
-  cudaMemsetAsync(
-      expert_num_tokens.data_ptr(), 0,
-      num_experts * sizeof(int32_t), stream);
+  // expert_num_tokens zeroed inline by kernel (block 0
+  // after barrier, before signaling other blocks).
 
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
@@ -207,12 +204,10 @@ void scatter_add_direct(
       reinterpret_cast<const DispatchCombineConfig*>(
           config_tensor.data_ptr());
 
-  // Zero output before scatter-add (atomicAdd).
-  cudaMemsetAsync(
-      output.data_ptr(), 0,
-      M * K * output.element_size(), stream);
+  // Output zeroed inline by kernel (grid-wide sync).
 
   const int32_t K32 = static_cast<int32_t>(K);
+  const int32_t M32 = static_cast<int32_t>(M);
   int32_t grid_sz = kPersistentGrid;
   if (grid_sz < 1) grid_sz = 1;
   dim3 grid(grid_sz);
@@ -227,7 +222,7 @@ void scatter_add_direct(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, K32);
+              config, K32, M32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -235,7 +230,7 @@ void scatter_add_direct(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, K32);
+              config, K32, M32);
         })
   );
 }
@@ -258,13 +253,11 @@ void combine_and_scatter(
       reinterpret_cast<const TokenMetadata*>(
           dispatch_meta.data_ptr());
 
-  // Zero output before scatter-add (atomicAdd).
-  cudaMemsetAsync(
-      output.data_ptr(), 0,
-      M * K * output.element_size(), stream);
+  // Output zeroed inline by kernel (Phase 0).
 
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
+  const int32_t M32 = static_cast<int32_t>(M);
   int32_t grid_sz = mc32;
   if (grid_sz > kPersistentGrid)
     grid_sz = kPersistentGrid;
@@ -284,7 +277,7 @@ void combine_and_scatter(
               meta,
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              config, mc32, K32, M32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -295,7 +288,7 @@ void combine_and_scatter(
               meta,
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, mc32, K32);
+              config, mc32, K32, M32);
         })
   );
 }
@@ -362,10 +355,8 @@ void dispatch_and_route(
   const int32_t ws =
       static_cast<int32_t>(world_size);
 
-  // Zero expert_num_tokens (atomicAdd target).
-  cudaMemsetAsync(
-      expert_num_tokens.data_ptr(), 0,
-      num_physical_experts * sizeof(int32_t), stream);
+  // expert_num_tokens zeroed inline by kernel (Phase C,
+  // block 0, before routing_ready_flag signal).
 
   // NOTE: expert_counts is NOT zeroed here. It is zeroed
   // at the end of the kernel (Phase E). A host-side
@@ -543,6 +534,7 @@ void dar_phase_d1(
     torch::Tensor dispatch_recv,
     torch::Tensor expert_topk_ids,
     torch::Tensor expert_topk_weights,
+    torch::Tensor expert_num_tokens,
     torch::Tensor data_remap,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
@@ -573,6 +565,7 @@ void dar_phase_d1(
                   dispatch_recv.data_ptr()),
               expert_topk_ids.data_ptr<int64_t>(),
               expert_topk_weights.data_ptr<float>(),
+              expert_num_tokens.data_ptr<int32_t>(),
               data_remap.data_ptr<int32_t>(),
               config, mc32, K32, ne32);
         })
@@ -584,6 +577,7 @@ void dar_phase_d1(
                   dispatch_recv.data_ptr()),
               expert_topk_ids.data_ptr<int64_t>(),
               expert_topk_weights.data_ptr<float>(),
+              expert_num_tokens.data_ptr<int32_t>(),
               data_remap.data_ptr<int32_t>(),
               config, mc32, K32, ne32);
         })
@@ -610,10 +604,7 @@ void dar_phase_d2(
   const int32_t ne32 =
       static_cast<int32_t>(num_physical_experts);
 
-  // Zero expert_num_tokens (atomicAdd target).
-  cudaMemsetAsync(
-      expert_num_tokens.data_ptr(), 0,
-      num_physical_experts * sizeof(int32_t), stream);
+  // expert_num_tokens zeroed by D1 kernel (same stream).
 
   dim3 grid(kPersistentGrid);
   dim3 block(kBlockSize);

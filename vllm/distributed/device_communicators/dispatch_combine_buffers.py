@@ -499,7 +499,7 @@ class DispatchCombineP2PManager:
             self, output: torch.Tensor, mc: int):
         """Scatter-add from IPC combine buffers directly
         into output using native bf16/fp16 atomicAdd.
-        Zeros output via cudaMemsetAsync before launch."""
+        Output zeroed inline by kernel."""
         M = output.shape[0]
         torch.ops._C_dispatch_combine\
             .scatter_add_direct(
@@ -580,20 +580,20 @@ class DispatchCombineP2PManager:
     def gpu_dar_phase_d1(
             self, mc: int, K: int,
             num_experts: int):
-        """Phase D1: zero stale entries."""
+        """Phase D1: zero expert_num_tokens for D2."""
         torch.ops._C_dispatch_combine\
             .dar_phase_d1(
                 self.dispatch_recv_tensor,
                 self.expert_topk_ids_buf,
                 self.expert_topk_weights_buf,
+                self.expert_num_tokens_buf,
                 self.data_remap_buf,
                 self.config_tensor,
                 mc, K, num_experts)
 
     def gpu_dar_phase_d2(
             self, mc: int, num_experts: int):
-        """Phase D2: routing filter.
-        Zeros expert_num_tokens via cudaMemsetAsync."""
+        """Phase D2: routing filter."""
         torch.ops._C_dispatch_combine\
             .dar_phase_d2(
                 self.expert_topk_ids_buf,

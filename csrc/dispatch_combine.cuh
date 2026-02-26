@@ -379,7 +379,8 @@ __global__ void combine_p2p_kernel(
 // + routing extraction into one kernel. Block 0 does the
 // cross-GPU barrier; other blocks spin on the counter.
 // Grid = kPersistentGrid, block = kBlockSize.
-// expert_num_tokens must be pre-zeroed before launch.
+// expert_num_tokens is zeroed inline by block 0 after
+// barrier, before signaling other blocks.
 template <typename T>
 __global__ void prepare_dispatch_recv_kernel(
     T* __restrict__ dispatch_recv,
@@ -426,6 +427,14 @@ __global__ void prepare_dispatch_recv_kernel(
         ;
     }
 
+    __syncthreads();
+
+    // Zero expert_num_tokens for Phase 2's atomicAdd.
+    for (int32_t i = tid; i < num_experts;
+         i += blockDim.x) {
+      expert_num_tokens[i] = 0;
+    }
+    __threadfence();
     __syncthreads();
 
     if (tid == 0) {
@@ -494,13 +503,52 @@ __global__ void prepare_dispatch_recv_kernel(
 // ====================================================================
 // Reads combine recv/meta via IPC pointers in config.
 // Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+).
-// Output must be pre-zeroed via cudaMemsetAsync.
+// Output is zeroed inline using combine_done_counter
+// for grid-wide sync (avoids host-side cudaMemsetAsync).
 // Grid = kPersistentGrid, block = kBlockSize.
 template <typename T>
 __global__ void scatter_add_direct_kernel(
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
-    int32_t K) {
+    int32_t K, int32_t M) {
+  // ---- Phase 0: Zero output (grid-wide cooperative) ----
+  __shared__ FlagType s_cd_base;
+  if (threadIdx.x == 0) {
+    s_cd_base = static_cast<FlagType>(
+        *config->combine_done_counter);
+  }
+  __syncthreads();
+  FlagType cd_base = s_cd_base;
+
+  {
+    // Vectorized zero: int4 = 16 bytes = 8 BF16/FP16.
+    int4* out4 = reinterpret_cast<int4*>(output);
+    constexpr int32_t kElemsPerI4 =
+        static_cast<int32_t>(sizeof(int4) / sizeof(T));
+    int32_t n4 = M * K / kElemsPerI4;
+    int4 z4 = make_int4(0, 0, 0, 0);
+    for (int32_t i =
+             blockIdx.x * blockDim.x + threadIdx.x;
+         i < n4; i += gridDim.x * blockDim.x) {
+      out4[i] = z4;
+    }
+  }
+
+  // Grid-wide sync: all blocks done zeroing.
+  __syncthreads();
+  __threadfence();
+  if (threadIdx.x == 0) {
+    atomicAdd(config->combine_done_counter,
+              static_cast<FlagType>(1));
+    FlagType target = cd_base + gridDim.x;
+    while (dc_ld_flag_acquire(
+               config->combine_done_counter)
+            < target)
+      ;
+  }
+  __syncthreads();
+
+  // ---- Phase 1: Scatter-add from combine buffer ----
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
   const int32_t ss_c = config->combine_section_size;
@@ -545,11 +593,11 @@ __global__ void scatter_add_direct_kernel(
 // ====================================================================
 // Replaces 3 separate kernel launches:
 //   combine_p2p + p2p_barrier_reset_dispatch + scatter_add_direct
+// Phase 0: Zero output (all blocks cooperate).
 // Phase 1: Combine P2P writes (persistent grid loop).
 // Grid-wide sync: all blocks done writing.
 // Phase 2: Inline P2P barrier (RESET_DISPATCH).
 // Phase 3: Scatter-add from local combine buffer.
-// Output must be pre-zeroed via cudaMemsetAsync.
 // Grid = kPersistentGrid, block = kBlockSize.
 template <typename T>
 __global__ void combine_and_scatter_kernel(
@@ -557,7 +605,7 @@ __global__ void combine_and_scatter_kernel(
     const TokenMetadata* __restrict__ dispatch_meta,
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
-    int32_t mc, int32_t K) {
+    int32_t mc, int32_t K, int32_t M) {
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
 
@@ -574,6 +622,23 @@ __global__ void combine_and_scatter_kernel(
   __syncthreads();
   FlagType cd_base = s_cd_base;
   FlagType barrier_expected = s_barrier_expected;
+
+  // ---- Phase 0: Zero output ----
+  // Vectorized: int4 = 16 bytes = 8 BF16/FP16.
+  // Phase 1 doesn't touch output, and Phase 3 follows
+  // multiple system fences + barrier, so no extra sync.
+  {
+    int4* out4 = reinterpret_cast<int4*>(output);
+    constexpr int32_t kElemsPerI4 =
+        static_cast<int32_t>(sizeof(int4) / sizeof(T));
+    int32_t n4 = M * K / kElemsPerI4;
+    int4 z4 = make_int4(0, 0, 0, 0);
+    for (int32_t i =
+             blockIdx.x * blockDim.x + threadIdx.x;
+         i < n4; i += gridDim.x * blockDim.x) {
+      out4[i] = z4;
+    }
+  }
 
   // ---- Phase 1: Combine P2P writes ----
   // Section-aware iteration: loop only over real entries
@@ -1128,21 +1193,26 @@ __global__ void dar_phase_c_kernel(
   __threadfence();
 }
 
-// ---- Phase D1: No-op (stale stamping removed) ----
-// Combine kernels now use section-aware bounds checks
-// to skip stale entries. D2 fills sentinel defaults
-// for expert_topk_ids/weights/data_remap.
+// ---- Phase D1: Zero expert_num_tokens for D2 ----
+// D2 uses atomicAdd on expert_num_tokens, so it must
+// start at zero. Folded here to avoid host-side
+// cudaMemsetAsync overhead. Kernel-to-kernel ordering
+// on the same stream guarantees D2 sees the zeros.
 template <typename T>
 __global__ void dar_phase_d1_kernel(
     T* __restrict__ dispatch_recv,
     int64_t* __restrict__ expert_topk_ids,
     float* __restrict__ expert_topk_weights,
+    int32_t* __restrict__ expert_num_tokens,
     int32_t* __restrict__ data_remap,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc, int32_t K,
     int32_t num_physical_experts) {
-  // No-op: kept for API compatibility with split-phase
-  // profiling path (VLLM_DC_SPLIT_KERNELS=1).
+  for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < num_physical_experts;
+       i += gridDim.x * blockDim.x) {
+    expert_num_tokens[i] = 0;
+  }
 }
 
 // ---- Phase D2: Single-pass fill + routing filter ----
@@ -1151,7 +1221,8 @@ __global__ void dar_phase_d1_kernel(
 // if real and overwrite with routing results. Single
 // pass avoids cross-block race between fill and routing
 // when section boundaries don't align with grid stride.
-// expert_num_tokens must be pre-zeroed before launch.
+// expert_num_tokens is zeroed by D1 (split path) or
+// inline by Phase C / block 0 barrier (fused paths).
 __global__ void dar_phase_d2_kernel(
     int64_t* __restrict__ expert_topk_ids,
     float* __restrict__ expert_topk_weights,
@@ -1752,7 +1823,15 @@ __global__ void dispatch_and_route_kernel(
          e += blockDim.x) {
       config->routing_selection[e] = routing_sel[e];
     }
+
+    // Zero expert_num_tokens for Phase D2's atomicAdd.
+    for (int32_t i = threadIdx.x;
+         i < num_physical_experts;
+         i += blockDim.x) {
+      expert_num_tokens[i] = 0;
+    }
     __threadfence();
+    __syncthreads();
 
     // Signal routing complete.
     if (threadIdx.x == 0) {

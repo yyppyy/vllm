@@ -58,6 +58,7 @@ void dar_phase_c(torch::Tensor config_tensor,
 void dar_phase_d1(torch::Tensor dispatch_recv,
                   torch::Tensor expert_topk_ids,
                   torch::Tensor expert_topk_weights,
+                  torch::Tensor expert_num_tokens,
                   torch::Tensor data_remap,
                   torch::Tensor config_tensor,
                   int64_t mc, int64_t K, int64_t num_physical_experts);
@@ -967,6 +968,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "Tensor! dispatch_recv, "
       "Tensor! expert_topk_ids, "
       "Tensor! expert_topk_weights, "
+      "Tensor! expert_num_tokens, "
       "Tensor! data_remap, "
       "Tensor config_tensor, "
       "int mc, int K, "
