@@ -304,8 +304,11 @@ __global__ void combine_p2p_kernel(
 
   for (int32_t s = 0; s < ws_c; s++) {
     int32_t section_start = s * ss_d;
+    // Clamp to section size: raw counter may exceed ss_d
+    // due to overflow counting in dispatch atomicAdd.
     int32_t count = config->
         remote_dispatch_offsets[rank_c][s];
+    if (count > ss_d) count = ss_d;
     for (int32_t pair_idx = section_start + blockIdx.x;
          pair_idx < section_start + count;
          pair_idx += gridDim.x) {
@@ -453,9 +456,11 @@ __global__ void prepare_dispatch_recv_kernel(
        idx += gridDim.x) {
     int32_t sec = idx / ss_p;
     int32_t off = idx % ss_p;
+    int32_t sec_cnt_p = config->
+        remote_dispatch_offsets[rank][sec];
+    if (sec_cnt_p > ss_p) sec_cnt_p = ss_p;
     bool is_real = (sec < ws_p)
-        && (off < config->
-            remote_dispatch_offsets[rank][sec]);
+        && (off < sec_cnt_p);
     if (is_real) {
       if (threadIdx.x == 0) {
         const TokenMetadata* meta =
@@ -509,8 +514,11 @@ __global__ void scatter_add_direct_kernel(
   // Section-aware iteration: only visit real entries.
   for (int32_t s = 0; s < ws; s++) {
     int32_t section_start = s * ss_c;
+    // Clamp to section size: raw counter may exceed ss_c
+    // due to overflow counting in combine atomicAdd.
     int32_t count = config->
         remote_combine_offsets[rank][s];
+    if (count > ss_c) count = ss_c;
     for (int32_t idx = section_start + blockIdx.x;
          idx < section_start + count;
          idx += gridDim.x) {
@@ -578,6 +586,7 @@ __global__ void combine_and_scatter_kernel(
       int32_t section_start = s * ss_d;
       int32_t count = config->
           remote_dispatch_offsets[rank][s];
+      if (count > ss_d) count = ss_d;
       for (int32_t pair_idx =
                section_start + blockIdx.x;
            pair_idx < section_start + count;
@@ -718,6 +727,7 @@ __global__ void combine_and_scatter_kernel(
       int32_t section_start = s * ss_c;
       int32_t count = config->
           remote_combine_offsets[rank][s];
+      if (count > ss_c) count = ss_c;
       for (int32_t idx = section_start + blockIdx.x;
            idx < section_start + count;
            idx += gridDim.x) {
@@ -1178,12 +1188,15 @@ __global__ void dar_phase_d2_kernel(
       expert_topk_weights[idx] = 0.0f;
       data_remap[idx] = idx;
 
-      // Section-aware real check.
+      // Section-aware real check. Clamp count to
+      // section size: raw counter may exceed ss due
+      // to overflow counting in dispatch atomicAdd.
       int32_t sec = idx / ss;
       int32_t off = idx % ss;
-      if (sec < ws
-          && off < config->
-              remote_dispatch_offsets[rank][sec]) {
+      int32_t sec_count = config->
+          remote_dispatch_offsets[rank][sec];
+      if (sec_count > ss) sec_count = ss;
+      if (sec < ws && off < sec_count) {
         // Backward scan for group leader.
         int32_t section_start = sec * ss;
         int32_t leader = idx;
@@ -1784,12 +1797,14 @@ __global__ void dispatch_and_route_kernel(
         expert_topk_weights[idx] = 0.0f;
         data_remap[idx] = idx;
 
-        // Section-aware real check.
+        // Section-aware real check. Clamp count to
+        // section size: raw counter may exceed ss_d2.
         int32_t sec = idx / ss_d2;
         int32_t off = idx % ss_d2;
-        if (sec < ws
-            && off < config->
-                remote_dispatch_offsets[rank][sec]) {
+        int32_t sec_cnt = config->
+            remote_dispatch_offsets[rank][sec];
+        if (sec_cnt > ss_d2) sec_cnt = ss_d2;
+        if (sec < ws && off < sec_cnt) {
           // Backward scan for group leader.
           int32_t section_start = sec * ss_d2;
           int32_t leader = idx;
