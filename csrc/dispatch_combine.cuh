@@ -135,41 +135,12 @@ struct DispatchCombineConfig {
 };
 
 // ====================================================================
-// GPU-side buffer operations (CUDA-graph compatible)
-// ====================================================================
-
-// Reset local rank's dispatch and combine offset counters.
-// Launch with 1 block, 1 thread.
-__global__ void reset_offsets_kernel(
-    const DispatchCombineConfig* __restrict__ config) {
-  const int32_t rank = config->rank;
-  if (config->remote_dispatch_offsets[rank]) {
-    *config->remote_dispatch_offsets[rank] = 0;
-  }
-  if (config->remote_combine_offsets[rank]) {
-    *config->remote_combine_offsets[rank] = 0;
-  }
-}
-
-// Reset only the local rank's combine offset counter.
-// Launch with 1 block, 1 thread.
-__global__ void reset_combine_offset_kernel(
-    const DispatchCombineConfig* __restrict__ config) {
-  const int32_t rank = config->rank;
-  if (config->remote_combine_offsets[rank]) {
-    *config->remote_combine_offsets[rank] = 0;
-  }
-}
-
-// ====================================================================
 // P2P flag-based barrier kernels (replace NCCL AllReduce).
 // Launch with 1 block, kMaxRanks threads.
 // ====================================================================
 enum class BarrierMode : int {
-  PURE = 0,                    // Signal + wait only
-  RESET_DISPATCH_COMBINE = 1,  // Reset both offsets + barrier
-  RESET_COMBINE = 2,           // Reset combine offset + barrier
-  RESET_DISPATCH = 3,          // Reset dispatch offset + barrier
+  PURE = 0,            // Signal + wait only
+  RESET_DISPATCH = 1,  // Reset dispatch offset + barrier
 };
 
 template <BarrierMode mode>
@@ -181,19 +152,7 @@ __global__ void p2p_barrier_kernel(
   if (tid >= ws) return;
 
   // Optional reset (thread 0 only).
-  if constexpr (mode == BarrierMode::RESET_DISPATCH_COMBINE) {
-    if (tid == 0) {
-      if (config->remote_dispatch_offsets[rank])
-        *config->remote_dispatch_offsets[rank] = 0;
-      if (config->remote_combine_offsets[rank])
-        *config->remote_combine_offsets[rank] = 0;
-    }
-  } else if constexpr (mode == BarrierMode::RESET_COMBINE) {
-    if (tid == 0) {
-      if (config->remote_combine_offsets[rank])
-        *config->remote_combine_offsets[rank] = 0;
-    }
-  } else if constexpr (mode == BarrierMode::RESET_DISPATCH) {
+  if constexpr (mode == BarrierMode::RESET_DISPATCH) {
     if (tid == 0) {
       if (config->remote_dispatch_offsets[rank])
         *config->remote_dispatch_offsets[rank] = 0;
@@ -223,139 +182,6 @@ __global__ void p2p_barrier_kernel(
   if (tid == 0) {
     config->self_signals->counter = flag;
   }
-}
-
-// Copy dispatch recv data from IPC buffer to PyTorch tensor.
-// Reads actual count from the local dispatch offset counter.
-// Entries beyond actual count are zeroed.
-// Launch with max_recv blocks, kBlockSize threads.
-template <typename T>
-__global__ void copy_dispatch_recv_kernel(
-    T* __restrict__ output,  // (max_recv, K)
-    const DispatchCombineConfig* __restrict__ config,
-    int32_t K) {
-  const int32_t entry_idx = blockIdx.x;
-  const int32_t rank = config->rank;
-
-  // Read actual count from local dispatch offset counter.
-  int32_t actual_count =
-      *config->remote_dispatch_offsets[rank];
-  if (actual_count > config->max_recv)
-    actual_count = config->max_recv;
-
-  if (entry_idx >= actual_count) {
-    // Zero entries beyond actual count.
-    for (int32_t k = threadIdx.x; k < K; k += blockDim.x) {
-      output[entry_idx * K + k] = T(0);
-    }
-    return;
-  }
-
-  const T* src = reinterpret_cast<const T*>(
-      config->remote_dispatch_recv[rank]);
-  for (int32_t k = threadIdx.x; k < K; k += blockDim.x) {
-    output[entry_idx * K + k] = src[entry_idx * K + k];
-  }
-}
-
-// Copy dispatch metadata from IPC buffer to PyTorch tensor.
-// Entries beyond actual count are zeroed (weight=0).
-// Launch with max_recv blocks, 1 thread per block.
-__global__ void copy_dispatch_meta_kernel(
-    int32_t* __restrict__ output,  // (max_recv, 4)
-    const DispatchCombineConfig* __restrict__ config) {
-  const int32_t entry_idx = blockIdx.x;
-  const int32_t rank = config->rank;
-
-  int32_t actual_count =
-      *config->remote_dispatch_offsets[rank];
-  if (actual_count > config->max_recv)
-    actual_count = config->max_recv;
-
-  if (entry_idx >= actual_count) {
-    // Padding: use num_experts as expert_id sentinel
-    // so moe_align_block_size skips these entries
-    // (its kernel has: if expert_id >= num_experts continue).
-    output[entry_idx * 4 + 0] = 0;
-    output[entry_idx * 4 + 1] = 0;
-    output[entry_idx * 4 + 2] =
-        config->experts_per_rank * config->world_size;
-    *reinterpret_cast<float*>(
-        &output[entry_idx * 4 + 3]) = 0.0f;
-    return;
-  }
-
-  const TokenMetadata* src =
-      reinterpret_cast<const TokenMetadata*>(
-          config->remote_dispatch_meta[rank]);
-  const TokenMetadata& meta = src[entry_idx];
-  output[entry_idx * 4 + 0] = meta.source_rank;
-  output[entry_idx * 4 + 1] = meta.source_token_idx;
-  output[entry_idx * 4 + 2] = meta.expert_id;
-  *reinterpret_cast<float*>(
-      &output[entry_idx * 4 + 3]) = meta.topk_weight;
-}
-
-// Copy combine recv data from IPC buffer to PyTorch tensor.
-// Launch with max_recv blocks, kBlockSize threads.
-template <typename T>
-__global__ void copy_combine_recv_kernel(
-    T* __restrict__ output,  // (max_recv, K)
-    const DispatchCombineConfig* __restrict__ config,
-    int32_t K) {
-  const int32_t entry_idx = blockIdx.x;
-  const int32_t rank = config->rank;
-
-  int32_t actual_count =
-      *config->remote_combine_offsets[rank];
-  if (actual_count > config->max_recv)
-    actual_count = config->max_recv;
-
-  if (entry_idx >= actual_count) {
-    for (int32_t k = threadIdx.x; k < K; k += blockDim.x) {
-      output[entry_idx * K + k] = T(0);
-    }
-    return;
-  }
-
-  const T* src = reinterpret_cast<const T*>(
-      config->remote_combine_recv[rank]);
-  for (int32_t k = threadIdx.x; k < K; k += blockDim.x) {
-    output[entry_idx * K + k] = src[entry_idx * K + k];
-  }
-}
-
-// Copy combine metadata from IPC buffer to PyTorch tensor.
-// Launch with max_recv blocks, 1 thread per block.
-__global__ void copy_combine_meta_kernel(
-    int32_t* __restrict__ output,  // (max_recv, 4)
-    const DispatchCombineConfig* __restrict__ config) {
-  const int32_t entry_idx = blockIdx.x;
-  const int32_t rank = config->rank;
-
-  int32_t actual_count =
-      *config->remote_combine_offsets[rank];
-  if (actual_count > config->max_recv)
-    actual_count = config->max_recv;
-
-  if (entry_idx >= actual_count) {
-    output[entry_idx * 4 + 0] = 0;
-    output[entry_idx * 4 + 1] = 0;
-    output[entry_idx * 4 + 2] = 0;
-    *reinterpret_cast<float*>(
-        &output[entry_idx * 4 + 3]) = 0.0f;
-    return;
-  }
-
-  const TokenMetadata* src =
-      reinterpret_cast<const TokenMetadata*>(
-          config->remote_combine_meta[rank]);
-  const TokenMetadata& meta = src[entry_idx];
-  output[entry_idx * 4 + 0] = meta.source_rank;
-  output[entry_idx * 4 + 1] = meta.source_token_idx;
-  output[entry_idx * 4 + 2] = meta.expert_id;
-  *reinterpret_cast<float*>(
-      &output[entry_idx * 4 + 3]) = meta.topk_weight;
 }
 
 // ====================================================================
@@ -503,80 +329,6 @@ __global__ void combine_p2p_kernel(
 }
 
 // ====================================================================
-// Scatter-add weighted kernel
-// ====================================================================
-// Skips entries with zero weight (padding beyond actual count).
-template <typename T>
-__global__ void scatter_add_weighted_kernel(
-    float* __restrict__ output,
-    const T* __restrict__ combine_recv,
-    const TokenMetadata* __restrict__ combine_meta,
-    int32_t N_recv,
-    int32_t K) {
-  const int32_t entry_idx = blockIdx.x;
-  if (entry_idx >= N_recv) return;
-
-  const int32_t token_idx =
-      combine_meta[entry_idx].source_token_idx;
-  const float weight =
-      combine_meta[entry_idx].topk_weight;
-
-  // Skip zero-weight entries (padding beyond actual count).
-  if (weight == 0.0f) return;
-
-  for (int32_t k = threadIdx.x; k < K; k += blockDim.x) {
-    float val = static_cast<float>(
-        combine_recv[entry_idx * K + k]);
-    val *= weight;
-    atomicAdd(output + token_idx * K + k, val);
-  }
-}
-
-// ====================================================================
-// Stamp + zero stale dispatch entries (replaces copy kernels)
-// ====================================================================
-// After post-dispatch barrier, stamps sentinel metadata and
-// zeros stale data for entries beyond actual_count.
-// Grid = mc (tight upper bound), block = kBlockSize.
-template <typename T>
-__global__ void stamp_and_zero_dispatch_kernel(
-    T* __restrict__ dispatch_recv,  // IPC buffer, in-place
-    const DispatchCombineConfig* __restrict__ config,
-    int32_t mc,
-    int32_t K) {
-  const int32_t idx = blockIdx.x;
-  if (idx >= mc) return;
-
-  const int32_t rank = config->rank;
-  int32_t actual =
-      *config->remote_dispatch_offsets[rank];
-  if (actual > config->max_recv)
-    actual = config->max_recv;
-
-  // Real entries: skip (written by dispatch_p2p).
-  if (idx < actual) return;
-
-  // Stale entries: zero data for quantization safety.
-  T* dest = dispatch_recv + idx * K;
-  for (int32_t k = threadIdx.x; k < K;
-       k += blockDim.x) {
-    dest[k] = T(0);
-  }
-
-  // Stamp sentinel metadata (expert_id = num_experts).
-  if (threadIdx.x == 0) {
-    TokenMetadata* meta =
-        reinterpret_cast<TokenMetadata*>(
-            config->remote_dispatch_meta[rank]);
-    meta[idx].source_rank = 0;
-    meta[idx].source_token_idx = 0;
-    meta[idx].expert_id =
-        config->experts_per_rank * config->world_size;
-    meta[idx].topk_weight = 0.0f;
-  }
-}
-
-// ====================================================================
 // Fused prepare: barrier + stamp/zero + routing metadata
 // ====================================================================
 // Fuses p2p_barrier(RESET_COMBINE) + stamp_and_zero_dispatch
@@ -687,48 +439,6 @@ __global__ void prepare_dispatch_recv_kernel(
 }
 
 // ====================================================================
-// Scatter-add v2: reads directly from IPC buffers
-// ====================================================================
-// Replaces copy_combine_recv + copy_combine_meta +
-// scatter_add_weighted. Reads IPC buffers via config ptrs.
-// Grid = mc, block = kBlockSize.
-template <typename T>
-__global__ void scatter_add_v2_kernel(
-    float* __restrict__ output,
-    const DispatchCombineConfig* __restrict__ config,
-    int32_t N_recv,
-    int32_t K) {
-  const int32_t idx = blockIdx.x;
-  if (idx >= N_recv) return;
-
-  const int32_t rank = config->rank;
-  int32_t actual =
-      *config->remote_combine_offsets[rank];
-  if (actual > config->max_recv)
-    actual = config->max_recv;
-  if (idx >= actual) return;
-
-  const TokenMetadata* meta =
-      reinterpret_cast<const TokenMetadata*>(
-          config->remote_combine_meta[rank]);
-  const T* recv = reinterpret_cast<const T*>(
-      config->remote_combine_recv[rank]);
-
-  const int32_t token_idx =
-      meta[idx].source_token_idx;
-  const float weight = meta[idx].topk_weight;
-  if (weight == 0.0f) return;
-
-  for (int32_t k = threadIdx.x; k < K;
-       k += blockDim.x) {
-    float val = static_cast<float>(
-        recv[idx * K + k]);
-    atomicAdd(
-        output + token_idx * K + k, val * weight);
-  }
-}
-
-// ====================================================================
 // Scatter-add direct: reads from IPC combine buffers
 // ====================================================================
 // Reads combine recv/meta via IPC pointers in config.
@@ -782,58 +492,16 @@ void dispatch_p2p(
     torch::Tensor config_tensor,
     int64_t M, int64_t K, int64_t topk);
 
-// combine_p2p: grid = max_recv, reads actual count from config.
 void combine_p2p(
     torch::Tensor expert_output,
     torch::Tensor dispatch_meta,
     torch::Tensor config_tensor,
     int64_t max_recv, int64_t K);
 
-void scatter_add_weighted(
-    torch::Tensor output,
-    torch::Tensor combine_recv,
-    torch::Tensor combine_meta,
-    int64_t N_recv, int64_t K);
-
-// GPU-side buffer operations (CUDA-graph compatible).
-void reset_offsets(torch::Tensor config_tensor);
-void reset_combine_offset(torch::Tensor config_tensor);
-
-// P2P flag-based barriers (replace NCCL AllReduce).
 void p2p_barrier(torch::Tensor config_tensor);
-void p2p_barrier_reset_offsets(
-    torch::Tensor config_tensor);
-void p2p_barrier_reset_combine_offset(
-    torch::Tensor config_tensor);
 void p2p_barrier_reset_dispatch(
     torch::Tensor config_tensor);
-void copy_dispatch_recv(
-    torch::Tensor output,
-    torch::Tensor config_tensor,
-    int64_t max_recv, int64_t K);
-void copy_dispatch_meta(
-    torch::Tensor output,
-    torch::Tensor config_tensor,
-    int64_t max_recv);
-void copy_combine_recv(
-    torch::Tensor output,
-    torch::Tensor config_tensor,
-    int64_t max_recv, int64_t K);
-void copy_combine_meta(
-    torch::Tensor output,
-    torch::Tensor config_tensor,
-    int64_t max_recv);
 
-// New fused kernels (eliminate copy overhead).
-void stamp_and_zero_dispatch(
-    torch::Tensor dispatch_recv,
-    torch::Tensor config_tensor,
-    int64_t mc, int64_t K);
-void scatter_add_v2(
-    torch::Tensor output,
-    torch::Tensor config_tensor,
-    int64_t mc, int64_t K,
-    int64_t dtype_code);
 torch::Tensor wrap_cuda_ptr(
     torch::Tensor dummy,
     int64_t ptr, int64_t dim0, int64_t dim1,

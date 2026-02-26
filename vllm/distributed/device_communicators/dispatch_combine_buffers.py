@@ -33,11 +33,10 @@ class DispatchCombineP2PManager:
     - combine_meta: (max_recv * 16) bytes
     - combine_offset: 4 bytes
 
-    Pre-allocated PyTorch tensors for GPU-side copy destinations:
+    Non-owning PyTorch tensor views over IPC buffers
+    (via wrap_cuda_ptr):
     - dispatch_recv_tensor: (max_recv, hidden_dim) dtype
     - dispatch_meta_tensor: (max_recv, 4) int32
-    - combine_recv_tensor: (max_recv, hidden_dim) dtype
-    - combine_meta_tensor: (max_recv, 4) int32
     """
 
     def __init__(
@@ -150,7 +149,6 @@ class DispatchCombineP2PManager:
         # dtype_code: 0=bf16, 1=fp16, 2=int32
         dtype_code = (
             0 if dtype == torch.bfloat16 else 1)
-        self._dtype_code = dtype_code
         ct = self.config_tensor  # dummy for dispatch
         self.dispatch_recv_tensor = (
             torch.ops._C_dispatch_combine.wrap_cuda_ptr(
@@ -161,16 +159,6 @@ class DispatchCombineP2PManager:
             torch.ops._C_dispatch_combine.wrap_cuda_ptr(
                 ct, self._raw_dispatch_meta.value,
                 self.max_recv, 4, 2))  # int32
-        self.combine_recv_tensor = (
-            torch.ops._C_dispatch_combine.wrap_cuda_ptr(
-                ct, self._raw_combine_recv.value,
-                self.max_recv, hidden_dim,
-                dtype_code))
-        self.combine_meta_tensor = (
-            torch.ops._C_dispatch_combine.wrap_cuda_ptr(
-                ct, self._raw_combine_meta.value,
-                self.max_recv, 4, 2))  # int32
-
         # Persistent buffers for fused prepare kernel.
         # Pre-allocated once; reused every MoE layer.
         # expert_topk_ids: (max_recv,) int64
@@ -463,80 +451,16 @@ class DispatchCombineP2PManager:
     # GPU-side ops (CUDA-graph compatible)
     # ================================================================
 
-    def gpu_reset_offsets(self):
-        """Reset dispatch+combine offset counters (GPU kernel).
-        """
-        torch.ops._C_dispatch_combine.reset_offsets(
-            self.config_tensor)
-
-    def gpu_reset_combine_offset(self):
-        """Reset combine offset counter (GPU kernel)."""
-        torch.ops._C_dispatch_combine.reset_combine_offset(
-            self.config_tensor)
-
-    def gpu_copy_dispatch_recv(self):
-        """Copy dispatch recv from IPC to pre-allocated tensor.
-        """
-        torch.ops._C_dispatch_combine.copy_dispatch_recv(
-            self.dispatch_recv_tensor,
-            self.config_tensor,
-            self.max_recv,
-            self.hidden_dim)
-
-    def gpu_copy_dispatch_meta(self):
-        """Copy dispatch metadata from IPC to tensor."""
-        torch.ops._C_dispatch_combine.copy_dispatch_meta(
-            self.dispatch_meta_tensor,
-            self.config_tensor,
-            self.max_recv)
-
-    def gpu_copy_combine_recv(self):
-        """Copy combine recv from IPC to tensor."""
-        torch.ops._C_dispatch_combine.copy_combine_recv(
-            self.combine_recv_tensor,
-            self.config_tensor,
-            self.max_recv,
-            self.hidden_dim)
-
-    def gpu_copy_combine_meta(self):
-        """Copy combine metadata from IPC to tensor."""
-        torch.ops._C_dispatch_combine.copy_combine_meta(
-            self.combine_meta_tensor,
-            self.config_tensor,
-            self.max_recv)
-
     def gpu_p2p_barrier(self):
         """P2P flag-based barrier (GPU kernel)."""
         torch.ops._C_dispatch_combine.p2p_barrier(
             self.config_tensor)
 
-    def gpu_stamp_and_zero_dispatch(self, mc: int):
-        """Stamp sentinel meta + zero stale data for
-        entries beyond actual_count. Resets BOTH offset
-        counters. Grid = mc for minimal decode cost."""
-        torch.ops._C_dispatch_combine\
-            .stamp_and_zero_dispatch(
-                self.dispatch_recv_tensor,
-                self.config_tensor,
-                mc, self.hidden_dim)
-
-    def gpu_scatter_add_v2(
-            self, output: torch.Tensor, mc: int):
-        """Scatter-add from IPC combine buffers directly
-        into output. Reads actual_count from combine
-        offset. Grid = mc."""
-        torch.ops._C_dispatch_combine.scatter_add_v2(
-            output,
-            self.config_tensor,
-            mc, self.hidden_dim,
-            self._dtype_code)
-
     def gpu_scatter_add_direct(
             self, output: torch.Tensor, mc: int):
         """Scatter-add from IPC combine buffers directly
         into output using native bf16/fp16 atomicAdd.
-        Zeros output via cudaMemsetAsync before launch.
-        Eliminates float32 accumulator + cast."""
+        Zeros output via cudaMemsetAsync before launch."""
         M = output.shape[0]
         torch.ops._C_dispatch_combine\
             .scatter_add_direct(
@@ -547,12 +471,6 @@ class DispatchCombineP2PManager:
         """Reset dispatch offset + P2P barrier."""
         torch.ops._C_dispatch_combine\
             .p2p_barrier_reset_dispatch(
-                self.config_tensor)
-
-    def gpu_p2p_barrier_reset_offsets(self):
-        """Reset dispatch+combine offsets + P2P barrier."""
-        torch.ops._C_dispatch_combine\
-            .p2p_barrier_reset_offsets(
                 self.config_tensor)
 
     def init_prepare_buffers(self, num_experts: int):
@@ -598,12 +516,6 @@ class DispatchCombineP2PManager:
             .unsqueeze(1),
             self.expert_num_tokens_buf,
         )
-
-    def gpu_p2p_barrier_reset_combine_offset(self):
-        """Reset combine offset + P2P barrier."""
-        torch.ops._C_dispatch_combine\
-            .p2p_barrier_reset_combine_offset(
-                self.config_tensor)
 
     # ================================================================
     # Integrated routing (EPLB) support
