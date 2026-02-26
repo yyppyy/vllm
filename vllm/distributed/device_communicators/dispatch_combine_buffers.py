@@ -530,6 +530,84 @@ class DispatchCombineP2PManager:
                 self.config_tensor,
                 mc, self.hidden_dim, M)
 
+    def gpu_combine_p2p(
+            self,
+            expert_output: torch.Tensor,
+            dispatch_meta: torch.Tensor,
+            mc: int):
+        """Combine P2P writes (standalone kernel)."""
+        torch.ops._C_dispatch_combine.combine_p2p(
+            expert_output, dispatch_meta,
+            self.config_tensor,
+            mc, self.hidden_dim)
+
+    # ================================================================
+    # Split-phase dispatch+route ops (profiling mode)
+    # ================================================================
+
+    def gpu_dar_phase_a(
+            self,
+            input_tensor: torch.Tensor,
+            topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            M: int, K: int, topk: int):
+        """Phase A: broadcast dispatch + expert count
+        accumulation."""
+        torch.ops._C_dispatch_combine\
+            .dar_phase_a(
+                input_tensor, topk_ids,
+                topk_weights,
+                self.config_tensor,
+                M, K, topk,
+                self._num_logical_experts,
+                self.world_size)
+
+    def gpu_dar_push_and_barrier(self):
+        """Allgather push + P2P barrier
+        (RESET_COMBINE)."""
+        torch.ops._C_dispatch_combine\
+            .dar_push_and_barrier(
+                self.config_tensor)
+
+    def gpu_dar_phase_c(self):
+        """Phase C: deterministic router."""
+        torch.ops._C_dispatch_combine\
+            .dar_phase_c(
+                self.config_tensor,
+                self._num_logical_experts,
+                self.world_size)
+
+    def gpu_dar_phase_d1(
+            self, mc: int, K: int,
+            num_experts: int):
+        """Phase D1: zero stale entries."""
+        torch.ops._C_dispatch_combine\
+            .dar_phase_d1(
+                self.dispatch_recv_tensor,
+                self.expert_topk_ids_buf,
+                self.expert_topk_weights_buf,
+                self.data_remap_buf,
+                self.config_tensor,
+                mc, K, num_experts)
+
+    def gpu_dar_phase_d2(
+            self, mc: int, num_experts: int):
+        """Phase D2: routing filter.
+        Zeros expert_num_tokens via cudaMemsetAsync."""
+        torch.ops._C_dispatch_combine\
+            .dar_phase_d2(
+                self.expert_topk_ids_buf,
+                self.expert_topk_weights_buf,
+                self.expert_num_tokens_buf,
+                self.data_remap_buf,
+                self.config_tensor,
+                mc, num_experts)
+
+    def gpu_dar_phase_e(self):
+        """Phase E: zero counts for next invocation."""
+        torch.ops._C_dispatch_combine\
+            .dar_phase_e(self.config_tensor)
+
     def init_prepare_buffers(self, num_experts: int):
         """Allocate expert_num_tokens buffer once
         num_experts is known (set by PrepareAndFinalize

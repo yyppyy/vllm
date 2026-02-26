@@ -10,9 +10,17 @@ compatibility. Synchronization uses NCCL all-reduce barriers on the
 EP device group instead of host-side torch.cuda.synchronize() or
 dist.barrier(cpu_group).
 """
+import os
 from typing import Callable, Optional
 
 import torch
+
+# When set, dispatch_and_route and combine_and_scatter
+# are split into per-phase kernels for profiling with
+# nsys/ncu. Default: fused (0).
+_DC_SPLIT_KERNELS = (
+    os.environ.get('VLLM_DC_SPLIT_KERNELS', '0')
+    == '1')
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
@@ -182,16 +190,45 @@ class DispatchCombinePrepareAndFinalize(
         topk_ids_i32 = topk_ids.to(torch.int32)
         topk_weights_f32 = topk_weights.to(torch.float32)
 
-        # Single fused kernel: dispatch + all-reduce +
-        # barrier + route + filter.
-        (expert_topk_ids,
-         expert_topk_weights,
-         expert_num_tokens,
-         data_remap) = (
-            mgr.gpu_dispatch_and_route(
+        if mgr.expert_num_tokens_buf is None:
+            mgr.init_prepare_buffers(num_experts)
+
+        if _DC_SPLIT_KERNELS:
+            # Split-phase path: 6 separate kernels
+            # for per-phase latency profiling.
+            mgr.gpu_dar_phase_a(
                 a1, topk_ids_i32, topk_weights_f32,
-                self._mc, M, K, topk,
-                num_experts))
+                M, K, topk)
+            mgr.gpu_dar_push_and_barrier()
+            mgr.gpu_dar_phase_c()
+            mgr.gpu_dar_phase_d1(
+                self._mc, K, num_experts)
+            mgr.gpu_dar_phase_d2(
+                self._mc, num_experts)
+            mgr.gpu_dar_phase_e()
+
+            expert_topk_ids = (
+                mgr.expert_topk_ids_buf[:self._mc]
+                .unsqueeze(1))
+            expert_topk_weights = (
+                mgr.expert_topk_weights_buf[
+                    :self._mc]
+                .unsqueeze(1))
+            expert_num_tokens = (
+                mgr.expert_num_tokens_buf)
+            data_remap = (
+                mgr.data_remap_buf[:self._mc])
+        else:
+            # Fused path: single kernel launch.
+            (expert_topk_ids,
+             expert_topk_weights,
+             expert_num_tokens,
+             data_remap) = (
+                mgr.gpu_dispatch_and_route(
+                    a1, topk_ids_i32,
+                    topk_weights_f32,
+                    self._mc, M, K, topk,
+                    num_experts))
 
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
@@ -321,18 +358,24 @@ class DispatchCombinePrepareAndFinalize(
                         apply_router_weight_on_input),
                 ))
 
-        # Step 2: Fused combine + barrier + scatter-add.
-        # Single kernel replaces combine_p2p +
-        # barrier_reset_dispatch + scatter_add_direct.
-        # Saves ~10us kernel launch overhead.
+        # Step 2: Combine + barrier + scatter-add.
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc]
             .contiguous().view(torch.uint8))
-        mgr.gpu_combine_and_scatter(
-            fused_expert_output,
-            meta_bytes,
-            output,
-            mc)
+        if _DC_SPLIT_KERNELS:
+            # Split path: 3 separate kernels.
+            mgr.gpu_combine_p2p(
+                fused_expert_output,
+                meta_bytes, mc)
+            mgr.gpu_p2p_barrier_reset_dispatch()
+            mgr.gpu_scatter_add_direct(output, mc)
+        else:
+            # Fused path: single kernel launch.
+            mgr.gpu_combine_and_scatter(
+                fused_expert_output,
+                meta_bytes,
+                output,
+                mc)
 
         if do_async:
             return lambda: None
