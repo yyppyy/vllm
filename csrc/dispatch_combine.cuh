@@ -493,13 +493,12 @@ __global__ void prepare_dispatch_recv_kernel(
 // Scatter-add direct: reads from IPC combine buffers
 // ====================================================================
 // Reads combine recv/meta via IPC pointers in config.
-// Scatter-adds to a float accumulation buffer using
-// native float atomicAdd (avoids emulated bf16 CAS
-// on SM_80). float_output must be pre-zeroed.
+// Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+).
+// Output must be pre-zeroed via cudaMemsetAsync.
 // Grid = mc, block = kBlockSize.
 template <typename T>
 __global__ void scatter_add_direct_kernel(
-    float* __restrict__ float_output,
+    T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t N_recv,
     int32_t K) {
@@ -532,23 +531,8 @@ __global__ void scatter_add_direct_kernel(
     float val = static_cast<float>(
         recv[idx * K + k]);
     atomicAdd(
-        float_output + token_idx * K + k,
-        val * weight);
-  }
-}
-
-// Convert float accumulation buffer to model dtype.
-// Launched after scatter-add completes.
-template <typename T>
-__global__ void convert_float_to_T_kernel(
-    T* __restrict__ output,
-    const float* __restrict__ float_buf,
-    int32_t N) {
-  for (int32_t i = blockIdx.x * blockDim.x
-           + threadIdx.x;
-       i < N;
-       i += gridDim.x * blockDim.x) {
-    output[i] = static_cast<T>(float_buf[i]);
+        output + token_idx * K + k,
+        static_cast<T>(val * weight));
   }
 }
 
@@ -560,16 +544,14 @@ __global__ void convert_float_to_T_kernel(
 // Phase 1: Combine P2P writes (persistent grid loop).
 // Grid-wide sync: all blocks done writing.
 // Phase 2: Inline P2P barrier (RESET_DISPATCH).
-// Phase 3: Scatter-add to float accumulation buffer
-// (native float atomicAdd). float_output must be
-// pre-zeroed via cudaMemsetAsync; host wrapper
-// launches convert_float_to_T_kernel afterwards.
+// Phase 3: Scatter-add from local combine buffer.
+// Output must be pre-zeroed via cudaMemsetAsync.
 // Grid = kPersistentGrid, block = kBlockSize.
 template <typename T>
 __global__ void combine_and_scatter_kernel(
     const T* __restrict__ expert_output,
     const TokenMetadata* __restrict__ dispatch_meta,
-    float* __restrict__ float_output,
+    T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc, int32_t K) {
   const int32_t rank = config->rank;
@@ -739,8 +721,8 @@ __global__ void combine_and_scatter_kernel(
       float val = static_cast<float>(
           crecv[idx * K + k]);
       atomicAdd(
-          float_output + token_idx * K + k,
-          val * wt);
+          output + token_idx * K + k,
+          static_cast<T>(val * wt));
     }
   }
 }
@@ -779,7 +761,6 @@ void prepare_dispatch_recv(
     int64_t num_experts);
 void scatter_add_direct(
     torch::Tensor output,
-    torch::Tensor float_buf,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M);
@@ -787,7 +768,6 @@ void combine_and_scatter(
     torch::Tensor expert_output,
     torch::Tensor dispatch_meta,
     torch::Tensor output,
-    torch::Tensor float_buf,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M);
