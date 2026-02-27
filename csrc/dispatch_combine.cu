@@ -207,8 +207,6 @@ void scatter_add_direct(
       reinterpret_cast<const DispatchCombineConfig*>(
           config_tensor.data_ptr());
 
-  // Gather kernel writes final values directly (no zeroing).
-
   const int32_t K32 = static_cast<int32_t>(K);
   const int32_t M32 = static_cast<int32_t>(M);
   int32_t grid_sz =
@@ -219,24 +217,34 @@ void scatter_add_direct(
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
+  // Tile rows into chunks that fit in 48KB shared memory.
+  // tile_m = 49152 / (256 * 4) = 48 for kBlockSize=256.
+  constexpr int32_t kMaxSmemBytes = 49152;
+  const int32_t tile_m =
+      kMaxSmemBytes
+      / (kBlockSize * static_cast<int32_t>(sizeof(float)));
+  const int32_t smem_bytes =
+      kBlockSize * tile_m
+      * static_cast<int32_t>(sizeof(float));
+
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
       "scatter_add_direct",
       AT_DISPATCH_CASE(at::ScalarType::BFloat16,
         [&] {
           scatter_add_direct_kernel<__nv_bfloat16>
-              <<<grid, block, 0, stream>>>(
+              <<<grid, block, smem_bytes, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, K32, M32);
+              config, K32, M32, tile_m);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
           scatter_add_direct_kernel<__half>
-              <<<grid, block, 0, stream>>>(
+              <<<grid, block, smem_bytes, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, K32, M32);
+              config, K32, M32, tile_m);
         })
   );
 }

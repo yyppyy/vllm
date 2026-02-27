@@ -508,19 +508,23 @@ __global__ void prepare_dispatch_recv_kernel(
 // Reads combine recv/meta via IPC pointers in config.
 // Gather-accumulate scatter-add: each thread owns a column k
 // and gathers contributions from all recv entries into
-// per-row float32 accumulators. No atomicAdd needed.
-// For M > kAccTile, processes rows in tiles.
+// per-row float32 accumulators in shared memory.
+// No atomicAdd needed. Each thread's smem slots are
+// private (stride = blockDim.x), so no __syncthreads.
+// Layout: smem[tid + m * bdim] → zero bank conflicts.
 // Grid = min(ceil(K/kBlockSize), kPersistentGrid).
-constexpr int32_t kAccTile = 256;
-
 template <typename T>
 __global__ void scatter_add_direct_kernel(
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
-    int32_t K, int32_t M) {
+    int32_t K, int32_t M, int32_t tile_m) {
+  extern __shared__ float smem_acc[];
+
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
   const int32_t ss_c = config->combine_section_size;
+  const int32_t tid = threadIdx.x;
+  const int32_t bdim = blockDim.x;
 
   const TokenMetadata* meta =
       reinterpret_cast<const TokenMetadata*>(
@@ -529,21 +533,19 @@ __global__ void scatter_add_direct_kernel(
       config->remote_combine_recv[rank]);
 
   // Each thread owns column k exclusively.
-  for (int32_t k = blockIdx.x * blockDim.x + threadIdx.x;
-       k < K; k += gridDim.x * blockDim.x) {
+  for (int32_t k = blockIdx.x * bdim + tid;
+       k < K; k += gridDim.x * bdim) {
 
-    // Process output rows in tiles of kAccTile.
+    // Process output rows in tiles of tile_m.
     for (int32_t m_base = 0; m_base < M;
-         m_base += kAccTile) {
-      int32_t tile_end = m_base + kAccTile;
+         m_base += tile_m) {
+      int32_t tile_end = m_base + tile_m;
       if (tile_end > M) tile_end = M;
       int32_t tile_size = tile_end - m_base;
 
-      // Per-row accumulators (registers for small M,
-      // L1-cached local memory for larger M).
-      float acc[kAccTile];
+      // Zero accumulators in shared memory.
       for (int32_t i = 0; i < tile_size; i++)
-        acc[i] = 0.0f;
+        smem_acc[tid + i * bdim] = 0.0f;
 
       // Single pass over all sections and entries.
       for (int32_t s = 0; s < ws; s++) {
@@ -557,7 +559,7 @@ __global__ void scatter_add_direct_kernel(
           if (tok >= m_base && tok < tile_end) {
             float w = meta[idx].topk_weight;
             if (w != 0.0f) {
-              acc[tok - m_base] +=
+              smem_acc[tid + (tok - m_base) * bdim] +=
                   static_cast<float>(recv[idx * K + k])
                   * w;
             }
@@ -568,7 +570,7 @@ __global__ void scatter_add_direct_kernel(
       // Write final values (direct store, no atomic).
       for (int32_t i = 0; i < tile_size; i++) {
         output[(m_base + i) * K + k] =
-            static_cast<T>(acc[i]);
+            static_cast<T>(smem_acc[tid + i * bdim]);
       }
     }
   }
