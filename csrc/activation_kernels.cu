@@ -31,6 +31,26 @@ __global__ void act_and_mul_kernel(
   }
 }
 
+// EP variant: skip stale entries via per-block topk_ids check.
+// Grid stays at mc (CUDA-graph-compatible); stale blocks
+// return after one int64 read.
+template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&),
+          bool act_first>
+__global__ void act_and_mul_kernel(
+    scalar_t* __restrict__ out,              // [..., d]
+    const scalar_t* __restrict__ input,      // [..., 2, d]
+    const int d,
+    const int64_t* __restrict__ topk_ids,    // [num_tokens]
+    const int64_t num_local_experts) {
+  const int64_t token_idx = blockIdx.x;
+  if (topk_ids[token_idx] >= num_local_experts) return;
+  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+    const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
+    const scalar_t y = VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
+    out[token_idx * d + idx] = compute<scalar_t, ACT_FN, act_first>(x, y);
+  }
+}
+
 template <typename T>
 __device__ __forceinline__ T silu_kernel(const T& x) {
   // x * sigmoid(x)
@@ -86,6 +106,31 @@ void silu_and_mul(torch::Tensor& out,    // [..., d]
                   torch::Tensor& input)  // [..., 2 * d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, true);
+}
+
+void silu_and_mul_ep(torch::Tensor& out,      // [..., d]
+                     torch::Tensor& input,    // [..., 2 * d]
+                     torch::Tensor topk_ids,  // [num_tokens]
+                     int64_t num_local_experts) {
+  int d = input.size(-1) / 2;
+  int64_t num_tokens = input.numel() / input.size(-1);
+  dim3 grid(num_tokens);
+  dim3 block(std::min(d, 1024));
+  if (num_tokens == 0) {
+    return;
+  }
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "act_and_mul_ep_kernel", [&] {
+        vllm::act_and_mul_kernel<
+            scalar_t, vllm::silu_kernel<scalar_t>, true>
+            <<<grid, block, 0, stream>>>(
+                out.data_ptr<scalar_t>(),
+                input.data_ptr<scalar_t>(), d,
+                topk_ids.data_ptr<int64_t>(),
+                num_local_experts);
+      });
 }
 
 void mul_and_silu(torch::Tensor& out,    // [..., d]

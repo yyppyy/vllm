@@ -1962,8 +1962,19 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             B_bias=self.w1_bias,
         )
 
-        self.activation(activation, intermediate_cache2,
-                        intermediate_cache1.view(-1, N))
+        if (expert_tokens_meta is not None
+                and expert_tokens_meta.topk_ids_for_masking
+                is not None):
+            E_local = w1.size(0)
+            torch.ops._C.silu_and_mul_ep(
+                intermediate_cache2,
+                intermediate_cache1.view(-1, N),
+                expert_tokens_meta.topk_ids_for_masking,
+                E_local)
+        else:
+            self.activation(
+                activation, intermediate_cache2,
+                intermediate_cache1.view(-1, N))
 
         a2q_scale: Optional[torch.Tensor] = None
 
@@ -1995,7 +2006,16 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             B_bias=self.w2_bias,
         )
 
-        ops.moe_sum(intermediate_cache3, output)
+        if (expert_tokens_meta is not None
+                and expert_tokens_meta.topk_ids_for_masking
+                is not None):
+            E_local = w1.size(0)
+            torch.ops._moe_C.moe_sum_ep(
+                intermediate_cache3, output,
+                expert_tokens_meta.topk_ids_for_masking,
+                E_local)
+        else:
+            ops.moe_sum(intermediate_cache3, output)
 
 
 def modular_triton_fused_moe(

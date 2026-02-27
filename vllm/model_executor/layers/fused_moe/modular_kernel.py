@@ -118,6 +118,10 @@ class ExpertTokensMetadata:
     # Needed when the input tensor is a fixed-size buffer
     # larger than the actual token count (e.g. dispatch_combine).
     num_tokens_for_config: Optional[int] = None
+    # When set, _ep kernel variants use this to skip
+    # stale entries. Shape: (num_tokens,) int64.
+    # Entries >= num_local_experts are stale.
+    topk_ids_for_masking: Optional[torch.Tensor] = None
 
     @staticmethod
     def make_from_list(expert_num_tokens_list: list[int],

@@ -305,7 +305,9 @@ class DispatchCombinePrepareAndFinalize(
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=local_expert_num_tokens,
             expert_num_tokens_cpu=None,
-            num_tokens_for_config=a1_orig.shape[0])
+            num_tokens_for_config=a1_orig.shape[0],
+            topk_ids_for_masking=(
+                expert_topk_ids.view(-1)))
 
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,

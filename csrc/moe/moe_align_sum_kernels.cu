@@ -128,6 +128,24 @@ __global__ void moe_sum_kernel(
   }
 }
 
+// EP variant: masked copy for topk=1, skipping stale entries.
+// Grid stays at mc (CUDA-graph-compatible); stale blocks
+// return after one int64 read.
+template <typename scalar_t>
+__global__ void moe_sum_ep_kernel(
+    scalar_t* __restrict__ out,              // [..., d]
+    const scalar_t* __restrict__ input,      // [..., d]
+    const int64_t* __restrict__ topk_ids,    // [num_tokens]
+    const int d,
+    const int64_t num_local_experts) {
+  const int64_t token_idx = blockIdx.x;
+  if (topk_ids[token_idx] >= num_local_experts) return;
+  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+    out[token_idx * d + idx] =
+        VLLM_LDG(&input[token_idx * d + idx]);
+  }
+}
+
 template <typename scalar_t>
 __global__ void moe_align_block_size_small_batch_expert_kernel(
     const scalar_t* __restrict__ topk_ids,
@@ -321,4 +339,28 @@ void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
       at::sum_out(output, input, 1);
       break;
   }
+}
+
+void moe_sum_ep(torch::Tensor& input,    // [num_tokens, d]
+                torch::Tensor& output,   // [num_tokens, d]
+                torch::Tensor topk_ids,  // [num_tokens]
+                int64_t num_local_experts) {
+  const int hidden_size = input.size(-1);
+  const auto num_tokens = output.numel() / hidden_size;
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(hidden_size, 1024));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "moe_sum_ep_kernel", [&] {
+        vllm::moe::moe_sum_ep_kernel<scalar_t>
+            <<<grid, block, 0, stream>>>(
+                output.data_ptr<scalar_t>(),
+                input.data_ptr<scalar_t>(),
+                topk_ids.data_ptr<int64_t>(),
+                hidden_size,
+                num_local_experts);
+      });
 }

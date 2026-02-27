@@ -13,6 +13,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
+  m.def(
+      "moe_sum_ep(Tensor input, Tensor! output, "
+      "Tensor topk_ids, int num_local_experts) -> ()");
+  m.impl("moe_sum_ep", torch::kCUDA, &moe_sum_ep);
+
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size.
   m.def(
