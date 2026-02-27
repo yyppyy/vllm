@@ -127,6 +127,7 @@ class DispatchCombinePrepareAndFinalize(
         # ws sections in the recv buffer, so mc must cover
         # the full buffer to reach all sections.
         self._mc = self.max_recv
+        self._mc_full = self.max_recv
 
         # Step 1: Launch dispatch P2P kernel.
         # No pre-dispatch barrier needed: dispatch_offset
@@ -182,10 +183,18 @@ class DispatchCombinePrepareAndFinalize(
         """
         mgr = self.p2p_manager
 
-        # Per-sender sections: entries are spread across
-        # ws sections in the recv buffer, so mc must cover
-        # the full buffer to reach all sections.
-        self._mc = self.max_recv
+        # Per-batch tight bound: compaction moves valid
+        # entries from scattered per-sender sections into
+        # contiguous positions, so mc can be tight.
+        # Worst case: all ws source ranks send M*topk
+        # entries, with max_rep=2 replicas each.
+        self._mc = min(
+            M * self.experts_per_token
+            * self.world_size_ * 2,
+            self.max_recv)
+        # mc for combine kernel (iterates over original
+        # IPC section layout, unchanged by compaction).
+        self._mc_full = self.max_recv
 
         topk_ids_i32 = topk_ids.to(torch.int32)
         topk_weights_f32 = topk_weights.to(torch.float32)
@@ -202,33 +211,50 @@ class DispatchCombinePrepareAndFinalize(
             mgr.gpu_dar_push_and_barrier()
             mgr.gpu_dar_phase_c()
             mgr.gpu_dar_phase_d1(
-                self._mc, K, num_experts)
+                self._mc_full, K, num_experts)
             mgr.gpu_dar_phase_d2(
+                self._mc_full, num_experts)
+            # Compact: gather valid entries from
+            # scattered sections into contiguous
+            # positions [0, mc_compact).
+            mgr.gpu_dar_compact(
                 self._mc, num_experts)
             mgr.gpu_dar_phase_e()
 
             expert_topk_ids = (
-                mgr.expert_topk_ids_buf[:self._mc]
+                mgr.compact_expert_topk_ids_buf[
+                    :self._mc]
                 .unsqueeze(1))
             expert_topk_weights = (
-                mgr.expert_topk_weights_buf[
+                mgr.compact_expert_topk_weights_buf[
                     :self._mc]
                 .unsqueeze(1))
             expert_num_tokens = (
                 mgr.expert_num_tokens_buf)
-            data_remap = (
-                mgr.data_remap_buf[:self._mc])
+            data_remap = None  # Folded into compact
         else:
             # Fused path: single kernel launch.
             (expert_topk_ids,
              expert_topk_weights,
              expert_num_tokens,
-             data_remap) = (
+             _data_remap) = (
                 mgr.gpu_dispatch_and_route(
                     a1, topk_ids_i32,
                     topk_weights_f32,
-                    self._mc, M, K, topk,
+                    self._mc_full, M, K, topk,
                     num_experts))
+            # Compact after fused kernel.
+            mgr.gpu_dar_compact(
+                self._mc, num_experts)
+            expert_topk_ids = (
+                mgr.compact_expert_topk_ids_buf[
+                    :self._mc]
+                .unsqueeze(1))
+            expert_topk_weights = (
+                mgr.compact_expert_topk_weights_buf[
+                    :self._mc]
+                .unsqueeze(1))
+            data_remap = None  # Folded into compact
 
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
@@ -258,16 +284,20 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
         mc = self._mc
 
-        # Slice IPC-backed dispatch recv to mc.
-        expert_x = mgr.dispatch_recv_tensor[:mc]
-
-        # Expand shared data for co-located expert dedup.
-        # Phase A writes token data once per (token,
-        # dest_rank) group; data_remap maps duplicate
-        # entries to their group leader's data row.
-        # Local HBM gather (~0.03ms), not NVLink.
-        if data_remap is not None:
-            expert_x = expert_x[data_remap]
+        if self.use_integrated_routing:
+            # Compacted path: gather mc_compact entries
+            # using compact_data_remap which combines
+            # section compaction + co-located dedup.
+            compact_remap = (
+                mgr.compact_data_remap_buf[:mc])
+            expert_x = (
+                mgr.dispatch_recv_tensor[compact_remap])
+        else:
+            # Non-integrated path: use original recv.
+            expert_x = mgr.dispatch_recv_tensor[:mc]
+            # Expand shared data for co-located dedup.
+            if data_remap is not None:
+                expert_x = expert_x[data_remap]
 
         # Post-dispatch quantization.
         expert_x_scale = None
@@ -341,7 +371,9 @@ class DispatchCombinePrepareAndFinalize(
         do_async: bool,
     ) -> Optional[Callable]:
         K = output.shape[-1]
-        mc = self._mc
+        # mc_full: combine iterates over original IPC
+        # section layout (unchanged by compaction).
+        mc_full = self._mc_full
         mgr = self.p2p_manager
 
         # Step 1: Apply weights + reduce on dispatched tokens.
@@ -361,23 +393,27 @@ class DispatchCombinePrepareAndFinalize(
                 ))
 
         # Step 2: Combine + barrier + scatter-add.
+        # Use mc_full (not mc_compact) because combine
+        # reads dispatch_meta at original IPC positions
+        # and uses compact_reverse to index expert_output.
         meta_bytes = (
-            mgr.dispatch_meta_tensor[:mc]
+            mgr.dispatch_meta_tensor[:mc_full]
             .contiguous().view(torch.uint8))
         if _DC_SPLIT_KERNELS:
             # Split path: 3 separate kernels.
             mgr.gpu_combine_p2p(
                 fused_expert_output,
-                meta_bytes, mc)
+                meta_bytes, mc_full)
             mgr.gpu_p2p_barrier_reset_dispatch()
-            mgr.gpu_scatter_add_direct(output, mc)
+            mgr.gpu_scatter_add_direct(
+                output, mc_full)
         else:
             # Fused path: single kernel launch.
             mgr.gpu_combine_and_scatter(
                 fused_expert_output,
                 meta_bytes,
                 output,
-                mc)
+                mc_full)
 
         if do_async:
             return lambda: None

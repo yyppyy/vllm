@@ -290,6 +290,7 @@ template <typename T>
 __global__ void combine_p2p_kernel(
     const T* __restrict__ expert_output,
     const TokenMetadata* __restrict__ dispatch_meta,
+    const int32_t* __restrict__ compact_reverse,
     const DispatchCombineConfig* __restrict__ config,
     int32_t K) {
   // Section-aware iteration: loop only over real entries
@@ -348,8 +349,11 @@ __global__ void combine_p2p_kernel(
 
       T* dest_data = reinterpret_cast<T*>(
           config->remote_combine_recv[dest_rank]);
+      // Read expert output from compact position.
+      const int32_t ci =
+          compact_reverse[pair_idx];
       const T* src_data =
-          expert_output + pair_idx * K;
+          expert_output + ci * K;
       for (int32_t k = threadIdx.x; k < K;
            k += blockDim.x) {
         dest_data[write_pos * K + k] = src_data[k];
@@ -603,6 +607,7 @@ template <typename T>
 __global__ void combine_and_scatter_kernel(
     const T* __restrict__ expert_output,
     const TokenMetadata* __restrict__ dispatch_meta,
+    const int32_t* __restrict__ compact_reverse,
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc, int32_t K, int32_t M) {
@@ -691,8 +696,11 @@ __global__ void combine_and_scatter_kernel(
 
         T* dest_data = reinterpret_cast<T*>(
             config->remote_combine_recv[dest_rank]);
+        // Read expert output from compact position.
+        const int32_t ci =
+            compact_reverse[pair_idx];
         const T* src_data =
-            expert_output + pair_idx * K;
+            expert_output + ci * K;
         for (int32_t k = threadIdx.x; k < K;
              k += blockDim.x) {
           dest_data[write_pos * K + k] =
@@ -1314,6 +1322,95 @@ __global__ void dar_phase_d2_kernel(
         }
       }
     }
+  }
+}
+
+// ---- Section compaction ----
+// Gathers valid entries from scattered per-sender sections
+// into contiguous positions. Builds compact_data_remap
+// (compact_idx → original leader index for dedup + gather),
+// compact_expert_topk_ids, compact_expert_topk_weights,
+// and compact_reverse (original_idx → compact_idx for
+// combine kernel to read expert output).
+// Grid = kPersistentGrid, block = kBlockSize.
+__global__ void dar_compact_kernel(
+    const int64_t* __restrict__ expert_topk_ids,
+    const float* __restrict__ expert_topk_weights,
+    const int32_t* __restrict__ data_remap,
+    int64_t* __restrict__ compact_expert_topk_ids,
+    float* __restrict__ compact_expert_topk_weights,
+    int32_t* __restrict__ compact_data_remap,
+    int32_t* __restrict__ compact_reverse,
+    const DispatchCombineConfig* __restrict__ config,
+    int32_t mc_compact,
+    int32_t num_physical_experts) {
+  const int32_t rank = config->rank;
+  const int32_t ws = config->world_size;
+  const int32_t ss = config->dispatch_section_size;
+  const int64_t sentinel =
+      static_cast<int64_t>(num_physical_experts);
+
+  // Compute per-section prefix sums (thread 0 only).
+  __shared__ int32_t s_compact_offset[kMaxRanks];
+  __shared__ int32_t s_section_count[kMaxRanks];
+  __shared__ int32_t s_num_valid;
+
+  if (threadIdx.x == 0) {
+    int32_t running = 0;
+    for (int32_t s = 0; s < ws; s++) {
+      int32_t count = config->
+          remote_dispatch_offsets[rank][s];
+      if (count > ss) count = ss;
+      s_section_count[s] = count;
+      s_compact_offset[s] = running;
+      running += count;
+    }
+    s_num_valid = running;
+  }
+  __syncthreads();
+
+  const int32_t num_valid = s_num_valid;
+
+  // Build compact mappings for valid entries.
+  for (int32_t s = 0; s < ws; s++) {
+    const int32_t section_start = s * ss;
+    const int32_t count = s_section_count[s];
+    const int32_t compact_base = s_compact_offset[s];
+    for (int32_t i =
+             blockIdx.x * blockDim.x + threadIdx.x;
+         i < count;
+         i += gridDim.x * blockDim.x) {
+      const int32_t original_idx = section_start + i;
+      const int32_t compact_idx = compact_base + i;
+
+      // Remap data_remap: leader is in same section,
+      // so leader_compact = compact_base + (leader -
+      // section_start).
+      const int32_t leader_original =
+          data_remap[original_idx];
+      compact_data_remap[compact_idx] =
+          compact_base
+          + (leader_original - section_start);
+
+      // Copy expert_topk_ids and weights.
+      compact_expert_topk_ids[compact_idx] =
+          expert_topk_ids[original_idx];
+      compact_expert_topk_weights[compact_idx] =
+          expert_topk_weights[original_idx];
+
+      // Reverse mapping for combine kernel.
+      compact_reverse[original_idx] = compact_idx;
+    }
+  }
+
+  // Pad entries [num_valid, mc_compact) with sentinel.
+  for (int32_t i = num_valid
+           + blockIdx.x * blockDim.x + threadIdx.x;
+       i < mc_compact;
+       i += gridDim.x * blockDim.x) {
+    compact_expert_topk_ids[i] = sentinel;
+    compact_expert_topk_weights[i] = 0.0f;
+    compact_data_remap[i] = 0;  // harmless index
   }
 }
 

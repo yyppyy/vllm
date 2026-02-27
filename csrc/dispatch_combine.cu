@@ -62,6 +62,7 @@ void dispatch_p2p(
 void combine_p2p(
     torch::Tensor expert_output,
     torch::Tensor dispatch_meta,
+    torch::Tensor compact_reverse,
     torch::Tensor config_tensor,
     int64_t max_recv, int64_t K) {
 
@@ -74,6 +75,8 @@ void combine_p2p(
   const TokenMetadata* meta =
       reinterpret_cast<const TokenMetadata*>(
           dispatch_meta.data_ptr());
+  const int32_t* cr =
+      compact_reverse.data_ptr<int32_t>();
 
   const int32_t K32 = static_cast<int32_t>(K);
   int32_t grid_sz = static_cast<int32_t>(max_recv);
@@ -91,7 +94,7 @@ void combine_p2p(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
-              meta, config, K32);
+              meta, cr, config, K32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -99,7 +102,7 @@ void combine_p2p(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<const __half*>(
                   expert_output.data_ptr()),
-              meta, config, K32);
+              meta, cr, config, K32);
         })
   );
 }
@@ -238,6 +241,7 @@ void scatter_add_direct(
 void combine_and_scatter(
     torch::Tensor expert_output,
     torch::Tensor dispatch_meta,
+    torch::Tensor compact_reverse,
     torch::Tensor output,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
@@ -252,6 +256,8 @@ void combine_and_scatter(
   const TokenMetadata* meta =
       reinterpret_cast<const TokenMetadata*>(
           dispatch_meta.data_ptr());
+  const int32_t* cr =
+      compact_reverse.data_ptr<int32_t>();
 
   // Output zeroed inline by kernel (Phase 0).
 
@@ -274,7 +280,7 @@ void combine_and_scatter(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
-              meta,
+              meta, cr,
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
               config, mc32, K32, M32);
@@ -285,7 +291,7 @@ void combine_and_scatter(
               <<<grid, block, 0, stream>>>(
               reinterpret_cast<const __half*>(
                   expert_output.data_ptr()),
-              meta,
+              meta, cr,
               reinterpret_cast<__half*>(
                   output.data_ptr()),
               config, mc32, K32, M32);
@@ -629,6 +635,44 @@ void dar_phase_e(
   dim3 block(kBlockSize);
   dar_phase_e_kernel
       <<<grid, block, 0, stream>>>(config);
+}
+
+void dar_compact(
+    torch::Tensor expert_topk_ids,
+    torch::Tensor expert_topk_weights,
+    torch::Tensor data_remap,
+    torch::Tensor compact_expert_topk_ids,
+    torch::Tensor compact_expert_topk_weights,
+    torch::Tensor compact_data_remap,
+    torch::Tensor compact_reverse,
+    torch::Tensor config_tensor,
+    int64_t mc_compact,
+    int64_t num_physical_experts) {
+
+  if (mc_compact == 0) return;
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const DispatchCombineConfig* config =
+      reinterpret_cast<const DispatchCombineConfig*>(
+          config_tensor.data_ptr());
+
+  const int32_t mc32 =
+      static_cast<int32_t>(mc_compact);
+  const int32_t ne32 =
+      static_cast<int32_t>(num_physical_experts);
+
+  dim3 grid(kPersistentGrid);
+  dim3 block(kBlockSize);
+  dar_compact_kernel
+      <<<grid, block, 0, stream>>>(
+      expert_topk_ids.data_ptr<int64_t>(),
+      expert_topk_weights.data_ptr<float>(),
+      data_remap.data_ptr<int32_t>(),
+      compact_expert_topk_ids.data_ptr<int64_t>(),
+      compact_expert_topk_weights.data_ptr<float>(),
+      compact_data_remap.data_ptr<int32_t>(),
+      compact_reverse.data_ptr<int32_t>(),
+      config, mc32, ne32);
 }
 
 }  // namespace dispatch_combine

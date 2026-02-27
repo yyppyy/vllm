@@ -526,6 +526,7 @@ class DispatchCombineP2PManager:
             .combine_and_scatter(
                 expert_output,
                 dispatch_meta,
+                self.compact_reverse_buf,
                 output,
                 self.config_tensor,
                 mc, self.hidden_dim, M)
@@ -538,6 +539,7 @@ class DispatchCombineP2PManager:
         """Combine P2P writes (standalone kernel)."""
         torch.ops._C_dispatch_combine.combine_p2p(
             expert_output, dispatch_meta,
+            self.compact_reverse_buf,
             self.config_tensor,
             mc, self.hidden_dim)
 
@@ -608,6 +610,23 @@ class DispatchCombineP2PManager:
         torch.ops._C_dispatch_combine\
             .dar_phase_e(self.config_tensor)
 
+    def gpu_dar_compact(
+            self, mc_compact: int,
+            num_experts: int):
+        """Compact valid entries from scattered sections
+        into contiguous positions."""
+        torch.ops._C_dispatch_combine\
+            .dar_compact(
+                self.expert_topk_ids_buf,
+                self.expert_topk_weights_buf,
+                self.data_remap_buf,
+                self.compact_expert_topk_ids_buf,
+                self.compact_expert_topk_weights_buf,
+                self.compact_data_remap_buf,
+                self.compact_reverse_buf,
+                self.config_tensor,
+                mc_compact, num_experts)
+
     def init_prepare_buffers(self, num_experts: int):
         """Allocate expert_num_tokens buffer once
         num_experts is known (set by PrepareAndFinalize
@@ -625,6 +644,33 @@ class DispatchCombineP2PManager:
         self.data_remap_buf = torch.arange(
             self.max_recv, dtype=torch.int32,
             device=f'cuda:{self._device}')
+        # Compact buffers for section compaction.
+        # After dispatch receive, valid entries are
+        # scattered across per-sender sections.
+        # Compaction gathers them into contiguous
+        # positions so downstream element-wise kernels
+        # operate on mc_compact instead of max_recv.
+        dev = f'cuda:{self._device}'
+        self.compact_expert_topk_ids_buf = (
+            torch.full((self.max_recv,),
+                       num_experts,
+                       dtype=torch.int64,
+                       device=dev))
+        self.compact_expert_topk_weights_buf = (
+            torch.zeros(self.max_recv,
+                        dtype=torch.float32,
+                        device=dev))
+        self.compact_data_remap_buf = (
+            torch.zeros(self.max_recv,
+                        dtype=torch.int32,
+                        device=dev))
+        # Identity default: compact_reverse[i] = i.
+        # dar_compact_kernel overwrites with actual
+        # compact mapping when compaction runs.
+        self.compact_reverse_buf = (
+            torch.arange(self.max_recv,
+                         dtype=torch.int32,
+                         device=dev))
 
     def gpu_prepare_dispatch_recv(
             self, mc: int, num_experts: int):
