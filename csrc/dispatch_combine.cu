@@ -207,11 +207,14 @@ void scatter_add_direct(
       reinterpret_cast<const DispatchCombineConfig*>(
           config_tensor.data_ptr());
 
-  // Output zeroed inline by kernel (grid-wide sync).
+  // Gather kernel writes final values directly (no zeroing).
 
   const int32_t K32 = static_cast<int32_t>(K);
   const int32_t M32 = static_cast<int32_t>(M);
-  int32_t grid_sz = kPersistentGrid;
+  int32_t grid_sz =
+      (K32 + kBlockSize - 1) / kBlockSize;
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
   if (grid_sz < 1) grid_sz = 1;
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);

@@ -506,53 +506,18 @@ __global__ void prepare_dispatch_recv_kernel(
 // Scatter-add direct: reads from IPC combine buffers
 // ====================================================================
 // Reads combine recv/meta via IPC pointers in config.
-// Uses native bf16/fp16 atomicAdd (SM_80+/SM_70+).
-// Output is zeroed inline using combine_done_counter
-// for grid-wide sync (avoids host-side cudaMemsetAsync).
-// Grid = kPersistentGrid, block = kBlockSize.
+// Gather-accumulate scatter-add: each thread owns a column k
+// and gathers contributions from all recv entries into
+// per-row float32 accumulators. No atomicAdd needed.
+// For M > kAccTile, processes rows in tiles.
+// Grid = min(ceil(K/kBlockSize), kPersistentGrid).
+constexpr int32_t kAccTile = 256;
+
 template <typename T>
 __global__ void scatter_add_direct_kernel(
     T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t K, int32_t M) {
-  // ---- Phase 0: Zero output (grid-wide cooperative) ----
-  __shared__ FlagType s_cd_base;
-  if (threadIdx.x == 0) {
-    s_cd_base = static_cast<FlagType>(
-        *config->combine_done_counter);
-  }
-  __syncthreads();
-  FlagType cd_base = s_cd_base;
-
-  {
-    // Vectorized zero: int4 = 16 bytes = 8 BF16/FP16.
-    int4* out4 = reinterpret_cast<int4*>(output);
-    constexpr int32_t kElemsPerI4 =
-        static_cast<int32_t>(sizeof(int4) / sizeof(T));
-    int32_t n4 = M * K / kElemsPerI4;
-    int4 z4 = make_int4(0, 0, 0, 0);
-    for (int32_t i =
-             blockIdx.x * blockDim.x + threadIdx.x;
-         i < n4; i += gridDim.x * blockDim.x) {
-      out4[i] = z4;
-    }
-  }
-
-  // Grid-wide sync: all blocks done zeroing.
-  __syncthreads();
-  __threadfence();
-  if (threadIdx.x == 0) {
-    atomicAdd(config->combine_done_counter,
-              static_cast<FlagType>(1));
-    FlagType target = cd_base + gridDim.x;
-    while (dc_ld_flag_acquire(
-               config->combine_done_counter)
-            < target)
-      ;
-  }
-  __syncthreads();
-
-  // ---- Phase 1: Scatter-add from combine buffer ----
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
   const int32_t ss_c = config->combine_section_size;
@@ -563,30 +528,47 @@ __global__ void scatter_add_direct_kernel(
   const T* recv = reinterpret_cast<const T*>(
       config->remote_combine_recv[rank]);
 
-  // Section-aware iteration: only visit real entries.
-  for (int32_t s = 0; s < ws; s++) {
-    int32_t section_start = s * ss_c;
-    // Clamp to section size: raw counter may exceed ss_c
-    // due to overflow counting in combine atomicAdd.
-    int32_t count = config->
-        remote_combine_offsets[rank][s];
-    if (count > ss_c) count = ss_c;
-    for (int32_t idx = section_start + blockIdx.x;
-         idx < section_start + count;
-         idx += gridDim.x) {
+  // Each thread owns column k exclusively.
+  for (int32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+       k < K; k += gridDim.x * blockDim.x) {
 
-      int32_t token_idx =
-          meta[idx].source_token_idx;
-      float weight = meta[idx].topk_weight;
-      if (weight == 0.0f) continue;
+    // Process output rows in tiles of kAccTile.
+    for (int32_t m_base = 0; m_base < M;
+         m_base += kAccTile) {
+      int32_t tile_end = m_base + kAccTile;
+      if (tile_end > M) tile_end = M;
+      int32_t tile_size = tile_end - m_base;
 
-      for (int32_t k = threadIdx.x; k < K;
-           k += blockDim.x) {
-        float val = static_cast<float>(
-            recv[idx * K + k]);
-        atomicAdd(
-            output + token_idx * K + k,
-            static_cast<T>(val * weight));
+      // Per-row accumulators (registers for small M,
+      // L1-cached local memory for larger M).
+      float acc[kAccTile];
+      for (int32_t i = 0; i < tile_size; i++)
+        acc[i] = 0.0f;
+
+      // Single pass over all sections and entries.
+      for (int32_t s = 0; s < ws; s++) {
+        int32_t sec_start = s * ss_c;
+        int32_t count =
+            config->remote_combine_offsets[rank][s];
+        if (count > ss_c) count = ss_c;
+        for (int32_t idx = sec_start;
+             idx < sec_start + count; idx++) {
+          int32_t tok = meta[idx].source_token_idx;
+          if (tok >= m_base && tok < tile_end) {
+            float w = meta[idx].topk_weight;
+            if (w != 0.0f) {
+              acc[tok - m_base] +=
+                  static_cast<float>(recv[idx * K + k])
+                  * w;
+            }
+          }
+        }
+      }
+
+      // Write final values (direct store, no atomic).
+      for (int32_t i = 0; i < tile_size; i++) {
+        output[(m_base + i) * K + k] =
+            static_cast<T>(acc[i]);
       }
     }
   }
