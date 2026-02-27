@@ -503,16 +503,19 @@ __global__ void prepare_dispatch_recv_kernel(
 }
 
 // ====================================================================
-// Scatter-add: entry-parallel via atomicAdd
+// Scatter-add: entry-parallel via fp32 atomicAdd
 // ====================================================================
 // Reads combine recv/meta via IPC pointers in config.
 // Each block processes a stride of entries, atomicAdds
-// weighted values to output. Threads tile over K columns
-// (coalesced). Output MUST be pre-zeroed by host wrapper.
+// weighted values to fp32 accum buffer. Threads tile
+// over K columns (coalesced). fp32 atomicAdd is native
+// on sm_80+ (no CAS loop, no adjacent-element
+// contention from paired 32-bit words).
+// Accum buffer MUST be pre-zeroed by host wrapper.
 // O(entries) metadata reads — each entry scanned once.
 template <typename T>
 __global__ void scatter_add_atomic_kernel(
-    T* __restrict__ output,
+    float* __restrict__ accum,
     const DispatchCombineConfig* __restrict__ config,
     int32_t K) {
   const int32_t rank = config->rank;
@@ -542,10 +545,21 @@ __global__ void scatter_add_atomic_kernel(
            k += blockDim.x) {
         float val = static_cast<float>(
             recv[idx * K + k]) * w;
-        atomicAdd(output + tok * K + k,
-                  static_cast<T>(val));
+        atomicAdd(accum + tok * K + k, val);
       }
     }
+  }
+}
+
+// Convert fp32 accumulation buffer to half-precision.
+template <typename T>
+__global__ void fp32_to_half_kernel(
+    T* __restrict__ output,
+    const float* __restrict__ input,
+    int32_t N) {
+  for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < N; i += gridDim.x * blockDim.x) {
+    output[i] = static_cast<T>(input[i]);
   }
 }
 

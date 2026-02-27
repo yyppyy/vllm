@@ -208,34 +208,52 @@ void scatter_add_direct(
           config_tensor.data_ptr());
 
   const int32_t K32 = static_cast<int32_t>(K);
+  const int32_t N = static_cast<int32_t>(M * K);
 
+  // This kernel has no grid-wide sync — use enough
+  // blocks to saturate all SMs for HBM latency hiding.
+  // 512 blocks / 108 SMs ≈ 4-5 blocks/SM = 32-40
+  // warps/SM, close to the ~42 needed for peak BW.
+  constexpr int32_t kScatterGrid = 512;
   int32_t grid_sz = static_cast<int32_t>(mc);
-  if (grid_sz > kPersistentGrid)
-    grid_sz = kPersistentGrid;
+  if (grid_sz > kScatterGrid)
+    grid_sz = kScatterGrid;
   if (grid_sz < 1) grid_sz = 1;
+
+  // fp32 accumulation buffer — native fp32 atomicAdd
+  // avoids bf16 CAS loops and adjacent-element
+  // contention from paired 32-bit words.
+  auto accum = torch::zeros(
+      {M, K}, output.options().dtype(at::kFloat));
 
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
       "scatter_add_direct",
       AT_DISPATCH_CASE(at::ScalarType::BFloat16,
         [&] {
-          cudaMemsetAsync(output.data_ptr(), 0,
-              M * K * sizeof(__nv_bfloat16), stream);
           scatter_add_atomic_kernel<__nv_bfloat16>
               <<<grid_sz, kBlockSize, 0, stream>>>(
+              accum.data_ptr<float>(),
+              config, K32);
+          fp32_to_half_kernel<__nv_bfloat16>
+              <<<(N + kBlockSize - 1) / kBlockSize,
+                 kBlockSize, 0, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, K32);
+              accum.data_ptr<float>(), N);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
-          cudaMemsetAsync(output.data_ptr(), 0,
-              M * K * sizeof(__half), stream);
           scatter_add_atomic_kernel<__half>
               <<<grid_sz, kBlockSize, 0, stream>>>(
+              accum.data_ptr<float>(),
+              config, K32);
+          fp32_to_half_kernel<__half>
+              <<<(N + kBlockSize - 1) / kBlockSize,
+                 kBlockSize, 0, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, K32);
+              accum.data_ptr<float>(), N);
         })
   );
 }
