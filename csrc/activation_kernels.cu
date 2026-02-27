@@ -31,9 +31,10 @@ __global__ void act_and_mul_kernel(
   }
 }
 
-// EP variant: skip stale entries via per-block topk_ids check.
-// Grid stays at mc (CUDA-graph-compatible); stale blocks
-// return after one int64 read.
+// EP variant: persistent grid, each block iterates over a
+// contiguous chunk and skips stale entries via topk_ids check.
+// Small fixed grid avoids block-scheduling overhead (mc blocks
+// on 108 SMs = ~38 waves = ~10us just for scheduling).
 template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&),
           bool act_first>
 __global__ void act_and_mul_kernel(
@@ -41,13 +42,20 @@ __global__ void act_and_mul_kernel(
     const scalar_t* __restrict__ input,      // [..., 2, d]
     const int d,
     const int64_t* __restrict__ topk_ids,    // [num_tokens]
-    const int64_t num_local_experts) {
-  const int64_t token_idx = blockIdx.x;
-  if (topk_ids[token_idx] >= num_local_experts) return;
-  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
-    const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
-    const scalar_t y = VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
-    out[token_idx * d + idx] = compute<scalar_t, ACT_FN, act_first>(x, y);
+    const int64_t num_local_experts,
+    const int64_t num_tokens) {
+  const int64_t chunk = (num_tokens + gridDim.x - 1) / gridDim.x;
+  const int64_t start = blockIdx.x * chunk;
+  const int64_t end = min(start + chunk, num_tokens);
+  for (int64_t token_idx = start; token_idx < end; ++token_idx) {
+    if (topk_ids[token_idx] >= num_local_experts) continue;
+    for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+      const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
+      const scalar_t y =
+          VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
+      out[token_idx * d + idx] =
+          compute<scalar_t, ACT_FN, act_first>(x, y);
+    }
   }
 }
 
@@ -114,7 +122,10 @@ void silu_and_mul_ep(torch::Tensor& out,      // [..., d]
                      int64_t num_local_experts) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  dim3 grid(num_tokens);
+  // Persistent grid: few blocks iterate over tokens,
+  // avoiding 4096-block scheduling overhead.
+  constexpr int kPersistentGrid = 64;
+  dim3 grid(std::min((int64_t)kPersistentGrid, num_tokens));
   dim3 block(std::min(d, 1024));
   if (num_tokens == 0) {
     return;
@@ -129,7 +140,8 @@ void silu_and_mul_ep(torch::Tensor& out,      // [..., d]
                 out.data_ptr<scalar_t>(),
                 input.data_ptr<scalar_t>(), d,
                 topk_ids.data_ptr<int64_t>(),
-                num_local_experts);
+                num_local_experts,
+                num_tokens);
       });
 }
 

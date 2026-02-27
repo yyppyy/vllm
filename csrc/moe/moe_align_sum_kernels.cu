@@ -128,21 +128,25 @@ __global__ void moe_sum_kernel(
   }
 }
 
-// EP variant: masked copy for topk=1, skipping stale entries.
-// Grid stays at mc (CUDA-graph-compatible); stale blocks
-// return after one int64 read.
+// EP variant: persistent grid masked copy for topk=1.
+// Small fixed grid avoids block-scheduling overhead.
 template <typename scalar_t>
 __global__ void moe_sum_ep_kernel(
     scalar_t* __restrict__ out,              // [..., d]
     const scalar_t* __restrict__ input,      // [..., d]
     const int64_t* __restrict__ topk_ids,    // [num_tokens]
     const int d,
-    const int64_t num_local_experts) {
-  const int64_t token_idx = blockIdx.x;
-  if (topk_ids[token_idx] >= num_local_experts) return;
-  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
-    out[token_idx * d + idx] =
-        VLLM_LDG(&input[token_idx * d + idx]);
+    const int64_t num_local_experts,
+    const int64_t num_tokens) {
+  const int64_t chunk = (num_tokens + gridDim.x - 1) / gridDim.x;
+  const int64_t start = blockIdx.x * chunk;
+  const int64_t end = min(start + chunk, num_tokens);
+  for (int64_t token_idx = start; token_idx < end; ++token_idx) {
+    if (topk_ids[token_idx] >= num_local_experts) continue;
+    for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+      out[token_idx * d + idx] =
+          VLLM_LDG(&input[token_idx * d + idx]);
+    }
   }
 }
 
@@ -348,7 +352,9 @@ void moe_sum_ep(torch::Tensor& input,    // [num_tokens, d]
   const int hidden_size = input.size(-1);
   const auto num_tokens = output.numel() / hidden_size;
 
-  dim3 grid(num_tokens);
+  constexpr int kPersistentGrid = 64;
+  dim3 grid(std::min((int64_t)kPersistentGrid,
+                     (int64_t)num_tokens));
   dim3 block(std::min(hidden_size, 1024));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -361,6 +367,7 @@ void moe_sum_ep(torch::Tensor& input,    // [num_tokens, d]
                 input.data_ptr<scalar_t>(),
                 topk_ids.data_ptr<int64_t>(),
                 hidden_size,
-                num_local_experts);
+                num_local_experts,
+                (int64_t)num_tokens);
       });
 }
