@@ -575,6 +575,50 @@ __global__ void scatter_add_direct_kernel(
   }
 }
 
+// Entry-parallel scatter-add via atomicAdd.
+// Used for M > 384 where tile-based gather creates
+// excessive re-scanning of metadata (O(entries × gridY)).
+// Each block processes a chunk of entries, atomicAdd
+// to output. Output MUST be pre-zeroed by host wrapper.
+template <typename T>
+__global__ void scatter_add_atomic_kernel(
+    T* __restrict__ output,
+    const DispatchCombineConfig* __restrict__ config,
+    int32_t K) {
+  const int32_t rank = config->rank;
+  const int32_t ws = config->world_size;
+  const int32_t ss_c = config->combine_section_size;
+
+  const TokenMetadata* meta =
+      reinterpret_cast<const TokenMetadata*>(
+          config->remote_combine_meta[rank]);
+  const T* recv = reinterpret_cast<const T*>(
+      config->remote_combine_recv[rank]);
+
+  for (int32_t s = 0; s < ws; s++) {
+    int32_t sec_start = s * ss_c;
+    int32_t count =
+        config->remote_combine_offsets[rank][s];
+    if (count > ss_c) count = ss_c;
+    for (int32_t idx = sec_start + blockIdx.x;
+         idx < sec_start + count;
+         idx += gridDim.x) {
+
+      int32_t tok = meta[idx].source_token_idx;
+      float w = meta[idx].topk_weight;
+      if (w == 0.0f) continue;
+
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        float val = static_cast<float>(
+            recv[idx * K + k]) * w;
+        atomicAdd(output + tok * K + k,
+                  static_cast<T>(val));
+      }
+    }
+  }
+}
+
 // ====================================================================
 // Fused combine + barrier + scatter-add kernel
 // ====================================================================
