@@ -512,7 +512,8 @@ __global__ void prepare_dispatch_recv_kernel(
 // No atomicAdd needed. Each thread's smem slots are
 // private (stride = blockDim.x), so no __syncthreads.
 // Layout: smem[tid + m * bdim] → zero bank conflicts.
-// Grid = min(ceil(K/kBlockSize), kPersistentGrid).
+// 2D grid: blockIdx.x → K columns, blockIdx.y → M row tile.
+// Dynamic block_sz adapts to M for maximal tile_m.
 template <typename T>
 __global__ void scatter_add_direct_kernel(
     T* __restrict__ output,
@@ -526,6 +527,12 @@ __global__ void scatter_add_direct_kernel(
   const int32_t tid = threadIdx.x;
   const int32_t bdim = blockDim.x;
 
+  // blockIdx.y selects the row tile (replaces m_base loop).
+  const int32_t m_base = blockIdx.y * tile_m;
+  int32_t tile_end = m_base + tile_m;
+  if (tile_end > M) tile_end = M;
+  const int32_t tile_size = tile_end - m_base;
+
   const TokenMetadata* meta =
       reinterpret_cast<const TokenMetadata*>(
           config->remote_combine_meta[rank]);
@@ -536,42 +543,34 @@ __global__ void scatter_add_direct_kernel(
   for (int32_t k = blockIdx.x * bdim + tid;
        k < K; k += gridDim.x * bdim) {
 
-    // Process output rows in tiles of tile_m.
-    for (int32_t m_base = 0; m_base < M;
-         m_base += tile_m) {
-      int32_t tile_end = m_base + tile_m;
-      if (tile_end > M) tile_end = M;
-      int32_t tile_size = tile_end - m_base;
+    // Zero accumulators in shared memory.
+    for (int32_t i = 0; i < tile_size; i++)
+      smem_acc[tid + i * bdim] = 0.0f;
 
-      // Zero accumulators in shared memory.
-      for (int32_t i = 0; i < tile_size; i++)
-        smem_acc[tid + i * bdim] = 0.0f;
-
-      // Single pass over all sections and entries.
-      for (int32_t s = 0; s < ws; s++) {
-        int32_t sec_start = s * ss_c;
-        int32_t count =
-            config->remote_combine_offsets[rank][s];
-        if (count > ss_c) count = ss_c;
-        for (int32_t idx = sec_start;
-             idx < sec_start + count; idx++) {
-          int32_t tok = meta[idx].source_token_idx;
-          if (tok >= m_base && tok < tile_end) {
-            float w = meta[idx].topk_weight;
-            if (w != 0.0f) {
-              smem_acc[tid + (tok - m_base) * bdim] +=
-                  static_cast<float>(recv[idx * K + k])
-                  * w;
-            }
+    // Scan entries, accumulate matches for this tile.
+    for (int32_t s = 0; s < ws; s++) {
+      int32_t sec_start = s * ss_c;
+      int32_t count =
+          config->remote_combine_offsets[rank][s];
+      if (count > ss_c) count = ss_c;
+      for (int32_t idx = sec_start;
+           idx < sec_start + count; idx++) {
+        int32_t tok = meta[idx].source_token_idx;
+        if (tok >= m_base && tok < tile_end) {
+          float w = meta[idx].topk_weight;
+          if (w != 0.0f) {
+            smem_acc[tid + (tok - m_base) * bdim] +=
+                static_cast<float>(recv[idx * K + k])
+                * w;
           }
         }
       }
+    }
 
-      // Write final values (direct store, no atomic).
-      for (int32_t i = 0; i < tile_size; i++) {
-        output[(m_base + i) * K + k] =
-            static_cast<T>(smem_acc[tid + i * bdim]);
-      }
+    // Write final values (direct store, no atomic).
+    for (int32_t i = 0; i < tile_size; i++) {
+      output[(m_base + i) * K + k] =
+          static_cast<T>(smem_acc[tid + i * bdim]);
     }
   }
 }

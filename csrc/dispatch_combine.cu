@@ -209,23 +209,30 @@ void scatter_add_direct(
 
   const int32_t K32 = static_cast<int32_t>(K);
   const int32_t M32 = static_cast<int32_t>(M);
-  int32_t grid_sz =
-      (K32 + kBlockSize - 1) / kBlockSize;
-  if (grid_sz > kPersistentGrid)
-    grid_sz = kPersistentGrid;
-  if (grid_sz < 1) grid_sz = 1;
-  dim3 grid(grid_sz);
-  dim3 block(kBlockSize);
 
-  // Tile rows into chunks that fit in 48KB shared memory.
-  // tile_m = 49152 / (256 * 4) = 48 for kBlockSize=256.
-  constexpr int32_t kMaxSmemBytes = 49152;
+  // Dynamic block size: shrink threads/block so tile_m >= M
+  // when possible, avoiding multi-tile re-scanning.
+  constexpr int32_t kMaxSmemBytes = 49152;  // 48KB
+  int32_t block_sz =
+      kMaxSmemBytes
+      / (M32 * static_cast<int32_t>(sizeof(float)));
+  block_sz = (block_sz / 32) * 32;  // warp-align
+  if (block_sz > kBlockSize) block_sz = kBlockSize;
+  if (block_sz < 32) block_sz = 32;
+
   const int32_t tile_m =
       kMaxSmemBytes
-      / (kBlockSize * static_cast<int32_t>(sizeof(float)));
+      / (block_sz * static_cast<int32_t>(sizeof(float)));
   const int32_t smem_bytes =
-      kBlockSize * tile_m
+      block_sz * tile_m
       * static_cast<int32_t>(sizeof(float));
+
+  // 2D grid: x = K columns, y = M row tiles.
+  int32_t grid_x = (K32 + block_sz - 1) / block_sz;
+  if (grid_x < 1) grid_x = 1;
+  int32_t grid_y = (M32 + tile_m - 1) / tile_m;
+  dim3 grid(grid_x, grid_y);
+  dim3 block(block_sz);
 
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
