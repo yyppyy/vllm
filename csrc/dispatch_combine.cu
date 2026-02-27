@@ -279,17 +279,27 @@ void combine_and_scatter(
   const int32_t* cr =
       compact_reverse.data_ptr<int32_t>();
 
-  // Output zeroed inline by kernel (Phase 0).
-
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
   const int32_t M32 = static_cast<int32_t>(M);
+  const int32_t N = M32 * K32;
+
+  // No grid-wide sync needed for scatter-add phase —
+  // use enough blocks to saturate all SMs.
+  constexpr int32_t kCombineScatterGrid = 512;
   int32_t grid_sz = mc32;
-  if (grid_sz > kPersistentGrid)
-    grid_sz = kPersistentGrid;
+  if (grid_sz > kCombineScatterGrid)
+    grid_sz = kCombineScatterGrid;
   if (grid_sz < 1) grid_sz = 1;
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
+
+  // fp32 accum buffer — zeroed inline by kernel Phase 0.
+  // Native fp32 atomicAdd avoids bf16 CAS loops and
+  // adjacent-element contention. Converted to output
+  // dtype by fp32_to_half_kernel after the fused kernel.
+  auto accum = torch::empty(
+      {M, K}, output.options().dtype(at::kFloat));
 
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
@@ -301,9 +311,14 @@ void combine_and_scatter(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
               meta, cr,
+              accum.data_ptr<float>(),
+              config, mc32, K32, M32);
+          fp32_to_half_kernel<__nv_bfloat16>
+              <<<(N + kBlockSize - 1) / kBlockSize,
+                 kBlockSize, 0, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              config, mc32, K32, M32);
+              accum.data_ptr<float>(), N);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -312,9 +327,14 @@ void combine_and_scatter(
               reinterpret_cast<const __half*>(
                   expert_output.data_ptr()),
               meta, cr,
+              accum.data_ptr<float>(),
+              config, mc32, K32, M32);
+          fp32_to_half_kernel<__half>
+              <<<(N + kBlockSize - 1) / kBlockSize,
+                 kBlockSize, 0, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              config, mc32, K32, M32);
+              accum.data_ptr<float>(), N);
         })
   );
 }

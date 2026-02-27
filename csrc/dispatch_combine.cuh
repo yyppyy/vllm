@@ -568,18 +568,19 @@ __global__ void fp32_to_half_kernel(
 // ====================================================================
 // Replaces 3 separate kernel launches:
 //   combine_p2p + p2p_barrier_reset_dispatch + scatter_add_direct
-// Phase 0: Zero output (all blocks cooperate).
+// Phase 0: Zero fp32 accum buffer (all blocks cooperate).
 // Phase 1: Combine P2P writes (persistent grid loop).
 // Grid-wide sync: all blocks done writing.
 // Phase 2: Inline P2P barrier (RESET_DISPATCH).
-// Phase 3: Scatter-add from local combine buffer.
-// Grid = kPersistentGrid, block = kBlockSize.
+// Phase 3: Scatter-add to fp32 accum (native atomicAdd).
+// Host launches fp32_to_half_kernel after to convert
+// accum → output. Grid = kCombineScatterGrid, block = kBlockSize.
 template <typename T>
 __global__ void combine_and_scatter_kernel(
     const T* __restrict__ expert_output,
     const TokenMetadata* __restrict__ dispatch_meta,
     const int32_t* __restrict__ compact_reverse,
-    T* __restrict__ output,
+    float* __restrict__ accum,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc, int32_t K, int32_t M) {
   const int32_t rank = config->rank;
@@ -599,14 +600,15 @@ __global__ void combine_and_scatter_kernel(
   FlagType cd_base = s_cd_base;
   FlagType barrier_expected = s_barrier_expected;
 
-  // ---- Phase 0: Zero output ----
-  // Vectorized: int4 = 16 bytes = 8 BF16/FP16.
-  // Phase 1 doesn't touch output, and Phase 3 follows
+  // ---- Phase 0: Zero fp32 accum buffer ----
+  // Vectorized: int4 = 16 bytes = 4 floats.
+  // Phase 1 doesn't touch accum, and Phase 3 follows
   // multiple system fences + barrier, so no extra sync.
   {
-    int4* out4 = reinterpret_cast<int4*>(output);
+    int4* out4 = reinterpret_cast<int4*>(accum);
     constexpr int32_t kElemsPerI4 =
-        static_cast<int32_t>(sizeof(int4) / sizeof(T));
+        static_cast<int32_t>(
+            sizeof(int4) / sizeof(float));
     int32_t n4 = M * K / kElemsPerI4;
     int4 z4 = make_int4(0, 0, 0, 0);
     for (int32_t i =
@@ -757,7 +759,9 @@ __global__ void combine_and_scatter_kernel(
     __syncthreads();
   }
 
-  // ---- Phase 3: Scatter-add from combine buffer ----
+  // ---- Phase 3: Scatter-add to fp32 accum ----
+  // Native fp32 atomicAdd: no CAS loop, no adjacent-
+  // element contention from packed 32-bit words.
   // Section-aware iteration: only visit real entries.
   {
     const int32_t ss_c = config->combine_section_size;
@@ -784,10 +788,9 @@ __global__ void combine_and_scatter_kernel(
         for (int32_t k = threadIdx.x; k < K;
              k += blockDim.x) {
           float val = static_cast<float>(
-              crecv[idx * K + k]);
+              crecv[idx * K + k]) * wt;
           atomicAdd(
-              output + token_idx * K + k,
-              static_cast<T>(val * wt));
+              accum + token_idx * K + k, val);
         }
       }
     }
@@ -1120,11 +1123,13 @@ __global__ void dar_phase_c_kernel(
   __syncthreads();
 
   // Write routing_selection to global memory.
+  // No trailing fence needed: kernel launch boundary
+  // to D1/D2 on the same stream provides device-wide
+  // visibility of all global memory writes.
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     config->routing_selection[e] = routing_sel[e];
   }
-  __threadfence();
 }
 
 // ---- Phase D1: Zero expert_num_tokens for D2 ----
@@ -1712,9 +1717,10 @@ __global__ void dispatch_and_route_kernel(
       actual = config->max_recv;
   }
 
-  // ---- Phase C (block 0) + Phase D1 (blocks 1-31) ----
-  // Block 0: parallel preload + deterministic router.
-  // Blocks 1-31: zero stale entries (concurrent with C).
+  // ---- Phase C + D1 (block 0 only) ----
+  // Block 0: parallel preload + deterministic router +
+  // zero expert_num_tokens. Other blocks spin-wait on
+  // routing_ready_flag.
   if (blockIdx.x == 0) {
     // Reuse shared[] for Phase C preload layout.
     int32_t* s_expert_sum = shared;           // [NL]
