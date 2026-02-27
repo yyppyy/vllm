@@ -795,51 +795,6 @@ __global__ void combine_and_scatter_kernel(
 }
 
 // ====================================================================
-// Host-callable wrappers
-// ====================================================================
-void dispatch_p2p(
-    torch::Tensor input,
-    torch::Tensor topk_ids,
-    torch::Tensor topk_weights,
-    torch::Tensor config_tensor,
-    int64_t M, int64_t K, int64_t topk);
-
-void combine_p2p(
-    torch::Tensor expert_output,
-    torch::Tensor dispatch_meta,
-    torch::Tensor config_tensor,
-    int64_t max_recv, int64_t K);
-
-void p2p_barrier(torch::Tensor config_tensor);
-void p2p_barrier_reset_dispatch(
-    torch::Tensor config_tensor);
-
-torch::Tensor wrap_cuda_ptr(
-    torch::Tensor dummy,
-    int64_t ptr, int64_t dim0, int64_t dim1,
-    int64_t dtype_code);
-void prepare_dispatch_recv(
-    torch::Tensor dispatch_recv,
-    torch::Tensor expert_topk_ids,
-    torch::Tensor expert_topk_weights,
-    torch::Tensor expert_num_tokens,
-    torch::Tensor config_tensor,
-    int64_t mc, int64_t K,
-    int64_t num_experts);
-void scatter_add_direct(
-    torch::Tensor output,
-    torch::Tensor config_tensor,
-    int64_t mc, int64_t K,
-    int64_t M);
-void combine_and_scatter(
-    torch::Tensor expert_output,
-    torch::Tensor dispatch_meta,
-    torch::Tensor output,
-    torch::Tensor config_tensor,
-    int64_t mc, int64_t K,
-    int64_t M);
-
-// ====================================================================
 // Split-phase dispatch + route kernels (profiling mode)
 // ====================================================================
 // When VLLM_DC_SPLIT_KERNELS=1, dispatch_and_route is split into
@@ -1177,15 +1132,8 @@ __global__ void dar_phase_c_kernel(
 // start at zero. Folded here to avoid host-side
 // cudaMemsetAsync overhead. Kernel-to-kernel ordering
 // on the same stream guarantees D2 sees the zeros.
-template <typename T>
 __global__ void dar_phase_d1_kernel(
-    T* __restrict__ dispatch_recv,
-    int64_t* __restrict__ expert_topk_ids,
-    float* __restrict__ expert_topk_weights,
     int32_t* __restrict__ expert_num_tokens,
-    int32_t* __restrict__ data_remap,
-    const DispatchCombineConfig* __restrict__ config,
-    int32_t mc, int32_t K,
     int32_t num_physical_experts) {
   for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
        i < num_physical_experts;
@@ -1409,40 +1357,6 @@ __global__ void dar_phase_e_kernel(
     config->local_dispatch_counters[threadIdx.x] = 0;
   }
 }
-
-// Forward declarations for split-phase host wrappers.
-void dar_phase_a(
-    torch::Tensor input,
-    torch::Tensor topk_ids,
-    torch::Tensor topk_weights,
-    torch::Tensor config_tensor,
-    int64_t M, int64_t K, int64_t topk,
-    int64_t num_logical_experts,
-    int64_t world_size);
-void dar_push_and_barrier(
-    torch::Tensor config_tensor);
-void dar_phase_c(
-    torch::Tensor config_tensor,
-    int64_t num_logical_experts,
-    int64_t world_size);
-void dar_phase_d1(
-    torch::Tensor dispatch_recv,
-    torch::Tensor expert_topk_ids,
-    torch::Tensor expert_topk_weights,
-    torch::Tensor data_remap,
-    torch::Tensor config_tensor,
-    int64_t mc, int64_t K,
-    int64_t num_physical_experts);
-void dar_phase_d2(
-    torch::Tensor expert_topk_ids,
-    torch::Tensor expert_topk_weights,
-    torch::Tensor expert_num_tokens,
-    torch::Tensor data_remap,
-    torch::Tensor config_tensor,
-    int64_t mc,
-    int64_t num_physical_experts);
-void dar_phase_e(
-    torch::Tensor config_tensor);
 
 // ====================================================================
 // Fused dispatch + route + filter kernel (integrated EPLB)
@@ -2028,24 +1942,6 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 }
-
-// Host-callable wrapper for fused dispatch+route+filter.
-void dispatch_and_route(
-    torch::Tensor input,
-    torch::Tensor topk_ids,
-    torch::Tensor topk_weights,
-    torch::Tensor dispatch_recv,
-    torch::Tensor expert_topk_ids,
-    torch::Tensor expert_topk_weights,
-    torch::Tensor expert_num_tokens,
-    torch::Tensor expert_counts,
-    torch::Tensor data_remap,
-    torch::Tensor config_tensor,
-    int64_t M, int64_t K, int64_t topk,
-    int64_t mc,
-    int64_t num_physical_experts,
-    int64_t num_logical_experts,
-    int64_t world_size);
 
 }  // namespace dispatch_combine
 }  // namespace vllm

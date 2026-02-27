@@ -57,13 +57,8 @@ void dar_phase_a(torch::Tensor input, torch::Tensor topk_ids,
 void dar_push_and_barrier(torch::Tensor config_tensor);
 void dar_phase_c(torch::Tensor config_tensor,
                  int64_t num_logical_experts, int64_t world_size);
-void dar_phase_d1(torch::Tensor dispatch_recv,
-                  torch::Tensor expert_topk_ids,
-                  torch::Tensor expert_topk_weights,
-                  torch::Tensor expert_num_tokens,
-                  torch::Tensor data_remap,
-                  torch::Tensor config_tensor,
-                  int64_t mc, int64_t K, int64_t num_physical_experts);
+void dar_phase_d1(torch::Tensor expert_num_tokens,
+                  int64_t num_physical_experts);
 void dar_phase_d2(torch::Tensor expert_topk_ids,
                   torch::Tensor expert_topk_weights,
                   torch::Tensor expert_num_tokens,
@@ -984,13 +979,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
 
   dc.def(
       "dar_phase_d1("
-      "Tensor! dispatch_recv, "
-      "Tensor! expert_topk_ids, "
-      "Tensor! expert_topk_weights, "
       "Tensor! expert_num_tokens, "
-      "Tensor! data_remap, "
-      "Tensor config_tensor, "
-      "int mc, int K, "
       "int num_physical_experts) -> ()");
   dc.impl("dar_phase_d1", torch::kCUDA,
           &vllm::dispatch_combine::dar_phase_d1);

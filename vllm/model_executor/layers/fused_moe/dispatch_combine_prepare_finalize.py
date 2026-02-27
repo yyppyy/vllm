@@ -210,8 +210,7 @@ class DispatchCombinePrepareAndFinalize(
                 M, K, topk)
             mgr.gpu_dar_push_and_barrier()
             mgr.gpu_dar_phase_c()
-            mgr.gpu_dar_phase_d1(
-                self._mc_full, K, num_experts)
+            mgr.gpu_dar_phase_d1(num_experts)
             mgr.gpu_dar_phase_d2(
                 self._mc_full, num_experts)
             # Compact: gather valid entries from

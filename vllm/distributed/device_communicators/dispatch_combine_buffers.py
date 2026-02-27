@@ -579,19 +579,12 @@ class DispatchCombineP2PManager:
                 self._num_logical_experts,
                 self.world_size)
 
-    def gpu_dar_phase_d1(
-            self, mc: int, K: int,
-            num_experts: int):
+    def gpu_dar_phase_d1(self, num_experts: int):
         """Phase D1: zero expert_num_tokens for D2."""
         torch.ops._C_dispatch_combine\
             .dar_phase_d1(
-                self.dispatch_recv_tensor,
-                self.expert_topk_ids_buf,
-                self.expert_topk_weights_buf,
                 self.expert_num_tokens_buf,
-                self.data_remap_buf,
-                self.config_tensor,
-                mc, K, num_experts)
+                num_experts)
 
     def gpu_dar_phase_d2(
             self, mc: int, num_experts: int):
