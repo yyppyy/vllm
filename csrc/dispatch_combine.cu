@@ -208,90 +208,34 @@ void scatter_add_direct(
           config_tensor.data_ptr());
 
   const int32_t K32 = static_cast<int32_t>(K);
-  const int32_t M32 = static_cast<int32_t>(M);
 
-  // Compute dynamic block size for smem gather path.
-  constexpr int32_t kMaxSmemBytes = 49152;  // 48KB
-  int32_t block_sz =
-      kMaxSmemBytes
-      / (M32 * static_cast<int32_t>(sizeof(float)));
-  block_sz = (block_sz / 32) * 32;  // warp-align
-  if (block_sz > kBlockSize) block_sz = kBlockSize;
-  if (block_sz < 32) block_sz = 32;
-
-  const int32_t tile_m =
-      kMaxSmemBytes
-      / (block_sz * static_cast<int32_t>(sizeof(float)));
-  const int32_t grid_y = (M32 + tile_m - 1) / tile_m;
-
-  // Single tile (M <= tile_m): smem gather — no
-  // atomicAdd contention, direct store to output.
-  // Multiple tiles (M > tile_m): atomicAdd scatter —
-  // O(entries) vs O(entries × gridY) metadata scanning.
-  const bool use_atomic = (grid_y > 1);
+  int32_t grid_sz = static_cast<int32_t>(mc);
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  if (grid_sz < 1) grid_sz = 1;
 
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
       "scatter_add_direct",
       AT_DISPATCH_CASE(at::ScalarType::BFloat16,
         [&] {
-          if (use_atomic) {
-            cudaMemsetAsync(output.data_ptr(), 0,
-                M * K * sizeof(__nv_bfloat16), stream);
-            int32_t grid_sz =
-                static_cast<int32_t>(mc);
-            if (grid_sz > kPersistentGrid)
-              grid_sz = kPersistentGrid;
-            if (grid_sz < 1) grid_sz = 1;
-            scatter_add_atomic_kernel<__nv_bfloat16>
-                <<<grid_sz, kBlockSize, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(
-                    output.data_ptr()),
-                config, K32);
-          } else {
-            int32_t smem_bytes =
-                block_sz * tile_m
-                * static_cast<int32_t>(sizeof(float));
-            int32_t grid_x =
-                (K32 + block_sz - 1) / block_sz;
-            if (grid_x < 1) grid_x = 1;
-            dim3 grid(grid_x, 1);
-            scatter_add_direct_kernel<__nv_bfloat16>
-                <<<grid, block_sz, smem_bytes, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(
-                    output.data_ptr()),
-                config, K32, M32, tile_m);
-          }
+          cudaMemsetAsync(output.data_ptr(), 0,
+              M * K * sizeof(__nv_bfloat16), stream);
+          scatter_add_atomic_kernel<__nv_bfloat16>
+              <<<grid_sz, kBlockSize, 0, stream>>>(
+              reinterpret_cast<__nv_bfloat16*>(
+                  output.data_ptr()),
+              config, K32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
-          if (use_atomic) {
-            cudaMemsetAsync(output.data_ptr(), 0,
-                M * K * sizeof(__half), stream);
-            int32_t grid_sz =
-                static_cast<int32_t>(mc);
-            if (grid_sz > kPersistentGrid)
-              grid_sz = kPersistentGrid;
-            if (grid_sz < 1) grid_sz = 1;
-            scatter_add_atomic_kernel<__half>
-                <<<grid_sz, kBlockSize, 0, stream>>>(
-                reinterpret_cast<__half*>(
-                    output.data_ptr()),
-                config, K32);
-          } else {
-            int32_t smem_bytes =
-                block_sz * tile_m
-                * static_cast<int32_t>(sizeof(float));
-            int32_t grid_x =
-                (K32 + block_sz - 1) / block_sz;
-            if (grid_x < 1) grid_x = 1;
-            dim3 grid(grid_x, 1);
-            scatter_add_direct_kernel<__half>
-                <<<grid, block_sz, smem_bytes, stream>>>(
-                reinterpret_cast<__half*>(
-                    output.data_ptr()),
-                config, K32, M32, tile_m);
-          }
+          cudaMemsetAsync(output.data_ptr(), 0,
+              M * K * sizeof(__half), stream);
+          scatter_add_atomic_kernel<__half>
+              <<<grid_sz, kBlockSize, 0, stream>>>(
+              reinterpret_cast<__half*>(
+                  output.data_ptr()),
+              config, K32);
         })
   );
 }

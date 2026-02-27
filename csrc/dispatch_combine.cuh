@@ -503,83 +503,13 @@ __global__ void prepare_dispatch_recv_kernel(
 }
 
 // ====================================================================
-// Scatter-add direct: reads from IPC combine buffers
+// Scatter-add: entry-parallel via atomicAdd
 // ====================================================================
 // Reads combine recv/meta via IPC pointers in config.
-// Gather-accumulate scatter-add: each thread owns a column k
-// and gathers contributions from all recv entries into
-// per-row float32 accumulators in shared memory.
-// No atomicAdd needed. Each thread's smem slots are
-// private (stride = blockDim.x), so no __syncthreads.
-// Layout: smem[tid + m * bdim] → zero bank conflicts.
-// 2D grid: blockIdx.x → K columns, blockIdx.y → M row tile.
-// Dynamic block_sz adapts to M for maximal tile_m.
-template <typename T>
-__global__ void scatter_add_direct_kernel(
-    T* __restrict__ output,
-    const DispatchCombineConfig* __restrict__ config,
-    int32_t K, int32_t M, int32_t tile_m) {
-  extern __shared__ float smem_acc[];
-
-  const int32_t rank = config->rank;
-  const int32_t ws = config->world_size;
-  const int32_t ss_c = config->combine_section_size;
-  const int32_t tid = threadIdx.x;
-  const int32_t bdim = blockDim.x;
-
-  // blockIdx.y selects the row tile (replaces m_base loop).
-  const int32_t m_base = blockIdx.y * tile_m;
-  int32_t tile_end = m_base + tile_m;
-  if (tile_end > M) tile_end = M;
-  const int32_t tile_size = tile_end - m_base;
-
-  const TokenMetadata* meta =
-      reinterpret_cast<const TokenMetadata*>(
-          config->remote_combine_meta[rank]);
-  const T* recv = reinterpret_cast<const T*>(
-      config->remote_combine_recv[rank]);
-
-  // Each thread owns column k exclusively.
-  for (int32_t k = blockIdx.x * bdim + tid;
-       k < K; k += gridDim.x * bdim) {
-
-    // Zero accumulators in shared memory.
-    for (int32_t i = 0; i < tile_size; i++)
-      smem_acc[tid + i * bdim] = 0.0f;
-
-    // Scan entries, accumulate matches for this tile.
-    for (int32_t s = 0; s < ws; s++) {
-      int32_t sec_start = s * ss_c;
-      int32_t count =
-          config->remote_combine_offsets[rank][s];
-      if (count > ss_c) count = ss_c;
-      for (int32_t idx = sec_start;
-           idx < sec_start + count; idx++) {
-        int32_t tok = meta[idx].source_token_idx;
-        if (tok >= m_base && tok < tile_end) {
-          float w = meta[idx].topk_weight;
-          if (w != 0.0f) {
-            smem_acc[tid + (tok - m_base) * bdim] +=
-                static_cast<float>(recv[idx * K + k])
-                * w;
-          }
-        }
-      }
-    }
-
-    // Write final values (direct store, no atomic).
-    for (int32_t i = 0; i < tile_size; i++) {
-      output[(m_base + i) * K + k] =
-          static_cast<T>(smem_acc[tid + i * bdim]);
-    }
-  }
-}
-
-// Entry-parallel scatter-add via atomicAdd.
-// Used for M > 384 where tile-based gather creates
-// excessive re-scanning of metadata (O(entries × gridY)).
-// Each block processes a chunk of entries, atomicAdd
-// to output. Output MUST be pre-zeroed by host wrapper.
+// Each block processes a stride of entries, atomicAdds
+// weighted values to output. Threads tile over K columns
+// (coalesced). Output MUST be pre-zeroed by host wrapper.
+// O(entries) metadata reads — each entry scanned once.
 template <typename T>
 __global__ void scatter_add_atomic_kernel(
     T* __restrict__ output,
