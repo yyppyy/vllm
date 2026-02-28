@@ -153,6 +153,9 @@ class DispatchCombineP2PManager:
         self._raw_routing_selection = None
         self._raw_routing_ready_flag = None
         self._raw_phase_a_done_counter = None
+        self._raw_block_dispatch_counts = None
+        self._raw_block_start_positions = None
+        self._raw_positions_ready_flag = None
         self._routing_map_tensor = None
         self._routing_count_tensor = None
         self._num_logical_experts = 0
@@ -464,6 +467,25 @@ class DispatchCombineP2PManager:
         data += struct.pack(
             'Q', self._raw_combine_done_counter.value)
 
+        # ---- Two-pass dispatch support ----
+        # block_dispatch_counts (1 pointer)
+        ptr = (self._raw_block_dispatch_counts.value
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
+        # block_start_positions (1 pointer)
+        ptr = (self._raw_block_start_positions.value
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
+        # positions_ready_flag (1 pointer)
+        ptr = (self._raw_positions_ready_flag.value
+               if self._integrated_routing_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
             bytearray(config_bytes), dtype=torch.uint8
@@ -760,6 +782,28 @@ class DispatchCombineP2PManager:
             self._raw_local_expert_counts,
             0, lec_bytes)
 
+        # Two-pass dispatch buffers (local only).
+        # block_dispatch_counts: int32[32 * 64]
+        # block_start_positions: int32[32 * 64]
+        # positions_ready_flag: uint32 (4 bytes)
+        kPersistentGrid = 32
+        kMaxRanks = 64
+        bdc_bytes = kPersistentGrid * kMaxRanks * 4
+        self._raw_block_dispatch_counts = (
+            cuda_rt.cudaMalloc(bdc_bytes))
+        cuda_rt.cudaMemset(
+            self._raw_block_dispatch_counts,
+            0, bdc_bytes)
+        self._raw_block_start_positions = (
+            cuda_rt.cudaMalloc(bdc_bytes))
+        cuda_rt.cudaMemset(
+            self._raw_block_start_positions,
+            0, bdc_bytes)
+        self._raw_positions_ready_flag = (
+            cuda_rt.cudaMalloc(4))
+        cuda_rt.cudaMemset(
+            self._raw_positions_ready_flag, 0, 4)
+
         # Routing tables (GPU tensors, updated on
         # EPLB rebalance).
         self._routing_map_tensor = torch.zeros(
@@ -909,3 +953,12 @@ class DispatchCombineP2PManager:
         if self._raw_local_expert_counts is not None:
             self._cuda_rt.cudaFree(
                 self._raw_local_expert_counts)
+        if self._raw_block_dispatch_counts is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_block_dispatch_counts)
+        if self._raw_block_start_positions is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_block_start_positions)
+        if self._raw_positions_ready_flag is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_positions_ready_flag)

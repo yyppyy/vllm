@@ -121,9 +121,10 @@ struct DispatchCombineConfig {
   FlagType* routing_ready_flag;
 
   // Grid-wide sync: all blocks increment this counter
-  // after Phase A completes. Block 0 spins until
-  // counter == base + gridDim.x before entering the
-  // P2P barrier. Monotonic for CUDA graph replay.
+  // twice per invocation (after Pass 1 and Pass 2).
+  // Block 0 spins until counter == base + gridDim.x
+  // (Pass 1 done) then base + 2*gridDim.x (Pass 2
+  // done + fence). Monotonic for CUDA graph replay.
   FlagType* phase_a_done_counter;
 
   // Local expert counts buffer for batched all-reduce.
@@ -149,6 +150,17 @@ struct DispatchCombineConfig {
   // All blocks increment after Phase 1 (combine P2P writes);
   // block 0 spins until all done before entering barrier.
   FlagType* combine_done_counter;
+
+  // ---- Two-pass dispatch support ----
+  // Pass 1 writes per-block per-rank entry counts here;
+  // block 0 reads them during aggregation for prefix sum.
+  int32_t* block_dispatch_counts;      // [kPersistentGrid * kMaxRanks]
+  // Block 0 writes per-block starting write positions here
+  // after prefix sum; all blocks read in Pass 2.
+  int32_t* block_start_positions;      // [kPersistentGrid * kMaxRanks]
+  // Block 0 signals this flag after computing positions;
+  // blocks 1-31 spin until ready. Monotonic for CUDA graph.
+  FlagType* positions_ready_flag;
 };
 
 // ====================================================================
@@ -618,12 +630,12 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  // ---- Phase 1: Combine P2P writes ----
-  // Section-aware iteration: loop only over real entries
-  // in each sender's section, avoiding 65536-entry
-  // full-range scan with expensive runtime div/mod.
+  // ---- Phase 1: Combine P2P writes (persistent blocks) ----
+  // Only kPersistentGrid (32) blocks do NVLink writes.
+  // Less contention on local_combine_counters, and only
+  // 32 blocks call __threadfence_system() (staggered).
   __shared__ int32_t s_write_pos;
-  {
+  if (blockIdx.x < kPersistentGrid) {
     const int32_t ss_d = config->dispatch_section_size;
     for (int32_t s = 0; s < ws; s++) {
       int32_t section_start = s * ss_d;
@@ -633,7 +645,7 @@ __global__ void combine_and_scatter_kernel(
       for (int32_t pair_idx =
                section_start + blockIdx.x;
            pair_idx < section_start + count;
-           pair_idx += gridDim.x) {
+           pair_idx += kPersistentGrid) {
 
         const int32_t dest_rank =
             dispatch_meta[pair_idx].source_rank;
@@ -669,7 +681,6 @@ __global__ void combine_and_scatter_kernel(
 
         T* dest_data = reinterpret_cast<T*>(
             config->remote_combine_recv[dest_rank]);
-        // Read expert output from compact position.
         const int32_t ci =
             compact_reverse[pair_idx];
         const T* src_data =
@@ -694,21 +705,24 @@ __global__ void combine_and_scatter_kernel(
         }
       }
     }
+
+    // Staggered fence: blocks finish at different
+    // times, avoiding NVLink ack congestion.
+    __syncthreads();
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(config->combine_done_counter,
+                static_cast<FlagType>(1));
+    }
   }
 
-  // ---- Grid-wide sync: all blocks done with P2P ----
-  __syncthreads();
-  __threadfence_system();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    atomicAdd(config->combine_done_counter,
-              static_cast<FlagType>(1));
-  }
-
-  // ---- Phase 2: Inline P2P barrier (RESET_DISPATCH) ----
+  // ---- Phase 2: Single barrier ----
+  // Block 0 waits for kPersistentGrid blocks, does
+  // P2P barrier. All other blocks wait for counter.
   if (blockIdx.x == 0) {
     if (threadIdx.x == 0) {
-      FlagType target = cd_base + gridDim.x;
+      FlagType target = cd_base + kPersistentGrid;
       while (dc_ld_flag_acquire(
                  config->combine_done_counter)
               < target)
@@ -717,7 +731,6 @@ __global__ void combine_and_scatter_kernel(
     __syncthreads();
 
     const int32_t tid = threadIdx.x;
-    // Push combine counts + reset dispatch state.
     if (tid < ws) {
       if (config->remote_combine_offsets[tid])
         config->remote_combine_offsets[tid][rank] =
@@ -749,7 +762,12 @@ __global__ void combine_and_scatter_kernel(
           barrier_expected);
     }
   } else {
-    // Wait for block 0 to complete barrier.
+    // Blocks 1-511: wait for barrier completion.
+    // Blocks >= kPersistentGrid: device fence ensures
+    // Phase 0 accum zeroing is L2-visible for Phase 3.
+    if (blockIdx.x >= kPersistentGrid) {
+      __threadfence();
+    }
     if (threadIdx.x == 0) {
       while (dc_ld_flag_acquire(
           &config->self_signals->counter)
@@ -1399,86 +1417,75 @@ __global__ void dispatch_and_route_kernel(
   const int32_t NL = config->num_logical_experts;
 
   // Shared memory layout (reused across phases):
-  // Phase A: s_expert_counts[NL] + s_grp_dest[ws]
-  //        + s_grp_count[ws] + s_ent_lid[64]
-  //        + s_ent_wt[64] + s_ent_grp[64]
-  // Phase C: s_expert_sum[NL] + s_replica_count[NL]
-  //        + s_l2p_map[NL*max_rep]
-  //        + routing_selection_smem[NL]
-  //        + rank_active_counts[ws]
+  // Pass 1/2: s_expert_counts[NL] + s_dr_count[ws]
+  //           + s_ent_lid[64] + s_ent_wt[64]
+  //           + s_ent_dr[64]
+  // Phase C:  s_expert_sum[NL] + s_replica_count[NL]
+  //           + s_l2p_map[NL*max_rep]
+  //           + routing_selection_smem[NL]
+  //           + rank_active_counts[ws]
   // Phases don't overlap, so same memory is reused.
   extern __shared__ int32_t shared[];
 
-  // Read monotonic counter base values BEFORE Phase A
+  // Read monotonic counter base values BEFORE any phase
   // (for CUDA graph replay compatibility).
   FlagType rf_expected = 0;
   FlagType pa_base = 0;
+  FlagType prf_expected = 0;
+  FlagType barrier_expected = 0;
   if (threadIdx.x == 0) {
     rf_expected =
-        static_cast<FlagType>(*config->routing_ready_flag) + 1;
+        static_cast<FlagType>(
+            *config->routing_ready_flag) + 1;
     pa_base =
-        static_cast<FlagType>(*config->phase_a_done_counter);
+        static_cast<FlagType>(
+            *config->phase_a_done_counter);
+    prf_expected =
+        static_cast<FlagType>(
+            *config->positions_ready_flag) + 1;
+    barrier_expected =
+        config->self_signals->counter + 1;
   }
   // Broadcast to all threads via shared mem.
   __shared__ FlagType s_rf_expected;
   __shared__ FlagType s_pa_base;
+  __shared__ FlagType s_prf_expected;
+  __shared__ FlagType s_barrier_expected;
   if (threadIdx.x == 0) {
     s_rf_expected = rf_expected;
     s_pa_base = pa_base;
+    s_prf_expected = prf_expected;
+    s_barrier_expected = barrier_expected;
   }
   __syncthreads();
   rf_expected = s_rf_expected;
   pa_base = s_pa_base;
+  prf_expected = s_prf_expected;
+  barrier_expected = s_barrier_expected;
 
-  // ---- Phase A: Broadcast dispatch + batched all-reduce ----
-  // Per-token loop: group (slot, replica) by dest_rank to
-  // write token data ONCE per unique (token, dest_rank).
-  // Expert counts accumulated in shared memory, flushed to
-  // local device buffer after loop, pushed to all ranks by
-  // block 0 after grid-wide sync.
-  // Reuses extern shared[] (Phase C only runs after barrier).
-  constexpr int32_t kMaxEntries = 64;  // topk * max_rep
-  int32_t* s_expert_counts = shared;              // [NL]
-  int32_t* s_grp_dest  = shared + NL;             // [ws]
-  int32_t* s_grp_count = shared + NL + ws;        // [ws]
-  int32_t* s_ent_lid   = shared + NL + 2 * ws;    // [kMaxEntries]
-  float*   s_ent_wt    = reinterpret_cast<float*>(
-      s_ent_lid + kMaxEntries);                    // [kMaxEntries]
-  int32_t* s_ent_grp   = reinterpret_cast<int32_t*>(
-      s_ent_wt + kMaxEntries);                     // [kMaxEntries]
+  // ============================================================
+  // PASS 1: Entry counting (no NVLink writes)
+  // ============================================================
+  // Count entries per dest_rank, accumulate expert counts.
+  // No serial grouping, no device atomicAdd for positions.
+  int32_t* s_expert_counts = shared;       // [NL]
+  int32_t* s_dr_count = shared + NL;       // [ws]
 
-  __shared__ int32_t s_num_groups;
-  __shared__ int32_t s_total_entries;
-  __shared__ int32_t s_grp_base[64];   // claimed write_pos
-
-  // Step 0: Zero shared expert counts (persistent across
-  // all token iterations; flushed to device mem after loop)
-  // and init per-token counters for parallel Step 1a.
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     s_expert_counts[e] = 0;
   }
-  if (threadIdx.x == 0) {
-    s_num_groups = 0;
-    s_total_entries = 0;
+  if (threadIdx.x < ws) {
+    s_dr_count[threadIdx.x] = 0;
   }
   __syncthreads();
 
   for (int32_t t = blockIdx.x; t < M; t += gridDim.x) {
-    // Step 1a: Parallel expansion (threads 0..topk-1).
-    // Each thread handles one topk slot, does global
-    // reads in parallel, expands (slot,replica) entries
-    // into shared-mem arrays. s_ent_grp temporarily
-    // stores dest_rank; Step 1b overwrites with group.
     if (threadIdx.x < topk) {
       int32_t slot = threadIdx.x;
       int32_t lid = topk_ids[t * topk + slot];
       if (lid >= 0 && lid < NL) {
-        // Expert count: shared-mem atomicAdd (may
-        // collide if two slots pick the same expert).
         atomicAdd(&s_expert_counts[lid], 1);
-
-        float wt = topk_weights[t * topk + slot];
         int32_t rc = static_cast<int32_t>(
             config->logical_replica_count[lid]);
         if (rc > max_rep) rc = max_rep;
@@ -1492,111 +1499,16 @@ __global__ void dispatch_and_route_kernel(
               !config->remote_dispatch_recv[dr] ||
               !config->remote_dispatch_meta[dr])
             continue;
-          int32_t ei =
-              atomicAdd(&s_total_entries, 1);
-          if (ei < kMaxEntries) {
-            s_ent_lid[ei] = lid;
-            s_ent_wt[ei] = wt;
-            s_ent_grp[ei] = dr;  // temp: dest_rank
-          }
+          atomicAdd(&s_dr_count[dr], 1);
         }
       }
     }
-    __syncthreads();
-
-    // Step 1b: Thread 0 groups entries by dest_rank
-    // from shared memory (~1 cycle per read). Overwrites
-    // s_ent_grp[i] from dest_rank to group index.
-    if (threadIdx.x == 0) {
-      int32_t ne = s_total_entries;
-      if (ne > kMaxEntries) ne = kMaxEntries;
-      for (int32_t i = 0; i < ne; i++) {
-        int32_t dr = s_ent_grp[i];
-        // Find or create group for dest_rank.
-        int32_t g = -1;
-        for (int32_t j = 0; j < s_num_groups; j++) {
-          if (s_grp_dest[j] == dr) {
-            g = j; break;
-          }
-        }
-        if (g == -1) {
-          g = s_num_groups++;
-          s_grp_dest[g] = dr;
-          s_grp_count[g] = 0;
-        }
-        s_ent_grp[i] = g;
-        s_grp_count[g]++;
-      }
-    }
-    __syncthreads();
-
-    // Step 2: Claim contiguous write positions.
-    // LOCAL atomicAdd (~50ns) instead of remote NVLink
-    // atomicAdd (~2us). Each source rank owns a section
-    // of size dispatch_section_size in each dest's recv
-    // buffer, so positions are rank * ss + local_offset.
-    if (threadIdx.x < s_num_groups) {
-      int32_t dr = s_grp_dest[threadIdx.x];
-      int32_t local_off = atomicAdd(
-          &config->local_dispatch_counters[dr],
-          s_grp_count[threadIdx.x]);
-      int32_t ss = config->dispatch_section_size;
-      // Section overflow: drop if section full.
-      s_grp_base[threadIdx.x] = (local_off < ss)
-          ? rank * ss + local_off : config->max_recv;
-    }
-    __syncthreads();
-
-    // Step 3: Write data ONCE + N metadata per group.
-    // Entries are interleaved across groups in the flat
-    // arrays, so filter by s_ent_grp[ei] == g.
-    for (int32_t g = 0; g < s_num_groups; g++) {
-      int32_t dr = s_grp_dest[g];
-      int32_t base = s_grp_base[g];
-      int32_t n = s_grp_count[g];
-      if (base >= config->max_recv) continue;
-      if (base + n > config->max_recv)
-        n = config->max_recv - base;
-
-      // All threads: write token data ONCE at base.
-      T* dest = reinterpret_cast<T*>(
-          config->remote_dispatch_recv[dr]);
-      const T* src = input + t * K;
-      for (int32_t k = threadIdx.x; k < K;
-           k += blockDim.x) {
-        dest[base * K + k] = src[k];
-      }
-
-      // Thread 0: write metadata for matching entries.
-      if (threadIdx.x == 0) {
-        TokenMetadata* meta =
-            reinterpret_cast<TokenMetadata*>(
-                config->remote_dispatch_meta[dr]);
-        int32_t mi = 0;
-        for (int32_t ei = 0;
-             ei < s_total_entries && mi < n;
-             ei++) {
-          if (s_ent_grp[ei] != g) continue;
-          meta[base + mi].source_rank = rank;
-          meta[base + mi].source_token_idx = t;
-          meta[base + mi].expert_id = s_ent_lid[ei];
-          meta[base + mi].topk_weight = s_ent_wt[ei];
-          mi++;
-        }
-      }
-    }
-    // Reset per-token counters for next iteration
-    // (visible after syncthreads below).
-    if (threadIdx.x == 0) {
-      s_num_groups = 0;
-      s_total_entries = 0;
-    }
-    __syncthreads();  // before next token overwrites smem
+    // No __syncthreads between tokens: smem atomics
+    // accumulate across the entire token loop.
   }
 
-  // Flush shared-mem expert counts to local device buffer.
-  // All blocks contribute; local_expert_counts accumulates
-  // this rank's total expert counts for the batch push.
+  // Flush expert counts to local device buffer.
+  __syncthreads();
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     int32_t count = s_expert_counts[e];
@@ -1605,20 +1517,25 @@ __global__ void dispatch_and_route_kernel(
                 count);
     }
   }
+  // Write per-block per-rank counts to device buffer.
+  if (threadIdx.x < ws) {
+    config->block_dispatch_counts[
+        blockIdx.x * kMaxRanks + threadIdx.x] =
+            s_dr_count[threadIdx.x];
+  }
 
-  // ---- Grid-wide sync: wait for ALL blocks to finish
-  //      Phase A before block 0 enters P2P barrier. ----
-  // Covers dispatch data writes + local_expert_counts
-  // flushes. Block 0 then pushes aggregated counts to
-  // all remote ranks before the P2P barrier.
+  // ============================================================
+  // AGGREGATION: Grid sync + block 0 prefix sum + count push
+  // ============================================================
   __syncthreads();
-  __threadfence_system();
-  __syncthreads();
+  __threadfence();  // device fence (no NVLink writes yet)
   if (threadIdx.x == 0) {
     atomicAdd(config->phase_a_done_counter,
               static_cast<FlagType>(1));
   }
+
   if (blockIdx.x == 0) {
+    // Wait for all blocks to finish Pass 1.
     if (threadIdx.x == 0) {
       FlagType target = pa_base + gridDim.x;
       while (dc_ld_flag_acquire(
@@ -1628,13 +1545,31 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
-    // Allgather push: block 0 writes local counts to
-    // per-sender section [rank*NL .. (rank+1)*NL) on
-    // each remote rank's expert_counts buffer.
-    // Regular stores (fire-and-forget), NOT atomicAdd.
-    // No contention: each sender owns its section.
-    // P2P barrier's __threadfence_system() makes
-    // these writes visible to peers.
+    // Prefix sum: per-block starting positions.
+    // Thread tid handles dest_rank tid.
+    if (threadIdx.x < ws) {
+      int32_t dr = threadIdx.x;
+      int32_t ss = config->dispatch_section_size;
+      int32_t running = 0;
+      for (int32_t b = 0; b < gridDim.x; b++) {
+        int32_t c = config->block_dispatch_counts[
+            b * kMaxRanks + dr];
+        // Section overflow: clamp.
+        int32_t pos = (running < ss)
+            ? rank * ss + running
+            : config->max_recv;
+        config->block_start_positions[
+            b * kMaxRanks + dr] = pos;
+        running += c;
+      }
+      // Push total dispatch count to remote rank
+      // (fire-and-forget NVLink write).
+      config->remote_dispatch_offsets[dr][rank] =
+          running;
+    }
+
+    // Push expert counts to all remote ranks
+    // (fire-and-forget NVLink writes).
     for (int32_t e = threadIdx.x; e < NL;
          e += blockDim.x) {
       int32_t count =
@@ -1646,42 +1581,190 @@ __global__ void dispatch_and_route_kernel(
       }
     }
 
-    // Push dispatch section counts to remote ranks.
-    // Thread tid pushes count for dest rank tid into
-    // dest rank tid's per-sender offset array at slot
-    // [rank]. Fire-and-forget; barrier makes visible.
-    if (threadIdx.x < ws) {
-      int32_t dr = threadIdx.x;
-      config->remote_dispatch_offsets[dr][rank] =
-          config->local_dispatch_counters[dr];
+    // Fence positions (device memory) and signal ready.
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      dc_st_flag_release(
+          config->positions_ready_flag,
+          prf_expected);
+    }
+  } else {
+    // Blocks 1-31: wait for positions to be ready.
+    if (threadIdx.x == 0) {
+      while (dc_ld_flag_acquire(
+                 config->positions_ready_flag)
+              != prf_expected)
+        ;
     }
     __syncthreads();
+    __threadfence();
   }
 
-  // ---- Phase B: P2P barrier (RESET_COMBINE) ----
-  // Shared barrier covers dispatch data writes AND
-  // remote expert_counts batch push.
-  FlagType expected =
-      config->self_signals->counter + 1;
+  // ============================================================
+  // PASS 2: Fire-and-forget NVLink writes
+  // ============================================================
+  // Re-expand entries using pre-computed positions.
+  // Data written ONCE per unique (token, dest_rank).
+  // No serial grouping, no device atomicAdd.
+  {
+    constexpr int32_t kMaxEntries = 64;
+    // Reuse shared[] for per-token entry tracking.
+    int32_t* s_ent_lid = shared;                  // [kMaxEntries]
+    float*   s_ent_wt  = reinterpret_cast<float*>(
+        s_ent_lid + kMaxEntries);                 // [kMaxEntries]
+    int32_t* s_ent_dr  = reinterpret_cast<int32_t*>(
+        s_ent_wt + kMaxEntries);                  // [kMaxEntries]
+
+    __shared__ int32_t s_total_entries;
+    __shared__ int32_t s_pos[kMaxRanks];
+    __shared__ int32_t s_dr_count_t[kMaxRanks];
+    __shared__ int32_t s_first_pos[kMaxRanks];
+
+    // Init per-rank position counters from aggregation.
+    if (threadIdx.x < ws) {
+      s_pos[threadIdx.x] =
+          config->block_start_positions[
+              blockIdx.x * kMaxRanks + threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+      s_total_entries = 0;
+    }
+    __syncthreads();
+
+    for (int32_t t = blockIdx.x; t < M;
+         t += gridDim.x) {
+      // Snapshot positions before expansion.
+      if (threadIdx.x < ws) {
+        s_first_pos[threadIdx.x] =
+            s_pos[threadIdx.x];
+        s_dr_count_t[threadIdx.x] = 0;
+      }
+      if (threadIdx.x == 0) {
+        s_total_entries = 0;
+      }
+      __syncthreads();
+
+      // Expand entries (L2-cached re-reads).
+      if (threadIdx.x < topk) {
+        int32_t slot = threadIdx.x;
+        int32_t lid = topk_ids[t * topk + slot];
+        if (lid >= 0 && lid < NL) {
+          float wt = topk_weights[t * topk + slot];
+          int32_t rc = static_cast<int32_t>(
+              config->logical_replica_count[lid]);
+          if (rc > max_rep) rc = max_rep;
+          for (int32_t rep = 0; rep < rc; rep++) {
+            int32_t phys =
+                config->logical_to_physical_map[
+                    lid * max_rep + rep];
+            int32_t dr = phys / epr;
+            if (dr < 0 || dr >= ws) continue;
+            if (!config->remote_dispatch_offsets[dr]
+                || !config->remote_dispatch_recv[dr]
+                || !config->remote_dispatch_meta[dr])
+              continue;
+            int32_t ei =
+                atomicAdd(&s_total_entries, 1);
+            if (ei < kMaxEntries) {
+              s_ent_lid[ei] = lid;
+              s_ent_wt[ei] = wt;
+              s_ent_dr[ei] = dr;
+            }
+            atomicAdd(&s_pos[dr], 1);
+            atomicAdd(&s_dr_count_t[dr], 1);
+          }
+        }
+      }
+      __syncthreads();
+
+      // Write data ONCE + metadata per dest_rank.
+      int32_t ne = s_total_entries;
+      if (ne > kMaxEntries) ne = kMaxEntries;
+      for (int32_t dr = 0; dr < ws; dr++) {
+        int32_t n = s_dr_count_t[dr];
+        if (n == 0) continue;
+        int32_t fpos = s_first_pos[dr];
+        int32_t ss = config->dispatch_section_size;
+        if (fpos >= rank * ss + ss) continue;
+
+        // All threads: write token data at fpos
+        // (fire-and-forget NVLink store).
+        T* dest = reinterpret_cast<T*>(
+            config->remote_dispatch_recv[dr]);
+        const T* src = input + t * K;
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x) {
+          dest[fpos * K + k] = src[k];
+        }
+
+        // Thread 0: write metadata per entry.
+        if (threadIdx.x == 0) {
+          TokenMetadata* meta =
+              reinterpret_cast<TokenMetadata*>(
+                  config->remote_dispatch_meta[dr]);
+          int32_t mi = 0;
+          for (int32_t ei = 0;
+               ei < ne && mi < n; ei++) {
+            if (s_ent_dr[ei] != dr) continue;
+            int32_t pos = fpos + mi;
+            if (pos >= rank * ss + ss) break;
+            meta[pos].source_rank = rank;
+            meta[pos].source_token_idx = t;
+            meta[pos].expert_id = s_ent_lid[ei];
+            meta[pos].topk_weight = s_ent_wt[ei];
+            mi++;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  // ============================================================
+  // SINGLE BARRIER: fence + grid sync + P2P barrier
+  // ============================================================
+  // Covers ALL NVLink writes: data, metadata, expert
+  // counts, dispatch offsets. Staggered fence: blocks
+  // finish Pass 2 at different times.
+  __syncthreads();
+  __threadfence_system();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicAdd(config->phase_a_done_counter,
+              static_cast<FlagType>(1));
+  }
 
   if (blockIdx.x == 0) {
+    // Wait for all blocks to finish Pass 2 + fence.
+    if (threadIdx.x == 0) {
+      FlagType target = pa_base + 2 * gridDim.x;
+      while (dc_ld_flag_acquire(
+                 config->phase_a_done_counter)
+              < target)
+        ;
+    }
+    __syncthreads();
+
     const int32_t tid = threadIdx.x;
 
-    // Reset per-sender combine offsets + local counters.
+    // Reset combine state for next layer.
     if (tid < ws) {
       config->remote_combine_offsets[rank][tid] = 0;
       config->local_combine_counters[tid] = 0;
     }
 
-    __threadfence_system();
-
+    // P2P barrier: dc_st_flag_release orders each
+    // thread's prior reset writes via release semantics.
+    // All NVLink data writes already system-visible
+    // via __threadfence_system() + grid sync above.
     if (tid < ws) {
       dc_st_flag_release(
           &config->peer_signals[tid]->flags[rank],
-          expected);
+          barrier_expected);
       while (dc_ld_flag_acquire(
           &config->self_signals->flags[tid])
-              != expected)
+              != barrier_expected)
         ;
     }
 
@@ -1690,13 +1773,13 @@ __global__ void dispatch_and_route_kernel(
     if (tid == 0) {
       dc_st_flag_release(
           &config->self_signals->counter,
-          expected);
+          barrier_expected);
     }
   } else {
     if (threadIdx.x == 0) {
       while (dc_ld_flag_acquire(
           &config->self_signals->counter)
-              != expected)
+              != barrier_expected)
         ;
     }
     __syncthreads();
