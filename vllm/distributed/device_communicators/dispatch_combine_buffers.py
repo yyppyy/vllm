@@ -16,6 +16,7 @@ import ctypes
 import torch
 import torch.distributed as dist
 
+import vllm._dispatch_combine_fake_ops  # noqa: F401
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
