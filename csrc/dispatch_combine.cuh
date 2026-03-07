@@ -121,10 +121,9 @@ struct DispatchCombineConfig {
   FlagType* routing_ready_flag;
 
   // Grid-wide sync: all blocks increment this counter
-  // twice per invocation (after Pass 1 and Pass 2).
-  // Block 0 spins until counter == base + gridDim.x
-  // (Pass 1 done) then base + 2*gridDim.x (Pass 2
-  // done + fence). Monotonic for CUDA graph replay.
+  // once per invocation (after fused scan+write + fence).
+  // Block 0 spins until counter == base + gridDim.x.
+  // Monotonic for CUDA graph replay.
   FlagType* phase_a_done_counter;
 
   // Local expert counts buffer for batched all-reduce.
@@ -151,17 +150,6 @@ struct DispatchCombineConfig {
   // block 0 spins until all done before entering barrier.
   FlagType* combine_done_counter;
 
-  // ---- Two-pass dispatch support ----
-  // Pass 1 writes per-block per-rank entry counts here;
-  // block 0 reads them during aggregation for prefix sum.
-  int32_t* block_dispatch_counts;      // [kPersistentGrid * kMaxRanks]
-  // Block 0 writes per-block starting write positions here
-  // after prefix sum; all blocks read in Pass 2.
-  int32_t* block_start_positions;      // [kPersistentGrid * kMaxRanks]
-  // Block 0 signals this flag after computing positions;
-  // blocks 1-31 spin until ready. Monotonic for CUDA graph.
-  FlagType* positions_ready_flag;
-
   // ---- Fine-grained profiling support ----
   // When non-null, block 0 writes globaltimer timestamps
   // at each step boundary. Layout:
@@ -173,7 +161,7 @@ struct DispatchCombineConfig {
 };
 
 // Number of timestamp slots per kernel.
-constexpr int kDarNumSteps = 12;
+constexpr int kDarNumSteps = 10;
 constexpr int kCasNumSteps = 6;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
@@ -182,17 +170,15 @@ constexpr int kTotalProfileSlots =
 inline const char* dar_step_name(int i) {
   static const char* names[] = {
     "dar:read_counters",     // 0
-    "dar:pass1_count",       // 1
-    "dar:pass1_flush+sync",  // 2
-    "dar:aggregation",       // 3
-    "dar:pass2_write",       // 4
-    "dar:threadfence_sys",   // 5
-    "dar:grid_sync",         // 6
-    "dar:barrier",           // 7
-    "dar:phase_c_route",     // 8
-    "dar:phase_d2_filter",   // 9
-    "dar:phase_e_zero",      // 10
-    "dar:end",               // 11
+    "dar:scan_write",        // 1
+    "dar:expert_flush",      // 2
+    "dar:threadfence_sys",   // 3
+    "dar:grid_sync",         // 4
+    "dar:expert_push",       // 5
+    "dar:barrier",           // 6
+    "dar:phase_c_route",     // 7
+    "dar:phase_d2_filter",   // 8
+    "dar:end",               // 9
   };
   return (i < kDarNumSteps) ? names[i] : "dar:?";
 }
@@ -1573,7 +1559,6 @@ __global__ void dispatch_and_route_kernel(
   // (for CUDA graph replay compatibility).
   FlagType rf_expected = 0;
   FlagType pa_base = 0;
-  FlagType prf_expected = 0;
   FlagType barrier_expected = 0;
   if (threadIdx.x == 0) {
     rf_expected =
@@ -1582,54 +1567,66 @@ __global__ void dispatch_and_route_kernel(
     pa_base =
         static_cast<FlagType>(
             *config->phase_a_done_counter);
-    prf_expected =
-        static_cast<FlagType>(
-            *config->positions_ready_flag) + 1;
     barrier_expected =
         config->self_signals->counter + 1;
   }
   // Broadcast to all threads via shared mem.
   __shared__ FlagType s_rf_expected;
   __shared__ FlagType s_pa_base;
-  __shared__ FlagType s_prf_expected;
   __shared__ FlagType s_barrier_expected;
   if (threadIdx.x == 0) {
     s_rf_expected = rf_expected;
     s_pa_base = pa_base;
-    s_prf_expected = prf_expected;
     s_barrier_expected = barrier_expected;
   }
   __syncthreads();
   rf_expected = s_rf_expected;
   pa_base = s_pa_base;
-  prf_expected = s_prf_expected;
   barrier_expected = s_barrier_expected;
 
   // ============================================================
-  // PASS 1: Entry counting (no NVLink writes)
+  // FUSED SCAN+WRITE: per-token expansion + position claiming
+  //   + NVLink write. Eliminates two-pass overhead (prefix sum,
+  //   positions_ready signal/wait). Modeled on dar_phase_a_kernel.
   // ============================================================
-  // Count entries per dest_rank, accumulate expert counts.
-  // No serial grouping, no device atomicAdd for positions.
-  DC_TIMESTAMP(config, 1);  // dar:pass1_count
+  DC_TIMESTAMP(config, 1);  // dar:scan_write
 
-  int32_t* s_expert_counts = shared;       // [NL]
-  int32_t* s_dr_count = shared + NL;       // [ws]
+  constexpr int32_t kMaxEntries = 64;
+  int32_t* s_expert_counts = shared;           // [NL]
+  int32_t* s_grp_dest  = shared + NL;          // [ws]
+  int32_t* s_grp_count = shared + NL + ws;     // [ws]
+  int32_t* s_ent_lid   = shared + NL + 2 * ws; // [kME]
+  float*   s_ent_wt    = reinterpret_cast<float*>(
+      s_ent_lid + kMaxEntries);                 // [kME]
+  int32_t* s_ent_grp   = reinterpret_cast<int32_t*>(
+      s_ent_wt + kMaxEntries);                  // [kME]
 
+  __shared__ int32_t s_num_groups;
+  __shared__ int32_t s_total_entries;
+  __shared__ int32_t s_grp_base[kMaxRanks];
+
+  // Zero shared expert counts (persistent across all
+  // tokens assigned to this block).
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     s_expert_counts[e] = 0;
   }
-  if (threadIdx.x < ws) {
-    s_dr_count[threadIdx.x] = 0;
+  if (threadIdx.x == 0) {
+    s_num_groups = 0;
+    s_total_entries = 0;
   }
   __syncthreads();
 
-  for (int32_t t = blockIdx.x; t < M; t += gridDim.x) {
+  // Per-token loop: expand → group → claim → write.
+  for (int32_t t = blockIdx.x; t < M;
+       t += gridDim.x) {
+    // Step 1: Parallel expansion (threads 0..topk-1).
     if (threadIdx.x < topk) {
       int32_t slot = threadIdx.x;
       int32_t lid = topk_ids[t * topk + slot];
       if (lid >= 0 && lid < NL) {
         atomicAdd(&s_expert_counts[lid], 1);
+        float wt = topk_weights[t * topk + slot];
         int32_t rc = static_cast<int32_t>(
             config->logical_replica_count[lid]);
         if (rc > max_rep) rc = max_rep;
@@ -1639,22 +1636,113 @@ __global__ void dispatch_and_route_kernel(
                   lid * max_rep + rep];
           int32_t dr = phys / epr;
           if (dr < 0 || dr >= ws) continue;
-          if (!config->remote_dispatch_offsets[dr] ||
-              !config->remote_dispatch_recv[dr] ||
-              !config->remote_dispatch_meta[dr])
+          if (!config->
+                  remote_dispatch_offsets[dr] ||
+              !config->
+                  remote_dispatch_recv[dr] ||
+              !config->
+                  remote_dispatch_meta[dr])
             continue;
-          atomicAdd(&s_dr_count[dr], 1);
+          int32_t ei =
+              atomicAdd(&s_total_entries, 1);
+          if (ei < kMaxEntries) {
+            s_ent_lid[ei] = lid;
+            s_ent_wt[ei] = wt;
+            s_ent_grp[ei] = dr;
+          }
         }
       }
     }
-    // No __syncthreads between tokens: smem atomics
-    // accumulate across the entire token loop.
+    __syncthreads();
+
+    // Step 2: Thread 0 groups entries by dest_rank.
+    if (threadIdx.x == 0) {
+      int32_t ne = s_total_entries;
+      if (ne > kMaxEntries) ne = kMaxEntries;
+      for (int32_t i = 0; i < ne; i++) {
+        int32_t dr = s_ent_grp[i];
+        int32_t g = -1;
+        for (int32_t j = 0; j < s_num_groups;
+             j++) {
+          if (s_grp_dest[j] == dr) {
+            g = j; break;
+          }
+        }
+        if (g == -1) {
+          g = s_num_groups++;
+          s_grp_dest[g] = dr;
+          s_grp_count[g] = 0;
+        }
+        s_ent_grp[i] = g;
+        s_grp_count[g]++;
+      }
+    }
+    __syncthreads();
+
+    // Step 3: Claim write positions via atomicAdd.
+    if (threadIdx.x < s_num_groups) {
+      int32_t dr = s_grp_dest[threadIdx.x];
+      int32_t local_off = atomicAdd(
+          &config->local_dispatch_counters[dr],
+          s_grp_count[threadIdx.x]);
+      int32_t ss = config->dispatch_section_size;
+      s_grp_base[threadIdx.x] = (local_off < ss)
+          ? rank * ss + local_off
+          : config->max_recv;
+    }
+    __syncthreads();
+
+    // Step 4: Write data + metadata per group.
+    for (int32_t g = 0; g < s_num_groups; g++) {
+      int32_t dr = s_grp_dest[g];
+      int32_t base = s_grp_base[g];
+      int32_t n = s_grp_count[g];
+      if (base >= config->max_recv) continue;
+      if (base + n > config->max_recv)
+        n = config->max_recv - base;
+
+      // All threads: write token data at base
+      // (fire-and-forget NVLink store).
+      T* dest = reinterpret_cast<T*>(
+          config->remote_dispatch_recv[dr]);
+      const T* src = input + t * K;
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        dest[base * K + k] = src[k];
+      }
+
+      // Thread 0: write metadata per entry.
+      if (threadIdx.x == 0) {
+        TokenMetadata* meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_dispatch_meta[dr]);
+        int32_t ne2 = s_total_entries;
+        if (ne2 > kMaxEntries) ne2 = kMaxEntries;
+        int32_t mi = 0;
+        for (int32_t ei = 0;
+             ei < ne2 && mi < n; ei++) {
+          if (s_ent_grp[ei] != g) continue;
+          meta[base + mi].source_rank = rank;
+          meta[base + mi].source_token_idx = t;
+          meta[base + mi].expert_id =
+              s_ent_lid[ei];
+          meta[base + mi].topk_weight =
+              s_ent_wt[ei];
+          mi++;
+        }
+      }
+    }
+
+    // Reset per-token state for next iteration.
+    if (threadIdx.x == 0) {
+      s_num_groups = 0;
+      s_total_entries = 0;
+    }
+    __syncthreads();
   }
 
-  // Flush expert counts to local device buffer.
-  __syncthreads();
-  DC_TIMESTAMP(config, 2);  // dar:pass1_flush+sync
-
+  // Flush expert counts to device buffer.
+  DC_TIMESTAMP(config, 2);  // dar:expert_flush
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     int32_t count = s_expert_counts[e];
@@ -1663,25 +1751,21 @@ __global__ void dispatch_and_route_kernel(
                 count);
     }
   }
-  // Write per-block per-rank counts to device buffer.
-  if (threadIdx.x < ws) {
-    config->block_dispatch_counts[
-        blockIdx.x * kMaxRanks + threadIdx.x] =
-            s_dr_count[threadIdx.x];
-  }
 
   // ============================================================
-  // AGGREGATION: Grid sync + block 0 prefix sum + count push
+  // SINGLE BARRIER: fence + grid sync + expert push + P2P
   // ============================================================
   __syncthreads();
-  __threadfence();  // device fence (no NVLink writes yet)
+  DC_TIMESTAMP(config, 3);  // dar:threadfence_sys
+  __threadfence_system();
+  __syncthreads();
   if (threadIdx.x == 0) {
     atomicAdd(config->phase_a_done_counter,
               static_cast<FlagType>(1));
   }
 
   if (blockIdx.x == 0) {
-    // Wait for all blocks to finish Pass 1.
+    // Wait for all blocks to finish scan+write + fence.
     if (threadIdx.x == 0) {
       FlagType target = pa_base + gridDim.x;
       while (dc_ld_flag_acquire(
@@ -1691,29 +1775,14 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
-    DC_TIMESTAMP(config, 3);  // dar:aggregation
+    DC_TIMESTAMP(config, 4);  // dar:grid_sync
 
-    // Prefix sum: per-block starting positions.
-    // Thread tid handles dest_rank tid.
+    // Push dispatch offsets to remote ranks
+    // (fire-and-forget NVLink writes).
     if (threadIdx.x < ws) {
       int32_t dr = threadIdx.x;
-      int32_t ss = config->dispatch_section_size;
-      int32_t running = 0;
-      for (int32_t b = 0; b < gridDim.x; b++) {
-        int32_t c = config->block_dispatch_counts[
-            b * kMaxRanks + dr];
-        // Section overflow: clamp.
-        int32_t pos = (running < ss)
-            ? rank * ss + running
-            : config->max_recv;
-        config->block_start_positions[
-            b * kMaxRanks + dr] = pos;
-        running += c;
-      }
-      // Push total dispatch count to remote rank
-      // (fire-and-forget NVLink write).
       config->remote_dispatch_offsets[dr][rank] =
-          running;
+          config->local_dispatch_counters[dr];
     }
 
     // Push expert counts to all remote ranks
@@ -1729,188 +1798,22 @@ __global__ void dispatch_and_route_kernel(
       }
     }
 
-    // Fence positions (device memory) and signal ready.
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      dc_st_flag_release(
-          config->positions_ready_flag,
-          prf_expected);
-    }
-  } else {
-    // Blocks 1-31: wait for positions to be ready.
-    if (threadIdx.x == 0) {
-      while (dc_ld_flag_acquire(
-                 config->positions_ready_flag)
-              != prf_expected)
-        ;
-    }
-    __syncthreads();
-    __threadfence();
-  }
-
-  // ============================================================
-  // PASS 2: Fire-and-forget NVLink writes
-  // ============================================================
-  DC_TIMESTAMP(config, 4);  // dar:pass2_write
-
-  // Re-expand entries using pre-computed positions.
-  // Data written ONCE per unique (token, dest_rank).
-  // No serial grouping, no device atomicAdd.
-  {
-    constexpr int32_t kMaxEntries = 64;
-    // Reuse shared[] for per-token entry tracking.
-    int32_t* s_ent_lid = shared;                  // [kMaxEntries]
-    float*   s_ent_wt  = reinterpret_cast<float*>(
-        s_ent_lid + kMaxEntries);                 // [kMaxEntries]
-    int32_t* s_ent_dr  = reinterpret_cast<int32_t*>(
-        s_ent_wt + kMaxEntries);                  // [kMaxEntries]
-
-    __shared__ int32_t s_total_entries;
-    __shared__ int32_t s_pos[kMaxRanks];
-    __shared__ int32_t s_dr_count_t[kMaxRanks];
-    __shared__ int32_t s_first_pos[kMaxRanks];
-
-    // Init per-rank position counters from aggregation.
-    if (threadIdx.x < ws) {
-      s_pos[threadIdx.x] =
-          config->block_start_positions[
-              blockIdx.x * kMaxRanks + threadIdx.x];
-    }
-    if (threadIdx.x == 0) {
-      s_total_entries = 0;
-    }
-    __syncthreads();
-
-    for (int32_t t = blockIdx.x; t < M;
-         t += gridDim.x) {
-      // Snapshot positions before expansion.
-      if (threadIdx.x < ws) {
-        s_first_pos[threadIdx.x] =
-            s_pos[threadIdx.x];
-        s_dr_count_t[threadIdx.x] = 0;
-      }
-      if (threadIdx.x == 0) {
-        s_total_entries = 0;
-      }
-      __syncthreads();
-
-      // Expand entries (L2-cached re-reads).
-      if (threadIdx.x < topk) {
-        int32_t slot = threadIdx.x;
-        int32_t lid = topk_ids[t * topk + slot];
-        if (lid >= 0 && lid < NL) {
-          float wt = topk_weights[t * topk + slot];
-          int32_t rc = static_cast<int32_t>(
-              config->logical_replica_count[lid]);
-          if (rc > max_rep) rc = max_rep;
-          for (int32_t rep = 0; rep < rc; rep++) {
-            int32_t phys =
-                config->logical_to_physical_map[
-                    lid * max_rep + rep];
-            int32_t dr = phys / epr;
-            if (dr < 0 || dr >= ws) continue;
-            if (!config->remote_dispatch_offsets[dr]
-                || !config->remote_dispatch_recv[dr]
-                || !config->remote_dispatch_meta[dr])
-              continue;
-            int32_t ei =
-                atomicAdd(&s_total_entries, 1);
-            if (ei < kMaxEntries) {
-              s_ent_lid[ei] = lid;
-              s_ent_wt[ei] = wt;
-              s_ent_dr[ei] = dr;
-            }
-            atomicAdd(&s_pos[dr], 1);
-            atomicAdd(&s_dr_count_t[dr], 1);
-          }
-        }
-      }
-      __syncthreads();
-
-      // Write data ONCE + metadata per dest_rank.
-      int32_t ne = s_total_entries;
-      if (ne > kMaxEntries) ne = kMaxEntries;
-      for (int32_t dr = 0; dr < ws; dr++) {
-        int32_t n = s_dr_count_t[dr];
-        if (n == 0) continue;
-        int32_t fpos = s_first_pos[dr];
-        int32_t ss = config->dispatch_section_size;
-        if (fpos >= rank * ss + ss) continue;
-
-        // All threads: write token data at fpos
-        // (fire-and-forget NVLink store).
-        T* dest = reinterpret_cast<T*>(
-            config->remote_dispatch_recv[dr]);
-        const T* src = input + t * K;
-        for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x) {
-          dest[fpos * K + k] = src[k];
-        }
-
-        // Thread 0: write metadata per entry.
-        if (threadIdx.x == 0) {
-          TokenMetadata* meta =
-              reinterpret_cast<TokenMetadata*>(
-                  config->remote_dispatch_meta[dr]);
-          int32_t mi = 0;
-          for (int32_t ei = 0;
-               ei < ne && mi < n; ei++) {
-            if (s_ent_dr[ei] != dr) continue;
-            int32_t pos = fpos + mi;
-            if (pos >= rank * ss + ss) break;
-            meta[pos].source_rank = rank;
-            meta[pos].source_token_idx = t;
-            meta[pos].expert_id = s_ent_lid[ei];
-            meta[pos].topk_weight = s_ent_wt[ei];
-            mi++;
-          }
-        }
-      }
-      __syncthreads();
-    }
-  }
-
-  // ============================================================
-  // SINGLE BARRIER: fence + grid sync + P2P barrier
-  // ============================================================
-  // Covers ALL NVLink writes: data, metadata, expert
-  // counts, dispatch offsets. Staggered fence: blocks
-  // finish Pass 2 at different times.
-  __syncthreads();
-  DC_TIMESTAMP(config, 5);  // dar:threadfence_sys
-  __threadfence_system();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    atomicAdd(config->phase_a_done_counter,
-              static_cast<FlagType>(1));
-  }
-
-  if (blockIdx.x == 0) {
-    // Wait for all blocks to finish Pass 2 + fence.
-    if (threadIdx.x == 0) {
-      FlagType target = pa_base + 2 * gridDim.x;
-      while (dc_ld_flag_acquire(
-                 config->phase_a_done_counter)
-              < target)
-        ;
-    }
-    __syncthreads();
-
-    DC_TIMESTAMP(config, 6);  // dar:grid_sync
-
-    const int32_t tid = threadIdx.x;
+    DC_TIMESTAMP(config, 5);  // dar:expert_push
 
     // Reset combine state for next layer.
+    const int32_t tid = threadIdx.x;
     if (tid < ws) {
-      config->remote_combine_offsets[rank][tid] = 0;
+      config->remote_combine_offsets[rank][tid]
+          = 0;
       config->local_combine_counters[tid] = 0;
     }
 
-    // P2P barrier: dc_st_flag_release orders each
-    // thread's prior reset writes via release semantics.
-    // All NVLink data writes already system-visible
-    // via __threadfence_system() + grid sync above.
+    // System fence: ensure expert push + offset push
+    // + combine reset are globally visible before
+    // barrier flag exchange.
+    __threadfence_system();
+
+    // P2P barrier exchange.
     if (tid < ws) {
       dc_st_flag_release(
           &config->peer_signals[tid]->flags[rank],
@@ -1938,7 +1841,7 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();
   }
 
-  DC_TIMESTAMP(config, 7);  // dar:barrier
+  DC_TIMESTAMP(config, 6);  // dar:barrier
 
   // Sum per-sender dispatch counts (available after
   // barrier). Each sender pushed its section count
@@ -1959,7 +1862,7 @@ __global__ void dispatch_and_route_kernel(
   // Block 0: parallel preload + deterministic router +
   // zero expert_num_tokens. Other blocks spin-wait on
   // routing_ready_flag.
-  DC_TIMESTAMP(config, 8);  // dar:phase_c_route
+  DC_TIMESTAMP(config, 7);  // dar:phase_c_route
 
   if (blockIdx.x == 0) {
     // Reuse shared[] for Phase C preload layout.
@@ -2079,7 +1982,7 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase D2: Single-pass fill + routing filter ----
-  DC_TIMESTAMP(config, 9);  // dar:phase_d2_filter
+  DC_TIMESTAMP(config, 8);  // dar:phase_d2_filter
 
   // For each entry: write sentinel defaults, then check
   // if real and overwrite. Single pass ensures no cross-
@@ -2164,8 +2067,6 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase E: Zero counts for next invocation ----
-  DC_TIMESTAMP(config, 10);  // dar:phase_e_zero
-
   // Zero this rank's allgather section + local counts
   // + local dispatch counters. Other ranks' sections
   // are zeroed by their owners.
@@ -2192,7 +2093,7 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, 11);  // dar:end
+  DC_TIMESTAMP(config, 9);  // dar:end
 }
 
 }  // namespace dispatch_combine
