@@ -161,7 +161,75 @@ struct DispatchCombineConfig {
   // Block 0 signals this flag after computing positions;
   // blocks 1-31 spin until ready. Monotonic for CUDA graph.
   FlagType* positions_ready_flag;
+
+  // ---- Fine-grained profiling support ----
+  // When non-null, block 0 writes globaltimer timestamps
+  // at each step boundary. Layout:
+  //   [0..kDarNumSteps-1] for dispatch_and_route_kernel
+  //   [kDarNumSteps..kDarNumSteps+kCasNumSteps-1] for
+  //     combine_and_scatter_kernel
+  // Host reads back and accumulates averages.
+  int64_t* profiling_timestamps;  // null = disabled
 };
+
+// Number of timestamp slots per kernel.
+constexpr int kDarNumSteps = 12;
+constexpr int kCasNumSteps = 8;
+constexpr int kTotalProfileSlots =
+    kDarNumSteps + kCasNumSteps;
+
+// Step names (host-side, for printing).
+inline const char* dar_step_name(int i) {
+  static const char* names[] = {
+    "dar:read_counters",     // 0
+    "dar:pass1_count",       // 1
+    "dar:pass1_flush+sync",  // 2
+    "dar:aggregation",       // 3
+    "dar:pass2_write",       // 4
+    "dar:threadfence_sys",   // 5
+    "dar:grid_sync",         // 6
+    "dar:barrier",           // 7
+    "dar:phase_c_route",     // 8
+    "dar:phase_d2_filter",   // 9
+    "dar:phase_e_zero",      // 10
+    "dar:end",               // 11
+  };
+  return (i < kDarNumSteps) ? names[i] : "dar:?";
+}
+
+inline const char* cas_step_name(int i) {
+  static const char* names[] = {
+    "cas:read_counters",     // 0
+    "cas:zero_accum",        // 1
+    "cas:combine_p2p",       // 2
+    "cas:grid_sync",         // 3
+    "cas:barrier",           // 4
+    "cas:scatter_add",       // 5
+    "cas:end",               // 6
+    "cas:reserved",          // 7
+  };
+  return (i < kCasNumSteps) ? names[i] : "cas:?";
+}
+
+// Helper: read globaltimer (synchronized across SMs).
+static __device__ __forceinline__ int64_t
+dc_globaltimer() {
+  int64_t ts;
+  asm volatile("mov.u64 %0, %%globaltimer;"
+               : "=l"(ts));
+  return ts;
+}
+
+// Helper: record timestamp if profiling enabled.
+// Only block 0, thread 0 writes to avoid contention.
+#define DC_TIMESTAMP(config, slot)                   \
+  do {                                               \
+    if (blockIdx.x == 0 && threadIdx.x == 0 &&       \
+        (config)->profiling_timestamps) {             \
+      (config)->profiling_timestamps[(slot)] =        \
+          dc_globaltimer();                           \
+    }                                                 \
+  } while (0)
 
 // ====================================================================
 // P2P flag-based barrier kernels (replace NCCL AllReduce).
@@ -598,6 +666,8 @@ __global__ void combine_and_scatter_kernel(
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
 
+  DC_TIMESTAMP(config, kDarNumSteps + 0);  // cas:read_counters
+
   // Read monotonic counter bases BEFORE any phase
   // modifies them (CUDA graph replay compatible).
   __shared__ FlagType s_cd_base;
@@ -613,6 +683,8 @@ __global__ void combine_and_scatter_kernel(
   FlagType barrier_expected = s_barrier_expected;
 
   // ---- Phase 0: Zero fp32 accum buffer ----
+  DC_TIMESTAMP(config, kDarNumSteps + 1);  // cas:zero_accum
+
   // Vectorized: int4 = 16 bytes = 4 floats.
   // Phase 1 doesn't touch accum, and Phase 3 follows
   // multiple system fences + barrier, so no extra sync.
@@ -631,6 +703,8 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 1: Combine P2P writes (persistent blocks) ----
+  DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:combine_p2p
+
   // Only kPersistentGrid (32) blocks do NVLink writes.
   // Less contention on local_combine_counters, and only
   // 32 blocks call __threadfence_system() (staggered).
@@ -718,6 +792,8 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 2: Single barrier ----
+  DC_TIMESTAMP(config, kDarNumSteps + 3);  // cas:grid_sync
+
   // Block 0 waits for kPersistentGrid blocks, does
   // P2P barrier. All other blocks wait for counter.
   if (blockIdx.x == 0) {
@@ -778,6 +854,9 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 3: Scatter-add to fp32 accum ----
+  DC_TIMESTAMP(config, kDarNumSteps + 4);  // cas:barrier
+  // (timestamp after barrier, before scatter-add)
+
   // Native fp32 atomicAdd: no CAS loop, no adjacent-
   // element contention from packed 32-bit words.
   // Section-aware iteration: only visit real entries.
@@ -813,6 +892,8 @@ __global__ void combine_and_scatter_kernel(
       }
     }
   }
+
+  DC_TIMESTAMP(config, kDarNumSteps + 5);  // cas:end
 }
 
 // ====================================================================
@@ -1427,6 +1508,8 @@ __global__ void dispatch_and_route_kernel(
   // Phases don't overlap, so same memory is reused.
   extern __shared__ int32_t shared[];
 
+  DC_TIMESTAMP(config, 0);  // dar:read_counters
+
   // Read monotonic counter base values BEFORE any phase
   // (for CUDA graph replay compatibility).
   FlagType rf_expected = 0;
@@ -1468,6 +1551,8 @@ __global__ void dispatch_and_route_kernel(
   // ============================================================
   // Count entries per dest_rank, accumulate expert counts.
   // No serial grouping, no device atomicAdd for positions.
+  DC_TIMESTAMP(config, 1);  // dar:pass1_count
+
   int32_t* s_expert_counts = shared;       // [NL]
   int32_t* s_dr_count = shared + NL;       // [ws]
 
@@ -1509,6 +1594,8 @@ __global__ void dispatch_and_route_kernel(
 
   // Flush expert counts to local device buffer.
   __syncthreads();
+  DC_TIMESTAMP(config, 2);  // dar:pass1_flush+sync
+
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     int32_t count = s_expert_counts[e];
@@ -1544,6 +1631,8 @@ __global__ void dispatch_and_route_kernel(
         ;
     }
     __syncthreads();
+
+    DC_TIMESTAMP(config, 3);  // dar:aggregation
 
     // Prefix sum: per-block starting positions.
     // Thread tid handles dest_rank tid.
@@ -1604,6 +1693,8 @@ __global__ void dispatch_and_route_kernel(
   // ============================================================
   // PASS 2: Fire-and-forget NVLink writes
   // ============================================================
+  DC_TIMESTAMP(config, 4);  // dar:pass2_write
+
   // Re-expand entries using pre-computed positions.
   // Data written ONCE per unique (token, dest_rank).
   // No serial grouping, no device atomicAdd.
@@ -1728,6 +1819,7 @@ __global__ void dispatch_and_route_kernel(
   // counts, dispatch offsets. Staggered fence: blocks
   // finish Pass 2 at different times.
   __syncthreads();
+  DC_TIMESTAMP(config, 5);  // dar:threadfence_sys
   __threadfence_system();
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -1745,6 +1837,8 @@ __global__ void dispatch_and_route_kernel(
         ;
     }
     __syncthreads();
+
+    DC_TIMESTAMP(config, 6);  // dar:grid_sync
 
     const int32_t tid = threadIdx.x;
 
@@ -1785,6 +1879,8 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();
   }
 
+  DC_TIMESTAMP(config, 7);  // dar:barrier
+
   // Sum per-sender dispatch counts (available after
   // barrier). Each sender pushed its section count
   // into remote_dispatch_offsets[rank][sender].
@@ -1804,6 +1900,8 @@ __global__ void dispatch_and_route_kernel(
   // Block 0: parallel preload + deterministic router +
   // zero expert_num_tokens. Other blocks spin-wait on
   // routing_ready_flag.
+  DC_TIMESTAMP(config, 8);  // dar:phase_c_route
+
   if (blockIdx.x == 0) {
     // Reuse shared[] for Phase C preload layout.
     int32_t* s_expert_sum = shared;           // [NL]
@@ -1922,6 +2020,8 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase D2: Single-pass fill + routing filter ----
+  DC_TIMESTAMP(config, 9);  // dar:phase_d2_filter
+
   // For each entry: write sentinel defaults, then check
   // if real and overwrite. Single pass ensures no cross-
   // block race between fill and routing.
@@ -2005,6 +2105,8 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase E: Zero counts for next invocation ----
+  DC_TIMESTAMP(config, 10);  // dar:phase_e_zero
+
   // Zero this rank's allgather section + local counts
   // + local dispatch counters. Other ranks' sections
   // are zeroed by their owners.
@@ -2030,6 +2132,8 @@ __global__ void dispatch_and_route_kernel(
       config->local_dispatch_counters[threadIdx.x] = 0;
     }
   }
+
+  DC_TIMESTAMP(config, 11);  // dar:end
 }
 
 }  // namespace dispatch_combine

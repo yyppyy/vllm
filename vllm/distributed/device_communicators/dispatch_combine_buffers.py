@@ -13,11 +13,50 @@ All runtime operations use GPU-side CUDA kernels (not host-side
 cudaMemset/cudaMemcpy) for CUDA graph compatibility.
 """
 import ctypes
+import os
 import torch
 import torch.distributed as dist
 
 import vllm._dispatch_combine_fake_ops  # noqa: F401
 from vllm.logger import init_logger
+
+# Fine-grained kernel profiling.
+# Set VLLM_DC_PROFILE=N to print per-step averages
+# every N batches. 0 = disabled.
+_DC_PROFILE_INTERVAL = int(
+    os.environ.get('VLLM_DC_PROFILE', '0'))
+
+# Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
+# in dispatch_combine.cuh.
+_DAR_NUM_STEPS = 12
+_CAS_NUM_STEPS = 8
+_TOTAL_PROFILE_SLOTS = _DAR_NUM_STEPS + _CAS_NUM_STEPS
+
+_DAR_STEP_NAMES = [
+    "read_counters",
+    "pass1_count",
+    "pass1_flush+sync",
+    "aggregation",
+    "pass2_write",
+    "threadfence_sys",
+    "grid_sync",
+    "barrier",
+    "phase_c_route",
+    "phase_d2_filter",
+    "phase_e_zero",
+    "end",
+]
+
+_CAS_STEP_NAMES = [
+    "read_counters",
+    "zero_accum",
+    "combine_p2p",
+    "grid_sync",
+    "barrier",
+    "scatter_add",
+    "end",
+    "reserved",
+]
 
 logger = init_logger(__name__)
 
@@ -165,6 +204,26 @@ class DispatchCombineP2PManager:
         self.remote_expert_counts_ptrs = []
         self._integrated_routing_enabled = False
         self._experts_per_rank = 0
+
+        # Fine-grained profiling.
+        self._profiling_enabled = (_DC_PROFILE_INTERVAL > 0)
+        self._profiling_interval = _DC_PROFILE_INTERVAL
+        self._raw_profiling_timestamps = None
+        if self._profiling_enabled:
+            # int64[kTotalProfileSlots] on GPU.
+            ts_bytes = _TOTAL_PROFILE_SLOTS * 8
+            self._raw_profiling_timestamps = (
+                self._cuda_rt.cudaMalloc(ts_bytes))
+            self._cuda_rt.cudaMemset(
+                self._raw_profiling_timestamps,
+                0, ts_bytes)
+            # Host-side accumulators (nanoseconds).
+            self._dar_accum = [0.0] * _DAR_NUM_STEPS
+            self._cas_accum = [0.0] * _CAS_NUM_STEPS
+            self._profile_batch_count = 0
+            logger.info(
+                "DC profiling enabled: print every "
+                "%d batches", self._profiling_interval)
 
         # Exchange CUDA IPC handles for P2P access.
         self._setup_p2p_mappings()
@@ -487,6 +546,12 @@ class DispatchCombineP2PManager:
                else 0)
         data += struct.pack('Q', ptr)
 
+        # profiling_timestamps (1 pointer)
+        ptr = (self._raw_profiling_timestamps.value
+               if self._profiling_enabled
+               else 0)
+        data += struct.pack('Q', ptr)
+
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
             bytearray(config_bytes), dtype=torch.uint8
@@ -553,6 +618,10 @@ class DispatchCombineP2PManager:
                 output,
                 self.config_tensor,
                 mc, self.hidden_dim, M)
+
+        if self._profiling_enabled:
+            self._read_and_accumulate_timestamps('cas')
+            self._maybe_print_profile()
 
     def gpu_combine_p2p(
             self,
@@ -878,6 +947,90 @@ class DispatchCombineP2PManager:
         self._routing_count_tensor.copy_(
             logical_replica_count.to(torch.int64))
 
+    # ================================================================
+    # Fine-grained profiling
+    # ================================================================
+
+    def _read_and_accumulate_timestamps(
+            self, kernel_name: str):
+        """Read GPU timestamp buffer, accumulate deltas.
+
+        Synchronizes the stream, copies timestamps to
+        host via cudaMemcpy, and accumulates deltas."""
+        if not self._profiling_enabled:
+            return
+        # Synchronize to ensure kernel has completed
+        # and timestamps are written.
+        torch.cuda.current_stream().synchronize()
+
+        # Copy int64 timestamps from GPU to host.
+        nbytes = _TOTAL_PROFILE_SLOTS * 8
+        ts_host = (ctypes.c_int64
+                    * _TOTAL_PROFILE_SLOTS)()
+        self._cuda_rt.cudaMemcpy(
+            ctypes.cast(ts_host, ctypes.c_void_p),
+            self._raw_profiling_timestamps,
+            nbytes)
+        ts = [ts_host[i] for i in
+              range(_TOTAL_PROFILE_SLOTS)]
+
+        # globaltimer is in nanoseconds on NVIDIA GPUs.
+        if kernel_name == 'dar':
+            for i in range(_DAR_NUM_STEPS - 1):
+                if ts[i] > 0 and ts[i + 1] > 0:
+                    delta_ns = ts[i + 1] - ts[i]
+                    self._dar_accum[i] += delta_ns
+        elif kernel_name == 'cas':
+            base = _DAR_NUM_STEPS
+            for i in range(_CAS_NUM_STEPS - 1):
+                if (ts[base + i] > 0
+                        and ts[base + i + 1] > 0):
+                    delta_ns = (ts[base + i + 1]
+                                - ts[base + i])
+                    self._cas_accum[i] += delta_ns
+
+    def _maybe_print_profile(self):
+        """Print and reset averages if interval reached."""
+        if not self._profiling_enabled:
+            return
+        self._profile_batch_count += 1
+        if (self._profile_batch_count
+                % self._profiling_interval != 0):
+            return
+
+        n = self._profiling_interval
+        # Print dispatch_and_route steps.
+        parts = []
+        for i in range(_DAR_NUM_STEPS - 1):
+            avg_us = (self._dar_accum[i] / n
+                      / 1000.0)
+            name = _DAR_STEP_NAMES[i]
+            parts.append(f"  {name}: {avg_us:.1f} us")
+        total_dar = sum(self._dar_accum) / n / 1000.0
+        logger.info(
+            "DC profile [rank %d] dispatch_and_route "
+            "(avg %d batches, total %.1f us):\n%s",
+            self.rank, n, total_dar,
+            "\n".join(parts))
+
+        # Print combine_and_scatter steps.
+        parts = []
+        for i in range(_CAS_NUM_STEPS - 1):
+            avg_us = (self._cas_accum[i] / n
+                      / 1000.0)
+            name = _CAS_STEP_NAMES[i]
+            parts.append(f"  {name}: {avg_us:.1f} us")
+        total_cas = sum(self._cas_accum) / n / 1000.0
+        logger.info(
+            "DC profile [rank %d] combine_and_scatter "
+            "(avg %d batches, total %.1f us):\n%s",
+            self.rank, n, total_cas,
+            "\n".join(parts))
+
+        # Reset accumulators.
+        self._dar_accum = [0.0] * _DAR_NUM_STEPS
+        self._cas_accum = [0.0] * _CAS_NUM_STEPS
+
     def gpu_dispatch_and_route(
         self,
         input_tensor: torch.Tensor,
@@ -914,6 +1067,9 @@ class DispatchCombineP2PManager:
                 num_experts,
                 self._num_logical_experts,
                 self.world_size)
+
+        if self._profiling_enabled:
+            self._read_and_accumulate_timestamps('dar')
 
         return (
             self.expert_topk_ids_buf[:mc]
@@ -963,3 +1119,6 @@ class DispatchCombineP2PManager:
         if self._raw_positions_ready_flag is not None:
             self._cuda_rt.cudaFree(
                 self._raw_positions_ready_flag)
+        if self._raw_profiling_timestamps is not None:
+            self._cuda_rt.cudaFree(
+                self._raw_profiling_timestamps)
