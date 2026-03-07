@@ -959,6 +959,10 @@ class DispatchCombineP2PManager:
         host via cudaMemcpy, and accumulates deltas."""
         if not self._profiling_enabled:
             return
+        # Skip during CUDA graph capture: synchronize
+        # and cudaMemcpy are illegal in capture mode.
+        if torch.cuda.is_current_stream_capturing():
+            return
         # Synchronize to ensure kernel has completed
         # and timestamps are written.
         torch.cuda.current_stream().synchronize()
