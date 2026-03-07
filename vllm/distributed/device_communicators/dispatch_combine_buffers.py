@@ -50,12 +50,12 @@ _DAR_STEP_NAMES = [
 _CAS_STEP_NAMES = [
     "read_counters",
     "zero_accum",
-    "combine_p2p",
+    "pass1_count",
+    "aggregation",
+    "pass2_write",
     "grid_sync",
     "barrier",
-    "scatter_add",
     "end",
-    "reserved",
 ]
 
 logger = init_logger(__name__)
@@ -204,6 +204,26 @@ class DispatchCombineP2PManager:
         self.remote_expert_counts_ptrs = []
         self._integrated_routing_enabled = False
         self._experts_per_rank = 0
+
+        # Two-pass combine support (same pattern as
+        # dispatch two-pass). Always allocated since
+        # combine_and_scatter_kernel uses them.
+        bcc_bytes = 4 * 32 * 64  # int32[kPG * kMR]
+        self._raw_block_combine_counts = (
+            self._cuda_rt.cudaMalloc(bcc_bytes))
+        self._cuda_rt.cudaMemset(
+            self._raw_block_combine_counts,
+            0, bcc_bytes)
+        self._raw_block_combine_positions = (
+            self._cuda_rt.cudaMalloc(bcc_bytes))
+        self._cuda_rt.cudaMemset(
+            self._raw_block_combine_positions,
+            0, bcc_bytes)
+        self._raw_combine_positions_ready_flag = (
+            self._cuda_rt.cudaMalloc(4))
+        self._cuda_rt.cudaMemset(
+            self._raw_combine_positions_ready_flag,
+            0, 4)
 
         # Fine-grained profiling.
         self._profiling_enabled = (_DC_PROFILE_INTERVAL > 0)
@@ -546,6 +566,18 @@ class DispatchCombineP2PManager:
                else 0)
         data += struct.pack('Q', ptr)
 
+        # ---- Two-pass combine support ----
+        data += struct.pack(
+            'Q',
+            self._raw_block_combine_counts.value)
+        data += struct.pack(
+            'Q',
+            self._raw_block_combine_positions.value)
+        data += struct.pack(
+            'Q',
+            self._raw_combine_positions_ready_flag
+            .value)
+
         # profiling_timestamps (1 pointer)
         ptr = (self._raw_profiling_timestamps.value
                if self._profiling_enabled
@@ -620,8 +652,8 @@ class DispatchCombineP2PManager:
                 mc, self.hidden_dim, M)
 
         if self._profiling_enabled:
-            self._read_and_accumulate_timestamps('cas')
-            self._maybe_print_profile()
+            if self._read_and_accumulate_timestamps('cas'):
+                self._maybe_print_profile()
 
     def gpu_combine_p2p(
             self,
@@ -952,17 +984,17 @@ class DispatchCombineP2PManager:
     # ================================================================
 
     def _read_and_accumulate_timestamps(
-            self, kernel_name: str):
+            self, kernel_name: str) -> bool:
         """Read GPU timestamp buffer, accumulate deltas.
 
-        Synchronizes the stream, copies timestamps to
-        host via cudaMemcpy, and accumulates deltas."""
+        Returns True if timestamps were accumulated,
+        False if skipped (disabled or graph capture)."""
         if not self._profiling_enabled:
-            return
+            return False
         # Skip during CUDA graph capture: synchronize
         # and cudaMemcpy are illegal in capture mode.
         if torch.cuda.is_current_stream_capturing():
-            return
+            return False
         # Synchronize to ensure kernel has completed
         # and timestamps are written.
         torch.cuda.current_stream().synchronize()
@@ -992,6 +1024,7 @@ class DispatchCombineP2PManager:
                     delta_ns = (ts[base + i + 1]
                                 - ts[base + i])
                     self._cas_accum[i] += delta_ns
+        return True
 
     def _maybe_print_profile(self):
         """Print and reset averages if interval reached."""
@@ -1123,6 +1156,12 @@ class DispatchCombineP2PManager:
         if self._raw_positions_ready_flag is not None:
             self._cuda_rt.cudaFree(
                 self._raw_positions_ready_flag)
+        self._cuda_rt.cudaFree(
+            self._raw_block_combine_counts)
+        self._cuda_rt.cudaFree(
+            self._raw_block_combine_positions)
+        self._cuda_rt.cudaFree(
+            self._raw_combine_positions_ready_flag)
         if self._raw_profiling_timestamps is not None:
             self._cuda_rt.cudaFree(
                 self._raw_profiling_timestamps)

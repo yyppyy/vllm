@@ -162,6 +162,15 @@ struct DispatchCombineConfig {
   // blocks 1-31 spin until ready. Monotonic for CUDA graph.
   FlagType* positions_ready_flag;
 
+  // ---- Two-pass combine support ----
+  // Same pattern as dispatch two-pass: Pass 1 counts,
+  // block 0 prefix-sums, Pass 2 writes with pre-computed
+  // positions. Eliminates per-entry atomicAdd + syncthreads.
+  int32_t* block_combine_counts;       // [kPersistentGrid * kMaxRanks]
+  int32_t* block_combine_positions;    // [kPersistentGrid * kMaxRanks]
+  // Block 0 signals after prefix sum; blocks 1-31 spin.
+  FlagType* combine_positions_ready_flag;
+
   // ---- Fine-grained profiling support ----
   // When non-null, block 0 writes globaltimer timestamps
   // at each step boundary. Layout:
@@ -201,12 +210,12 @@ inline const char* cas_step_name(int i) {
   static const char* names[] = {
     "cas:read_counters",     // 0
     "cas:zero_accum",        // 1
-    "cas:combine_p2p",       // 2
-    "cas:grid_sync",         // 3
-    "cas:barrier",           // 4
-    "cas:scatter_add",       // 5
-    "cas:end",               // 6
-    "cas:reserved",          // 7
+    "cas:pass1_count",       // 2
+    "cas:aggregation",       // 3
+    "cas:pass2_write",       // 4
+    "cas:grid_sync",         // 5
+    "cas:barrier",           // 6
+    "cas:end",               // 7
   };
   return (i < kCasNumSteps) ? names[i] : "cas:?";
 }
@@ -672,15 +681,19 @@ __global__ void combine_and_scatter_kernel(
   // modifies them (CUDA graph replay compatible).
   __shared__ FlagType s_cd_base;
   __shared__ FlagType s_barrier_expected;
+  __shared__ FlagType s_cprf_expected;
   if (threadIdx.x == 0) {
     s_cd_base = static_cast<FlagType>(
         *config->combine_done_counter);
     s_barrier_expected =
         config->self_signals->counter + 1;
+    s_cprf_expected = static_cast<FlagType>(
+        *config->combine_positions_ready_flag) + 1;
   }
   __syncthreads();
   FlagType cd_base = s_cd_base;
   FlagType barrier_expected = s_barrier_expected;
+  FlagType cprf_expected = s_cprf_expected;
 
   // ---- Phase 0: Zero fp32 accum buffer ----
   DC_TIMESTAMP(config, kDarNumSteps + 1);  // cas:zero_accum
@@ -702,81 +715,228 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  // ---- Phase 1: Combine P2P writes (persistent blocks) ----
-  DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:combine_p2p
+  // ---- Phase 1: Two-pass combine P2P writes ----
+  // Pass 1 counts entries, block 0 prefix-sums positions,
+  // Pass 2 writes data with NO per-entry syncthreads.
+  DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:pass1_count
 
-  // Only kPersistentGrid (32) blocks do NVLink writes.
-  // Less contention on local_combine_counters, and only
-  // 32 blocks call __threadfence_system() (staggered).
-  __shared__ int32_t s_write_pos;
+  // Batch arrays: thread 0 fills in Pass 2 scan,
+  // all 256 threads read after one __syncthreads().
+  constexpr int32_t kMaxBatch = 128;
+  __shared__ int32_t s_cdr_count[kMaxRanks];
+  __shared__ int32_t s_batch_dest[kMaxBatch];
+  __shared__ int32_t s_batch_wpos[kMaxBatch];
+  __shared__ int32_t s_batch_ci[kMaxBatch];
+  __shared__ int32_t s_batch_token[kMaxBatch];
+  __shared__ int32_t s_batch_eid[kMaxBatch];
+  __shared__ float   s_batch_weight[kMaxBatch];
+  __shared__ int32_t s_num_valid;
+
+  // === PASS 1: Count valid entries per dest_rank ===
   if (blockIdx.x < kPersistentGrid) {
+    if (threadIdx.x < ws) {
+      s_cdr_count[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
     const int32_t ss_d = config->dispatch_section_size;
-    for (int32_t s = 0; s < ws; s++) {
-      int32_t section_start = s * ss_d;
-      int32_t count = config->
-          remote_dispatch_offsets[rank][s];
-      if (count > ss_d) count = ss_d;
-      for (int32_t pair_idx =
-               section_start + blockIdx.x;
-           pair_idx < section_start + count;
-           pair_idx += kPersistentGrid) {
-
-        const int32_t dest_rank =
-            dispatch_meta[pair_idx].source_rank;
-        const int32_t orig_token_idx =
-            dispatch_meta[pair_idx].source_token_idx;
-        const float weight =
-            dispatch_meta[pair_idx].topk_weight;
-
-        if (weight == 0.0f) continue;
-        if (dest_rank < 0 || dest_rank >= ws)
-          continue;
-        if (!config->
-                remote_combine_offsets[dest_rank] ||
-            !config->
-                remote_combine_recv[dest_rank] ||
-            !config->
-                remote_combine_meta[dest_rank])
-          continue;
-
-        if (threadIdx.x == 0) {
-          int32_t local_off = atomicAdd(
-              &config->local_combine_counters[
-                  dest_rank], 1);
-          int32_t ss = config->combine_section_size;
-          s_write_pos = (local_off < ss)
-              ? rank * ss + local_off
-              : config->max_recv;
+    if (threadIdx.x == 0) {
+      for (int32_t s = 0; s < ws; s++) {
+        int32_t section_start = s * ss_d;
+        int32_t count = config->
+            remote_dispatch_offsets[rank][s];
+        if (count > ss_d) count = ss_d;
+        for (int32_t pair_idx =
+                 section_start + blockIdx.x;
+             pair_idx < section_start + count;
+             pair_idx += kPersistentGrid) {
+          float weight =
+              dispatch_meta[pair_idx].topk_weight;
+          if (weight == 0.0f) continue;
+          int32_t dr =
+              dispatch_meta[pair_idx].source_rank;
+          if (dr < 0 || dr >= ws) continue;
+          if (!config->
+                  remote_combine_offsets[dr] ||
+              !config->
+                  remote_combine_recv[dr] ||
+              !config->
+                  remote_combine_meta[dr])
+            continue;
+          s_cdr_count[dr]++;
         }
-        __syncthreads();
+      }
+    }
 
-        const int32_t write_pos = s_write_pos;
-        if (write_pos >= config->max_recv) continue;
+    // Flush per-block counts to device buffer.
+    __syncthreads();
+    if (threadIdx.x < ws) {
+      config->block_combine_counts[
+          blockIdx.x * kMaxRanks + threadIdx.x] =
+              s_cdr_count[threadIdx.x];
+    }
 
-        T* dest_data = reinterpret_cast<T*>(
-            config->remote_combine_recv[dest_rank]);
-        const int32_t ci =
-            compact_reverse[pair_idx];
-        const T* src_data =
-            expert_output + ci * K;
-        for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x) {
-          dest_data[write_pos * K + k] =
-              src_data[k];
+    // Grid sync: signal Pass 1 done.
+    __syncthreads();
+    __threadfence();
+    if (threadIdx.x == 0) {
+      atomicAdd(config->combine_done_counter,
+                static_cast<FlagType>(1));
+    }
+  }
+
+  // === AGGREGATION: Block 0 prefix sum ===
+  if (blockIdx.x == 0) {
+    if (threadIdx.x == 0) {
+      FlagType target = cd_base + kPersistentGrid;
+      while (dc_ld_flag_acquire(
+                 config->combine_done_counter)
+              < target)
+        ;
+    }
+    __syncthreads();
+
+    DC_TIMESTAMP(config, kDarNumSteps + 3);
+    // cas:aggregation
+
+    // Prefix sum: thread tid handles dest_rank tid.
+    if (threadIdx.x < ws) {
+      int32_t dr = threadIdx.x;
+      int32_t ss = config->combine_section_size;
+      int32_t running = 0;
+      for (int32_t b = 0; b < kPersistentGrid;
+           b++) {
+        int32_t c =
+            config->block_combine_counts[
+                b * kMaxRanks + dr];
+        int32_t pos = (running < ss)
+            ? rank * ss + running
+            : config->max_recv;
+        config->block_combine_positions[
+            b * kMaxRanks + dr] = pos;
+        running += c;
+      }
+      // Store total for barrier push later.
+      config->local_combine_counters[dr] = running;
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      dc_st_flag_release(
+          config->combine_positions_ready_flag,
+          cprf_expected);
+    }
+  } else if (blockIdx.x < kPersistentGrid) {
+    // Blocks 1-31: wait for positions.
+    if (threadIdx.x == 0) {
+      while (dc_ld_flag_acquire(
+          config->combine_positions_ready_flag)
+              != cprf_expected)
+        ;
+    }
+    __syncthreads();
+    __threadfence();
+  }
+
+  // === PASS 2: Batched data write (no per-entry sync) ===
+  DC_TIMESTAMP(config, kDarNumSteps + 4);
+  // cas:pass2_write
+
+  if (blockIdx.x < kPersistentGrid) {
+    // Load starting positions from aggregation.
+    if (threadIdx.x < ws) {
+      s_cdr_count[threadIdx.x] =
+          config->block_combine_positions[
+              blockIdx.x * kMaxRanks +
+              threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+      s_num_valid = 0;
+    }
+    __syncthreads();
+
+    // Thread 0: re-iterate entries, fill batch.
+    const int32_t ss_d = config->dispatch_section_size;
+    if (threadIdx.x == 0) {
+      int32_t nv = 0;
+      for (int32_t s = 0; s < ws; s++) {
+        int32_t section_start = s * ss_d;
+        int32_t count = config->
+            remote_dispatch_offsets[rank][s];
+        if (count > ss_d) count = ss_d;
+        for (int32_t pair_idx =
+                 section_start + blockIdx.x;
+             pair_idx < section_start + count;
+             pair_idx += kPersistentGrid) {
+          float weight =
+              dispatch_meta[pair_idx].topk_weight;
+          if (weight == 0.0f) continue;
+          int32_t dr =
+              dispatch_meta[pair_idx].source_rank;
+          if (dr < 0 || dr >= ws) continue;
+          if (!config->
+                  remote_combine_offsets[dr] ||
+              !config->
+                  remote_combine_recv[dr] ||
+              !config->
+                  remote_combine_meta[dr])
+            continue;
+
+          int32_t wpos = s_cdr_count[dr];
+          s_cdr_count[dr]++;
+
+          if (nv < kMaxBatch) {
+            s_batch_dest[nv] = dr;
+            s_batch_wpos[nv] = wpos;
+            s_batch_ci[nv] =
+                compact_reverse[pair_idx];
+            s_batch_token[nv] =
+                dispatch_meta[pair_idx]
+                    .source_token_idx;
+            s_batch_eid[nv] =
+                dispatch_meta[pair_idx].expert_id;
+            s_batch_weight[nv] = weight;
+          }
+          nv++;
         }
+      }
+      s_num_valid =
+          (nv < kMaxBatch) ? nv : kMaxBatch;
+    }
+    __syncthreads();  // ONE sync for all entries
 
-        if (threadIdx.x == 0) {
-          TokenMetadata* dest_meta =
-              reinterpret_cast<TokenMetadata*>(
-                  config->remote_combine_meta[
-                      dest_rank]);
-          dest_meta[write_pos].source_rank = rank;
-          dest_meta[write_pos].source_token_idx =
-              orig_token_idx;
-          dest_meta[write_pos].expert_id =
-              dispatch_meta[pair_idx].expert_id;
-          dest_meta[write_pos].topk_weight = weight;
-        }
+    // All threads: write data + metadata.
+    // No per-entry sync — warps pipeline across
+    // entries, overlapping HBM reads with NVLink
+    // writes.
+    int32_t nv = s_num_valid;
+    for (int32_t v = 0; v < nv; v++) {
+      int32_t write_pos = s_batch_wpos[v];
+      if (write_pos >= config->max_recv) continue;
+
+      int32_t dr = s_batch_dest[v];
+      T* dest_data = reinterpret_cast<T*>(
+          config->remote_combine_recv[dr]);
+      const T* src_data =
+          expert_output + s_batch_ci[v] * K;
+      for (int32_t k = threadIdx.x; k < K;
+           k += blockDim.x) {
+        dest_data[write_pos * K + k] =
+            src_data[k];
+      }
+
+      if (threadIdx.x == 0) {
+        TokenMetadata* dest_meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_combine_meta[dr]);
+        dest_meta[write_pos].source_rank = rank;
+        dest_meta[write_pos].source_token_idx =
+            s_batch_token[v];
+        dest_meta[write_pos].expert_id =
+            s_batch_eid[v];
+        dest_meta[write_pos].topk_weight =
+            s_batch_weight[v];
       }
     }
 
@@ -791,14 +951,16 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  // ---- Phase 2: Single barrier ----
-  DC_TIMESTAMP(config, kDarNumSteps + 3);  // cas:grid_sync
+  // ---- Grid sync + P2P barrier ----
+  DC_TIMESTAMP(config, kDarNumSteps + 5);
+  // cas:grid_sync
 
-  // Block 0 waits for kPersistentGrid blocks, does
-  // P2P barrier. All other blocks wait for counter.
+  // Block 0 waits for 2*kPersistentGrid (Pass 1 +
+  // Pass 2), does P2P barrier. Others wait for counter.
   if (blockIdx.x == 0) {
     if (threadIdx.x == 0) {
-      FlagType target = cd_base + kPersistentGrid;
+      FlagType target =
+          cd_base + 2 * kPersistentGrid;
       while (dc_ld_flag_acquire(
                  config->combine_done_counter)
               < target)
@@ -854,7 +1016,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 3: Scatter-add to fp32 accum ----
-  DC_TIMESTAMP(config, kDarNumSteps + 4);  // cas:barrier
+  DC_TIMESTAMP(config, kDarNumSteps + 6);  // cas:barrier
   // (timestamp after barrier, before scatter-add)
 
   // Native fp32 atomicAdd: no CAS loop, no adjacent-
@@ -893,7 +1055,7 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, kDarNumSteps + 5);  // cas:end
+  DC_TIMESTAMP(config, kDarNumSteps + 7);  // cas:end
 }
 
 // ====================================================================
