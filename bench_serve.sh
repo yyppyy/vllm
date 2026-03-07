@@ -45,6 +45,7 @@ args=(
   --max-model-len 4096
   --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
+  --enforce-eager
 )
 
 if (( USE_EP > 0 )); then
