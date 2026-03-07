@@ -29,7 +29,7 @@ _DC_PROFILE_INTERVAL = int(
 # Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
 # in dispatch_combine.cuh.
 _DAR_NUM_STEPS = 12
-_CAS_NUM_STEPS = 8
+_CAS_NUM_STEPS = 6
 _TOTAL_PROFILE_SLOTS = _DAR_NUM_STEPS + _CAS_NUM_STEPS
 
 _DAR_STEP_NAMES = [
@@ -50,9 +50,7 @@ _DAR_STEP_NAMES = [
 _CAS_STEP_NAMES = [
     "read_counters",
     "zero_accum",
-    "pass1_count",
-    "aggregation",
-    "pass2_write",
+    "scan_write",
     "grid_sync",
     "barrier",
     "end",
@@ -204,26 +202,6 @@ class DispatchCombineP2PManager:
         self.remote_expert_counts_ptrs = []
         self._integrated_routing_enabled = False
         self._experts_per_rank = 0
-
-        # Two-pass combine support (same pattern as
-        # dispatch two-pass). Always allocated since
-        # combine_and_scatter_kernel uses them.
-        bcc_bytes = 4 * 32 * 64  # int32[kPG * kMR]
-        self._raw_block_combine_counts = (
-            self._cuda_rt.cudaMalloc(bcc_bytes))
-        self._cuda_rt.cudaMemset(
-            self._raw_block_combine_counts,
-            0, bcc_bytes)
-        self._raw_block_combine_positions = (
-            self._cuda_rt.cudaMalloc(bcc_bytes))
-        self._cuda_rt.cudaMemset(
-            self._raw_block_combine_positions,
-            0, bcc_bytes)
-        self._raw_combine_positions_ready_flag = (
-            self._cuda_rt.cudaMalloc(4))
-        self._cuda_rt.cudaMemset(
-            self._raw_combine_positions_ready_flag,
-            0, 4)
 
         # Fine-grained profiling.
         self._profiling_enabled = (_DC_PROFILE_INTERVAL > 0)
@@ -565,18 +543,6 @@ class DispatchCombineP2PManager:
                if self._integrated_routing_enabled
                else 0)
         data += struct.pack('Q', ptr)
-
-        # ---- Two-pass combine support ----
-        data += struct.pack(
-            'Q',
-            self._raw_block_combine_counts.value)
-        data += struct.pack(
-            'Q',
-            self._raw_block_combine_positions.value)
-        data += struct.pack(
-            'Q',
-            self._raw_combine_positions_ready_flag
-            .value)
 
         # profiling_timestamps (1 pointer)
         ptr = (self._raw_profiling_timestamps.value
@@ -1156,12 +1122,6 @@ class DispatchCombineP2PManager:
         if self._raw_positions_ready_flag is not None:
             self._cuda_rt.cudaFree(
                 self._raw_positions_ready_flag)
-        self._cuda_rt.cudaFree(
-            self._raw_block_combine_counts)
-        self._cuda_rt.cudaFree(
-            self._raw_block_combine_positions)
-        self._cuda_rt.cudaFree(
-            self._raw_combine_positions_ready_flag)
         if self._raw_profiling_timestamps is not None:
             self._cuda_rt.cudaFree(
                 self._raw_profiling_timestamps)

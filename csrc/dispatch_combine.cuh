@@ -162,15 +162,6 @@ struct DispatchCombineConfig {
   // blocks 1-31 spin until ready. Monotonic for CUDA graph.
   FlagType* positions_ready_flag;
 
-  // ---- Two-pass combine support ----
-  // Same pattern as dispatch two-pass: Pass 1 counts,
-  // block 0 prefix-sums, Pass 2 writes with pre-computed
-  // positions. Eliminates per-entry atomicAdd + syncthreads.
-  int32_t* block_combine_counts;       // [kPersistentGrid * kMaxRanks]
-  int32_t* block_combine_positions;    // [kPersistentGrid * kMaxRanks]
-  // Block 0 signals after prefix sum; blocks 1-31 spin.
-  FlagType* combine_positions_ready_flag;
-
   // ---- Fine-grained profiling support ----
   // When non-null, block 0 writes globaltimer timestamps
   // at each step boundary. Layout:
@@ -183,7 +174,7 @@ struct DispatchCombineConfig {
 
 // Number of timestamp slots per kernel.
 constexpr int kDarNumSteps = 12;
-constexpr int kCasNumSteps = 8;
+constexpr int kCasNumSteps = 6;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
 
@@ -210,12 +201,10 @@ inline const char* cas_step_name(int i) {
   static const char* names[] = {
     "cas:read_counters",     // 0
     "cas:zero_accum",        // 1
-    "cas:pass1_count",       // 2
-    "cas:aggregation",       // 3
-    "cas:pass2_write",       // 4
-    "cas:grid_sync",         // 5
-    "cas:barrier",           // 6
-    "cas:end",               // 7
+    "cas:scan_write",        // 2
+    "cas:grid_sync",         // 3
+    "cas:barrier",           // 4
+    "cas:end",               // 5
   };
   return (i < kCasNumSteps) ? names[i] : "cas:?";
 }
@@ -681,19 +670,15 @@ __global__ void combine_and_scatter_kernel(
   // modifies them (CUDA graph replay compatible).
   __shared__ FlagType s_cd_base;
   __shared__ FlagType s_barrier_expected;
-  __shared__ FlagType s_cprf_expected;
   if (threadIdx.x == 0) {
     s_cd_base = static_cast<FlagType>(
         *config->combine_done_counter);
     s_barrier_expected =
         config->self_signals->counter + 1;
-    s_cprf_expected = static_cast<FlagType>(
-        *config->combine_positions_ready_flag) + 1;
   }
   __syncthreads();
   FlagType cd_base = s_cd_base;
   FlagType barrier_expected = s_barrier_expected;
-  FlagType cprf_expected = s_cprf_expected;
 
   // ---- Phase 0: Zero fp32 accum buffer ----
   DC_TIMESTAMP(config, kDarNumSteps + 1);  // cas:zero_accum
@@ -715,15 +700,16 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  // ---- Phase 1: Two-pass combine P2P writes ----
-  // Pass 1 counts entries, block 0 prefix-sums positions,
-  // Pass 2 writes data with NO per-entry syncthreads.
-  DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:pass1_count
+  // ---- Phase 1: Hybrid one-pass combine P2P writes ----
+  // Thread 0 scans entries ONCE: counts per dest_rank,
+  // fills batch arrays, atomicAdds to claim positions,
+  // assigns write positions. One __syncthreads(), then
+  // all threads write data. No grid sync before writing.
+  DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:scan_write
 
-  // Batch arrays: thread 0 fills in Pass 2 scan,
-  // all 256 threads read after one __syncthreads().
   constexpr int32_t kMaxBatch = 128;
   __shared__ int32_t s_cdr_count[kMaxRanks];
+  __shared__ int32_t s_cdr_start[kMaxRanks];
   __shared__ int32_t s_batch_dest[kMaxBatch];
   __shared__ int32_t s_batch_wpos[kMaxBatch];
   __shared__ int32_t s_batch_ci[kMaxBatch];
@@ -732,132 +718,18 @@ __global__ void combine_and_scatter_kernel(
   __shared__ float   s_batch_weight[kMaxBatch];
   __shared__ int32_t s_num_valid;
 
-  // === PASS 1: Count valid entries per dest_rank ===
   if (blockIdx.x < kPersistentGrid) {
     if (threadIdx.x < ws) {
       s_cdr_count[threadIdx.x] = 0;
-    }
-    __syncthreads();
-
-    const int32_t ss_d = config->dispatch_section_size;
-    if (threadIdx.x == 0) {
-      for (int32_t s = 0; s < ws; s++) {
-        int32_t section_start = s * ss_d;
-        int32_t count = config->
-            remote_dispatch_offsets[rank][s];
-        if (count > ss_d) count = ss_d;
-        for (int32_t pair_idx =
-                 section_start + blockIdx.x;
-             pair_idx < section_start + count;
-             pair_idx += kPersistentGrid) {
-          float weight =
-              dispatch_meta[pair_idx].topk_weight;
-          if (weight == 0.0f) continue;
-          int32_t dr =
-              dispatch_meta[pair_idx].source_rank;
-          if (dr < 0 || dr >= ws) continue;
-          if (!config->
-                  remote_combine_offsets[dr] ||
-              !config->
-                  remote_combine_recv[dr] ||
-              !config->
-                  remote_combine_meta[dr])
-            continue;
-          s_cdr_count[dr]++;
-        }
-      }
-    }
-
-    // Flush per-block counts to device buffer.
-    __syncthreads();
-    if (threadIdx.x < ws) {
-      config->block_combine_counts[
-          blockIdx.x * kMaxRanks + threadIdx.x] =
-              s_cdr_count[threadIdx.x];
-    }
-
-    // Grid sync: signal Pass 1 done.
-    __syncthreads();
-    __threadfence();
-    if (threadIdx.x == 0) {
-      atomicAdd(config->combine_done_counter,
-                static_cast<FlagType>(1));
-    }
-  }
-
-  // === AGGREGATION: Block 0 prefix sum ===
-  if (blockIdx.x == 0) {
-    if (threadIdx.x == 0) {
-      FlagType target = cd_base + kPersistentGrid;
-      while (dc_ld_flag_acquire(
-                 config->combine_done_counter)
-              < target)
-        ;
-    }
-    __syncthreads();
-
-    DC_TIMESTAMP(config, kDarNumSteps + 3);
-    // cas:aggregation
-
-    // Prefix sum: thread tid handles dest_rank tid.
-    if (threadIdx.x < ws) {
-      int32_t dr = threadIdx.x;
-      int32_t ss = config->combine_section_size;
-      int32_t running = 0;
-      for (int32_t b = 0; b < kPersistentGrid;
-           b++) {
-        int32_t c =
-            config->block_combine_counts[
-                b * kMaxRanks + dr];
-        int32_t pos = (running < ss)
-            ? rank * ss + running
-            : config->max_recv;
-        config->block_combine_positions[
-            b * kMaxRanks + dr] = pos;
-        running += c;
-      }
-      // Store total for barrier push later.
-      config->local_combine_counters[dr] = running;
-    }
-
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      dc_st_flag_release(
-          config->combine_positions_ready_flag,
-          cprf_expected);
-    }
-  } else if (blockIdx.x < kPersistentGrid) {
-    // Blocks 1-31: wait for positions.
-    if (threadIdx.x == 0) {
-      while (dc_ld_flag_acquire(
-          config->combine_positions_ready_flag)
-              != cprf_expected)
-        ;
-    }
-    __syncthreads();
-    __threadfence();
-  }
-
-  // === PASS 2: Batched data write (no per-entry sync) ===
-  DC_TIMESTAMP(config, kDarNumSteps + 4);
-  // cas:pass2_write
-
-  if (blockIdx.x < kPersistentGrid) {
-    // Load starting positions from aggregation.
-    if (threadIdx.x < ws) {
-      s_cdr_count[threadIdx.x] =
-          config->block_combine_positions[
-              blockIdx.x * kMaxRanks +
-              threadIdx.x];
     }
     if (threadIdx.x == 0) {
       s_num_valid = 0;
     }
     __syncthreads();
 
-    // Thread 0: re-iterate entries, fill batch.
+    // Thread 0: single scan — count + fill batch.
     const int32_t ss_d = config->dispatch_section_size;
+    const int32_t ss_c = config->combine_section_size;
     if (threadIdx.x == 0) {
       int32_t nv = 0;
       for (int32_t s = 0; s < ws; s++) {
@@ -883,12 +755,9 @@ __global__ void combine_and_scatter_kernel(
                   remote_combine_meta[dr])
             continue;
 
-          int32_t wpos = s_cdr_count[dr];
           s_cdr_count[dr]++;
-
           if (nv < kMaxBatch) {
             s_batch_dest[nv] = dr;
-            s_batch_wpos[nv] = wpos;
             s_batch_ci[nv] =
                 compact_reverse[pair_idx];
             s_batch_token[nv] =
@@ -901,8 +770,35 @@ __global__ void combine_and_scatter_kernel(
           nv++;
         }
       }
-      s_num_valid =
+
+      // Per-block atomicAdd: claim contiguous
+      // positions from global counters.
+      for (int32_t d = 0; d < ws; d++) {
+        if (s_cdr_count[d] > 0) {
+          s_cdr_start[d] = atomicAdd(
+              &config->local_combine_counters[d],
+              s_cdr_count[d]);
+        } else {
+          s_cdr_start[d] = 0;
+        }
+      }
+
+      // Assign write positions from atomicAdd
+      // return values. Quick shared-mem pass.
+      int32_t pos[kMaxRanks];
+      for (int32_t d = 0; d < ws; d++) {
+        pos[d] = s_cdr_start[d];
+      }
+      int32_t nv_capped =
           (nv < kMaxBatch) ? nv : kMaxBatch;
+      for (int32_t v = 0; v < nv_capped; v++) {
+        int32_t dr = s_batch_dest[v];
+        int32_t local_off = pos[dr]++;
+        s_batch_wpos[v] = (local_off < ss_c)
+            ? rank * ss_c + local_off
+            : config->max_recv;
+      }
+      s_num_valid = nv_capped;
     }
     __syncthreads();  // ONE sync for all entries
 
@@ -952,15 +848,16 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Grid sync + P2P barrier ----
-  DC_TIMESTAMP(config, kDarNumSteps + 5);
+  DC_TIMESTAMP(config, kDarNumSteps + 3);
   // cas:grid_sync
 
-  // Block 0 waits for 2*kPersistentGrid (Pass 1 +
-  // Pass 2), does P2P barrier. Others wait for counter.
+  // Block 0 waits for kPersistentGrid (one increment
+  // per block), does P2P barrier. Others wait for
+  // barrier counter.
   if (blockIdx.x == 0) {
     if (threadIdx.x == 0) {
       FlagType target =
-          cd_base + 2 * kPersistentGrid;
+          cd_base + kPersistentGrid;
       while (dc_ld_flag_acquire(
                  config->combine_done_counter)
               < target)
@@ -1016,7 +913,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 3: Scatter-add to fp32 accum ----
-  DC_TIMESTAMP(config, kDarNumSteps + 6);  // cas:barrier
+  DC_TIMESTAMP(config, kDarNumSteps + 4);  // cas:barrier
   // (timestamp after barrier, before scatter-add)
 
   // Native fp32 atomicAdd: no CAS loop, no adjacent-
@@ -1055,7 +952,7 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, kDarNumSteps + 7);  // cas:end
+  DC_TIMESTAMP(config, kDarNumSteps + 5);  // cas:end
 }
 
 // ====================================================================
