@@ -18,7 +18,7 @@ constexpr int kMaxRanks = 64;
 // within nanoseconds of each other. This guarantees
 // that inline barrier reads of the counter happen before
 // block 0 increments it (barrier takes microseconds).
-constexpr int kPersistentGrid = 32;
+constexpr int kPersistentGrid = 108;
 
 // ====================================================================
 // P2P flag operations for cross-GPU synchronization.
