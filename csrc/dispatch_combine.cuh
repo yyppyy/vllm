@@ -693,40 +693,54 @@ __global__ void combine_and_scatter_kernel(
   // all threads write data. No grid sync before writing.
   DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:scan_write
 
+  // Dynamic shared memory: fp32 accumulator [K].
+  extern __shared__ char dyn_shared_raw[];
+  float* s_accum = reinterpret_cast<float*>(
+      dyn_shared_raw);
+
   constexpr int32_t kMaxBatch = 128;
-  __shared__ int32_t s_cdr_count[kMaxRanks];
-  __shared__ int32_t s_cdr_start[kMaxRanks];
-  __shared__ int32_t s_batch_dest[kMaxBatch];
-  __shared__ int32_t s_batch_wpos[kMaxBatch];
   __shared__ int32_t s_batch_ci[kMaxBatch];
-  __shared__ int32_t s_batch_token[kMaxBatch];
-  __shared__ int32_t s_batch_eid[kMaxBatch];
   __shared__ float   s_batch_weight[kMaxBatch];
+  __shared__ int32_t s_batch_uid[kMaxBatch];
+  __shared__ int32_t s_unique_dr[kMaxBatch];
+  __shared__ int32_t s_unique_token[kMaxBatch];
+  __shared__ int32_t s_unique_wpos[kMaxBatch];
   __shared__ int32_t s_num_valid;
+  __shared__ int32_t s_num_unique;
 
   if (blockIdx.x < kPersistentGrid) {
-    if (threadIdx.x < ws) {
-      s_cdr_count[threadIdx.x] = 0;
-    }
     if (threadIdx.x == 0) {
       s_num_valid = 0;
+      s_num_unique = 0;
     }
     __syncthreads();
 
-    // Thread 0: single scan — count + fill batch.
-    const int32_t ss_d = config->dispatch_section_size;
-    const int32_t ss_c = config->combine_section_size;
+    // Thread 0: chunk-based scan — group entries
+    // by (source_rank, source_token_idx) for local
+    // reduction. Contiguous chunks ensure entries
+    // from the same token land in the same block.
+    const int32_t ss_d =
+        config->dispatch_section_size;
+    const int32_t ss_c =
+        config->combine_section_size;
     if (threadIdx.x == 0) {
       int32_t nv = 0;
+      int32_t nu = 0;
       for (int32_t s = 0; s < ws; s++) {
         int32_t section_start = s * ss_d;
         int32_t count = config->
             remote_dispatch_offsets[rank][s];
         if (count > ss_d) count = ss_d;
-        for (int32_t pair_idx =
-                 section_start + blockIdx.x;
-             pair_idx < section_start + count;
-             pair_idx += kPersistentGrid) {
+        // Chunk-based: contiguous range per block.
+        int32_t chunk = (count + kPersistentGrid
+                         - 1) / kPersistentGrid;
+        int32_t my_start = blockIdx.x * chunk;
+        int32_t my_end = my_start + chunk;
+        if (my_end > count) my_end = count;
+
+        for (int32_t i = my_start;
+             i < my_end; i++) {
+          int32_t pair_idx = section_start + i;
           float weight =
               dispatch_meta[pair_idx].topk_weight;
           if (weight == 0.0f) continue;
@@ -741,85 +755,122 @@ __global__ void combine_and_scatter_kernel(
                   remote_combine_meta[dr])
             continue;
 
-          s_cdr_count[dr]++;
+          int32_t token =
+              dispatch_meta[pair_idx]
+                  .source_token_idx;
+          int32_t ci =
+              compact_reverse[pair_idx];
+
+          // Find or create unique (dr, token).
+          int32_t g = -1;
+          for (int32_t j = 0; j < nu; j++) {
+            if (s_unique_token[j] == token &&
+                s_unique_dr[j] == dr) {
+              g = j;
+              break;
+            }
+          }
+          if (g == -1) {
+            if (nu >= kMaxBatch) continue;
+            g = nu++;
+            s_unique_token[g] = token;
+            s_unique_dr[g] = dr;
+          }
+
           if (nv < kMaxBatch) {
-            s_batch_dest[nv] = dr;
-            s_batch_ci[nv] =
-                compact_reverse[pair_idx];
-            s_batch_token[nv] =
-                dispatch_meta[pair_idx]
-                    .source_token_idx;
-            s_batch_eid[nv] =
-                dispatch_meta[pair_idx].expert_id;
+            s_batch_ci[nv] = ci;
             s_batch_weight[nv] = weight;
+            s_batch_uid[nv] = g;
           }
           nv++;
         }
       }
-
-      // Per-block atomicAdd: claim contiguous
-      // positions from global counters.
-      for (int32_t d = 0; d < ws; d++) {
-        if (s_cdr_count[d] > 0) {
-          s_cdr_start[d] = atomicAdd(
-              &config->local_combine_counters[d],
-              s_cdr_count[d]);
-        } else {
-          s_cdr_start[d] = 0;
-        }
-      }
-
-      // Assign write positions from atomicAdd
-      // return values. Quick shared-mem pass.
-      int32_t pos[kMaxRanks];
-      for (int32_t d = 0; d < ws; d++) {
-        pos[d] = s_cdr_start[d];
-      }
-      int32_t nv_capped =
+      s_num_valid =
           (nv < kMaxBatch) ? nv : kMaxBatch;
-      for (int32_t v = 0; v < nv_capped; v++) {
-        int32_t dr = s_batch_dest[v];
+      s_num_unique = nu;
+
+      // Claim combine buffer positions: ONE per
+      // unique (dr, token) — not per entry.
+      int32_t cdr_count[kMaxRanks] = {};
+      for (int32_t g = 0; g < nu; g++)
+        cdr_count[s_unique_dr[g]]++;
+
+      int32_t cdr_start[kMaxRanks];
+      for (int32_t d = 0; d < ws; d++) {
+        cdr_start[d] = (cdr_count[d] > 0)
+            ? atomicAdd(
+                  &config->
+                      local_combine_counters[d],
+                  cdr_count[d])
+            : 0;
+      }
+
+      int32_t pos[kMaxRanks];
+      for (int32_t d = 0; d < ws; d++)
+        pos[d] = cdr_start[d];
+      for (int32_t g = 0; g < nu; g++) {
+        int32_t dr = s_unique_dr[g];
         int32_t local_off = pos[dr]++;
-        s_batch_wpos[v] = (local_off < ss_c)
+        s_unique_wpos[g] = (local_off < ss_c)
             ? rank * ss_c + local_off
             : config->max_recv;
       }
-      s_num_valid = nv_capped;
     }
-    __syncthreads();  // ONE sync for all entries
+    __syncthreads();
 
-    // All threads: write data + metadata.
-    // No per-entry sync — warps pipeline across
-    // entries, overlapping HBM reads with NVLink
-    // writes.
+    // Local reduction + NVLink write: for each
+    // unique (dr, token), accumulate weight ×
+    // expert_output in shared fp32, then write ONE
+    // reduced bf16 vector. No atomics — each thread
+    // owns unique k positions in s_accum.
+    int32_t nu = s_num_unique;
     int32_t nv = s_num_valid;
-    for (int32_t v = 0; v < nv; v++) {
-      int32_t write_pos = s_batch_wpos[v];
-      if (write_pos >= config->max_recv) continue;
 
-      int32_t dr = s_batch_dest[v];
-      T* dest_data = reinterpret_cast<T*>(
-          config->remote_combine_recv[dr]);
-      const T* src_data =
-          expert_output + s_batch_ci[v] * K;
+    for (int32_t u = 0; u < nu; u++) {
+      // Zero fp32 accumulator.
       for (int32_t k = threadIdx.x; k < K;
-           k += blockDim.x) {
-        dest_data[write_pos * K + k] =
-            src_data[k];
-      }
+           k += blockDim.x)
+        s_accum[k] = 0.0f;
+      __syncthreads();
 
-      if (threadIdx.x == 0) {
-        TokenMetadata* dest_meta =
-            reinterpret_cast<TokenMetadata*>(
-                config->remote_combine_meta[dr]);
-        dest_meta[write_pos].source_rank = rank;
-        dest_meta[write_pos].source_token_idx =
-            s_batch_token[v];
-        dest_meta[write_pos].expert_id =
-            s_batch_eid[v];
-        dest_meta[write_pos].topk_weight =
-            s_batch_weight[v];
+      // Accumulate matching entries.
+      for (int32_t i = 0; i < nv; i++) {
+        if (s_batch_uid[i] != u) continue;
+        const T* src =
+            expert_output + s_batch_ci[i] * K;
+        float w = s_batch_weight[i];
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x) {
+          s_accum[k] +=
+              static_cast<float>(src[k]) * w;
+        }
       }
+      __syncthreads();
+
+      // Write ONE reduced vector to NVLink.
+      int32_t write_pos = s_unique_wpos[u];
+      if (write_pos < config->max_recv) {
+        int32_t dr = s_unique_dr[u];
+        T* dest = reinterpret_cast<T*>(
+            config->remote_combine_recv[dr]);
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x) {
+          dest[write_pos * K + k] =
+              static_cast<T>(s_accum[k]);
+        }
+        if (threadIdx.x == 0) {
+          TokenMetadata* meta =
+              reinterpret_cast<TokenMetadata*>(
+                  config->
+                      remote_combine_meta[dr]);
+          meta[write_pos].source_rank = rank;
+          meta[write_pos].source_token_idx =
+              s_unique_token[u];
+          meta[write_pos].expert_id = 0;
+          meta[write_pos].topk_weight = 1.0f;
+        }
+      }
+      __syncthreads();
     }
 
     // Staggered fence: blocks finish at different
