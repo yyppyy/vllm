@@ -413,9 +413,10 @@ void dispatch_and_route(
   // cudaMemsetAsync would race with remote ranks'
   // Phase A allgather writes to this IPC buffer.
 
-  // Shared memory: max of Phase A and Phase C needs.
-  // Phase A: NL + 2*ws + 3*64 ints (expert counts +
-  //   grouping arrays).
+  // Shared memory: max of scan_write and Phase C needs.
+  // Scan_write: NL + ws + 3*64 + NL + NL*kMaxRep ints
+  //   (expert_counts + grp_count + entries
+  //    + preloaded replica_count + l2p_map).
   // Phase C: 3*NL + NL*kMaxRep + ws ints
   //   (s_expert_sum[NL] + s_replica_count[NL]
   //    + s_l2p_map[NL*kMaxRep] + routing_sel[NL]
@@ -424,7 +425,8 @@ void dispatch_and_route(
   constexpr int32_t kMaxEntries = 64;
   constexpr int32_t kMaxRep = 2;
   size_t phase_a_bytes = static_cast<size_t>(
-      (NL + 2 * ws + 3 * kMaxEntries)
+      (2 * NL + ws + 3 * kMaxEntries
+       + NL * kMaxRep)
       * sizeof(int32_t));
   size_t phase_c_bytes = static_cast<size_t>(
       (3 * NL + NL * kMaxRep + ws)

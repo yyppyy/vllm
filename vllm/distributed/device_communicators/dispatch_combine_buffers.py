@@ -36,7 +36,7 @@ _DAR_STEP_NAMES = [
     "read_counters",     # 0
     "scan_write",        # 1
     "scan_expand",       # 2  Step 1: topk reads
-    "scan_group",        # 3  Step 2: grouping
+    "scan_group",        # 3  (fused into Step 1)
     "scan_claim",        # 4  Step 3: atomicAdd
     "scan_nvlink",       # 5  Step 4: NVLink write
     "expert_flush",      # 6

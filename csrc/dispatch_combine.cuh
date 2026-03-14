@@ -178,7 +178,7 @@ inline const char* dar_step_name(int i) {
     "dar:read_counters",     // 0
     "dar:scan_write",        // 1
     "dar:scan_expand",       // 2  Step 1: topk reads
-    "dar:scan_group",        // 3  Step 2: grouping
+    "dar:scan_group",        // 3  (fused into Step 1)
     "dar:scan_claim",        // 4  Step 3: atomicAdd
     "dar:scan_nvlink",       // 5  Step 4: NVLink write
     "dar:expert_flush",      // 6
@@ -1663,13 +1663,14 @@ __global__ void dispatch_and_route_kernel(
   const int32_t NL = config->num_logical_experts;
 
   // Shared memory layout (reused across phases):
-  // Pass 1/2: s_expert_counts[NL] + s_dr_count[ws]
-  //           + s_ent_lid[64] + s_ent_wt[64]
-  //           + s_ent_dr[64]
-  // Phase C:  s_expert_sum[NL] + s_replica_count[NL]
-  //           + s_l2p_map[NL*max_rep]
-  //           + routing_selection_smem[NL]
-  //           + rank_active_counts[ws]
+  // Scan_write: s_expert_counts[NL] + s_grp_count[ws]
+  //             + s_ent_lid[64] + s_ent_wt[64]
+  //             + s_ent_grp[64] + s_replica_count[NL]
+  //             + s_l2p_map[NL*max_rep]
+  // Phase C:    s_expert_sum[NL] + s_replica_count[NL]
+  //             + s_l2p_map[NL*max_rep]
+  //             + routing_selection_smem[NL]
+  //             + rank_active_counts[ws]
   // Phases don't overlap, so same memory is reused.
   extern __shared__ int32_t shared[];
 
@@ -1713,47 +1714,55 @@ __global__ void dispatch_and_route_kernel(
 
   constexpr int32_t kMaxEntries = 64;
   int32_t* s_expert_counts = shared;           // [NL]
-  int32_t* s_grp_dest  = shared + NL;          // [ws]
-  int32_t* s_grp_count = shared + NL + ws;     // [ws]
-  int32_t* s_ent_lid   = shared + NL + 2 * ws; // [kME]
+  int32_t* s_grp_count = shared + NL;          // [ws]
+  int32_t* s_ent_lid   = shared + NL + ws;     // [kME]
   float*   s_ent_wt    = reinterpret_cast<float*>(
       s_ent_lid + kMaxEntries);                 // [kME]
   int32_t* s_ent_grp   = reinterpret_cast<int32_t*>(
       s_ent_wt + kMaxEntries);                  // [kME]
+  // Preloaded config arrays (fit in existing alloc).
+  int32_t* s_replica_count =
+      s_ent_grp + kMaxEntries;                  // [NL]
+  int32_t* s_l2p_map =
+      s_replica_count + NL;                     // [NL*mr]
 
-  __shared__ int32_t s_num_groups;
   __shared__ int32_t s_total_entries;
   __shared__ int32_t s_grp_base[kMaxRanks];
 
-  // Zero shared expert counts (persistent across all
-  // tokens assigned to this block).
+  // Zero expert counts + preload config arrays.
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     s_expert_counts[e] = 0;
+    s_replica_count[e] =
+        config->logical_replica_count[e];
   }
-  if (threadIdx.x == 0) {
-    s_num_groups = 0;
-    s_total_entries = 0;
+  for (int32_t i = threadIdx.x;
+       i < NL * max_rep; i += blockDim.x) {
+    s_l2p_map[i] =
+        config->logical_to_physical_map[i];
   }
+  if (threadIdx.x < ws)
+    s_grp_count[threadIdx.x] = 0;
+  if (threadIdx.x == 0) s_total_entries = 0;
   __syncthreads();
 
-  // Per-token loop: expand → group → claim → write.
+  // Per-token loop: expand → claim → write.
+  // Groups pre-allocated by dest_rank (g == dr).
   for (int32_t t = blockIdx.x; t < M;
        t += gridDim.x) {
-    // Step 1: Parallel expansion (threads 0..topk-1).
+    // Step 1: Parallel expansion (threads 0..topk-1)
+    // + direct group tagging (fused with old Step 2).
     if (threadIdx.x < topk) {
       int32_t slot = threadIdx.x;
       int32_t lid = topk_ids[t * topk + slot];
       if (lid >= 0 && lid < NL) {
         atomicAdd(&s_expert_counts[lid], 1);
         float wt = topk_weights[t * topk + slot];
-        int32_t rc = static_cast<int32_t>(
-            config->logical_replica_count[lid]);
+        int32_t rc = s_replica_count[lid];
         if (rc > max_rep) rc = max_rep;
         for (int32_t rep = 0; rep < rc; rep++) {
           int32_t phys =
-              config->logical_to_physical_map[
-                  lid * max_rep + rep];
+              s_l2p_map[lid * max_rep + rep];
           int32_t dr = phys / epr;
           if (dr < 0 || dr >= ws) continue;
           if (!config->
@@ -1769,6 +1778,7 @@ __global__ void dispatch_and_route_kernel(
             s_ent_lid[ei] = lid;
             s_ent_wt[ei] = wt;
             s_ent_grp[ei] = dr;
+            atomicAdd(&s_grp_count[dr], 1);
           }
         }
       }
@@ -1776,38 +1786,14 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();
 
     DC_TIMESTAMP(config, 2);  // dar:scan_expand
-
-    // Step 2: Thread 0 groups entries by dest_rank.
-    if (threadIdx.x == 0) {
-      int32_t ne = s_total_entries;
-      if (ne > kMaxEntries) ne = kMaxEntries;
-      for (int32_t i = 0; i < ne; i++) {
-        int32_t dr = s_ent_grp[i];
-        int32_t g = -1;
-        for (int32_t j = 0; j < s_num_groups;
-             j++) {
-          if (s_grp_dest[j] == dr) {
-            g = j; break;
-          }
-        }
-        if (g == -1) {
-          g = s_num_groups++;
-          s_grp_dest[g] = dr;
-          s_grp_count[g] = 0;
-        }
-        s_ent_grp[i] = g;
-        s_grp_count[g]++;
-      }
-    }
-    __syncthreads();
-
-    DC_TIMESTAMP(config, 3);  // dar:scan_group
+    DC_TIMESTAMP(config, 3);  // dar:scan_group (fused)
 
     // Step 3: Claim write positions via atomicAdd.
-    if (threadIdx.x < s_num_groups) {
-      int32_t dr = s_grp_dest[threadIdx.x];
+    if (threadIdx.x < ws &&
+        s_grp_count[threadIdx.x] > 0) {
       int32_t local_off = atomicAdd(
-          &config->local_dispatch_counters[dr],
+          &config->local_dispatch_counters[
+              threadIdx.x],
           s_grp_count[threadIdx.x]);
       int32_t ss = config->dispatch_section_size;
       s_grp_base[threadIdx.x] = (local_off < ss)
@@ -1818,30 +1804,37 @@ __global__ void dispatch_and_route_kernel(
 
     DC_TIMESTAMP(config, 4);  // dar:scan_claim
 
-    // Step 4: Write data + metadata per group.
-    for (int32_t g = 0; g < s_num_groups; g++) {
-      int32_t dr = s_grp_dest[g];
+    // Step 4: Vectorized data + metadata per group.
+    // int4 = 16 bytes → 8x fewer stores than bf16.
+    const int32_t K4 = K *
+        static_cast<int32_t>(sizeof(T)) /
+        static_cast<int32_t>(sizeof(int4));
+    for (int32_t g = 0; g < ws; g++) {
+      if (s_grp_count[g] == 0) continue;
       int32_t base = s_grp_base[g];
       int32_t n = s_grp_count[g];
       if (base >= config->max_recv) continue;
       if (base + n > config->max_recv)
         n = config->max_recv - base;
 
-      // All threads: write token data at base
-      // (fire-and-forget NVLink store).
-      T* dest = reinterpret_cast<T*>(
-          config->remote_dispatch_recv[dr]);
-      const T* src = input + t * K;
-      for (int32_t k = threadIdx.x; k < K;
-           k += blockDim.x) {
-        dest[base * K + k] = src[k];
+      // All threads: vectorized data copy (int4).
+      const int4* src4 =
+          reinterpret_cast<const int4*>(
+              input + t * K);
+      int4* dest4 = reinterpret_cast<int4*>(
+          reinterpret_cast<T*>(
+              config->remote_dispatch_recv[g])
+          + base * K);
+      for (int32_t i = threadIdx.x; i < K4;
+           i += blockDim.x) {
+        dest4[i] = src4[i];
       }
 
       // Thread 0: write metadata per entry.
       if (threadIdx.x == 0) {
         TokenMetadata* meta =
             reinterpret_cast<TokenMetadata*>(
-                config->remote_dispatch_meta[dr]);
+                config->remote_dispatch_meta[g]);
         int32_t ne2 = s_total_entries;
         if (ne2 > kMaxEntries) ne2 = kMaxEntries;
         int32_t mi = 0;
@@ -1860,10 +1853,9 @@ __global__ void dispatch_and_route_kernel(
     }
 
     // Reset per-token state for next iteration.
-    if (threadIdx.x == 0) {
-      s_num_groups = 0;
-      s_total_entries = 0;
-    }
+    if (threadIdx.x < ws)
+      s_grp_count[threadIdx.x] = 0;
+    if (threadIdx.x == 0) s_total_entries = 0;
     __syncthreads();
 
     DC_TIMESTAMP(config, 5);  // dar:scan_nvlink
