@@ -167,7 +167,7 @@ struct DispatchCombineConfig {
 };
 
 // Number of timestamp slots per kernel.
-constexpr int kDarNumSteps = 12;
+constexpr int kDarNumSteps = 16;
 constexpr int kCasNumSteps = 10;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
@@ -177,16 +177,20 @@ inline const char* dar_step_name(int i) {
   static const char* names[] = {
     "dar:read_counters",     // 0
     "dar:scan_write",        // 1
-    "dar:expert_flush",      // 2
-    "dar:threadfence_sys",   // 3
-    "dar:grid_sync",         // 4
-    "dar:expert_push",       // 5
-    "dar:fence2",            // 6  fence#2 drain
-    "dar:p2p_wait",          // 7  P2P flag exchange
-    "dar:phase_c_preload",   // 8  smem preload
-    "dar:phase_c_route",     // 9  routing compute
-    "dar:phase_d2_filter",   // 10
-    "dar:end",               // 11
+    "dar:scan_expand",       // 2  Step 1: topk reads
+    "dar:scan_group",        // 3  Step 2: grouping
+    "dar:scan_claim",        // 4  Step 3: atomicAdd
+    "dar:scan_nvlink",       // 5  Step 4: NVLink write
+    "dar:expert_flush",      // 6
+    "dar:threadfence_sys",   // 7
+    "dar:grid_sync",         // 8
+    "dar:expert_push",       // 9
+    "dar:fence2",            // 10 fence#2 drain
+    "dar:p2p_wait",          // 11 P2P flag exchange
+    "dar:phase_c_preload",   // 12 smem preload
+    "dar:phase_c_route",     // 13 routing compute
+    "dar:phase_d2_filter",   // 14
+    "dar:end",               // 15
   };
   return (i < kDarNumSteps) ? names[i] : "dar:?";
 }
@@ -1767,6 +1771,8 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
+    DC_TIMESTAMP(config, 2);  // dar:scan_expand
+
     // Step 2: Thread 0 groups entries by dest_rank.
     if (threadIdx.x == 0) {
       int32_t ne = s_total_entries;
@@ -1791,6 +1797,8 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
+    DC_TIMESTAMP(config, 3);  // dar:scan_group
+
     // Step 3: Claim write positions via atomicAdd.
     if (threadIdx.x < s_num_groups) {
       int32_t dr = s_grp_dest[threadIdx.x];
@@ -1803,6 +1811,8 @@ __global__ void dispatch_and_route_kernel(
           : config->max_recv;
     }
     __syncthreads();
+
+    DC_TIMESTAMP(config, 4);  // dar:scan_claim
 
     // Step 4: Write data + metadata per group.
     for (int32_t g = 0; g < s_num_groups; g++) {
@@ -1851,10 +1861,12 @@ __global__ void dispatch_and_route_kernel(
       s_total_entries = 0;
     }
     __syncthreads();
+
+    DC_TIMESTAMP(config, 5);  // dar:scan_nvlink
   }
 
   // Flush expert counts to device buffer.
-  DC_TIMESTAMP(config, 2);  // dar:expert_flush
+  DC_TIMESTAMP(config, 6);  // dar:expert_flush
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     int32_t count = s_expert_counts[e];
@@ -1868,7 +1880,7 @@ __global__ void dispatch_and_route_kernel(
   // SINGLE BARRIER: fence + grid sync + expert push + P2P
   // ============================================================
   __syncthreads();
-  DC_TIMESTAMP(config, 3);  // dar:threadfence_sys
+  DC_TIMESTAMP(config, 7);  // dar:threadfence_sys
   __threadfence_system();
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -1887,7 +1899,7 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
-    DC_TIMESTAMP(config, 4);  // dar:grid_sync
+    DC_TIMESTAMP(config, 8);  // dar:grid_sync
 
     // Push dispatch offsets on threads NL..NL+ws-1
     // (warp 4), concurrent with expert count push on
@@ -1912,7 +1924,7 @@ __global__ void dispatch_and_route_kernel(
       }
     }
 
-    DC_TIMESTAMP(config, 5);  // dar:expert_push
+    DC_TIMESTAMP(config, 9);  // dar:expert_push
 
     // Reset combine state for next layer.
     const int32_t tid = threadIdx.x;
@@ -1927,7 +1939,7 @@ __global__ void dispatch_and_route_kernel(
     // barrier flag exchange.
     __threadfence_system();
 
-    DC_TIMESTAMP(config, 6);  // dar:fence2
+    DC_TIMESTAMP(config, 10);  // dar:fence2
 
     // P2P barrier exchange.
     if (tid < ws) {
@@ -1957,7 +1969,7 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();
   }
 
-  DC_TIMESTAMP(config, 7);  // dar:p2p_wait
+  DC_TIMESTAMP(config, 11);  // dar:p2p_wait
 
   // Sum per-sender dispatch counts (available after
   // barrier). Each sender pushed its section count
@@ -1978,7 +1990,7 @@ __global__ void dispatch_and_route_kernel(
   // Block 0: parallel preload + deterministic router +
   // zero expert_num_tokens. Other blocks spin-wait on
   // routing_ready_flag.
-  DC_TIMESTAMP(config, 8);  // dar:phase_c_preload
+  DC_TIMESTAMP(config, 12);  // dar:phase_c_preload
 
   if (blockIdx.x == 0) {
     // Reuse shared[] for Phase C preload layout.
@@ -2023,7 +2035,7 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
-    DC_TIMESTAMP(config, 9);  // dar:phase_c_route
+    DC_TIMESTAMP(config, 13);  // dar:phase_c_route
 
     // ---- Two-pass routing ----
     // Pass 1 (parallel): Route single-replica experts.
@@ -2118,7 +2130,7 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase D2: Single-pass fill + routing filter ----
-  DC_TIMESTAMP(config, 10);  // dar:phase_d2_filter
+  DC_TIMESTAMP(config, 14);  // dar:phase_d2_filter
 
   // For each entry: write sentinel defaults, then check
   // if real and overwrite. Single pass ensures no cross-
@@ -2229,7 +2241,7 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, 11);  // dar:end
+  DC_TIMESTAMP(config, 15);  // dar:end
 }
 
 }  // namespace dispatch_combine
