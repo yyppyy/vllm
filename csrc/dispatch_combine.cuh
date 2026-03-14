@@ -929,12 +929,12 @@ __global__ void combine_and_scatter_kernel(
     }
 
     DC_TIMESTAMP(config, kDarNumSteps + 3);
-    // cas:staggered_fence
+    // cas:staggered_fence (removed — deferred to per-block)
 
-    // Staggered fence: blocks finish at different
-    // times, avoiding NVLink ack congestion.
-    __syncthreads();
-    __threadfence_system();
+    // fence#1 removed: NVLink stores drain in background
+    // during grid_sync + offset_push. Each block fences
+    // once before P2P (block 0 after offset_push, others
+    // in else branch).
     __syncthreads();
     if (threadIdx.x == 0) {
       atomicAdd(config->combine_done_counter,
@@ -1001,7 +1001,11 @@ __global__ void combine_and_scatter_kernel(
           barrier_expected);
     }
   } else {
-    // Blocks 1..(gridDim-1): wait for barrier completion.
+    // Blocks 1..(gridDim-1): fence scan_write stores,
+    // then wait for P2P completion. With persistent grid,
+    // this fence completes before block 0's fence+P2P.
+    __threadfence_system();
+
     if (blockIdx.x >= kPersistentGrid) {
       __threadfence();
     }
@@ -1877,19 +1881,24 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ============================================================
-  // SINGLE BARRIER: fence + grid sync + expert push + P2P
+  // DEFERRED FENCE: grid sync + expert push + single fence + P2P
   // ============================================================
+  // fence#1 removed: NVLink stores from scan_write drain in the
+  // background while grid_sync + expert_push execute. Each block
+  // calls __threadfence_system() once before P2P, draining all
+  // its pending stores in a single pass. With the persistent
+  // grid (108 blocks on 108 SMs), blocks 1-107 start their
+  // fence before block 0 (no expert_push to do), so all stores
+  // are globally visible before block 0's P2P flag exchange.
   __syncthreads();
-  DC_TIMESTAMP(config, 7);  // dar:threadfence_sys
-  __threadfence_system();
-  __syncthreads();
+  DC_TIMESTAMP(config, 7);  // dar:threadfence_sys (removed)
   if (threadIdx.x == 0) {
     atomicAdd(config->phase_a_done_counter,
               static_cast<FlagType>(1));
   }
 
   if (blockIdx.x == 0) {
-    // Wait for all blocks to finish scan+write + fence.
+    // Wait for all blocks to finish scan+write.
     if (threadIdx.x == 0) {
       FlagType target = pa_base + gridDim.x;
       while (dc_ld_flag_acquire(
@@ -1934,9 +1943,10 @@ __global__ void dispatch_and_route_kernel(
       config->local_combine_counters[tid] = 0;
     }
 
-    // System fence: ensure expert push + offset push
-    // + combine reset are globally visible before
-    // barrier flag exchange.
+    // Single fence: drains scan_write + expert_push +
+    // offset_push + combine_reset stores in one pass.
+    // Scan_write stores have been draining in background
+    // during grid_sync + expert_push (~1.5 us head start).
     __threadfence_system();
 
     DC_TIMESTAMP(config, 10);  // dar:fence2
@@ -1960,6 +1970,11 @@ __global__ void dispatch_and_route_kernel(
           barrier_expected);
     }
   } else {
+    // Blocks 1-107: fence scan_write stores, then wait
+    // for P2P completion. With persistent grid, this
+    // fence completes before block 0's fence+P2P.
+    __threadfence_system();
+
     if (threadIdx.x == 0) {
       while (dc_ld_flag_acquire(
           &config->self_signals->counter)
