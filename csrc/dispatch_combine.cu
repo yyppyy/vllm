@@ -429,7 +429,7 @@ void dispatch_and_route(
        + NL * kMaxRep)
       * sizeof(int32_t));
   size_t phase_c_bytes = static_cast<size_t>(
-      (3 * NL + NL * kMaxRep + ws)
+      (3 * NL + NL * kMaxRep + ws + NL + 1)
       * sizeof(int32_t));
   size_t shared_bytes = phase_a_bytes > phase_c_bytes
       ? phase_a_bytes : phase_c_bytes;

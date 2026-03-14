@@ -2010,6 +2010,10 @@ __global__ void dispatch_and_route_kernel(
     int32_t* routing_sel =
         shared + 2 * NL + NL * max_rep;       // [NL]
     int32_t* rank_active = routing_sel + NL;   // [ws]
+    int32_t* s_multi_experts =
+        rank_active + ws;                      // [NL]
+    int32_t* s_num_multi =
+        s_multi_experts + NL;                  // [1]
 
     // All threads: parallel preload from global to smem.
     // Sum expert counts across allgather sections.
@@ -2043,6 +2047,7 @@ __global__ void dispatch_and_route_kernel(
          r += blockDim.x) {
       rank_active[r] = 0;
     }
+    if (threadIdx.x == 0) s_num_multi[0] = 0;
     __syncthreads();
 
     DC_TIMESTAMP(config, 13);  // dar:phase_c_route
@@ -2065,29 +2070,40 @@ __global__ void dispatch_and_route_kernel(
             s_l2p_map[e * max_rep];
         routing_sel[e] = phys;
         atomicAdd(&rank_active[phys / epr], count);
+      } else {
+        // rc > 1: defer to Pass 2 via compact list.
+        int32_t idx = atomicAdd(s_num_multi, 1);
+        s_multi_experts[idx] = e;
       }
     }
     __syncthreads();
 
     DC_TIMESTAMP(config, 14);  // dar:route_pass1
 
-    // Pass 2 (sequential): Route multi-replica experts.
-    // Greedy load-balanced assignment starting from the
-    // rank_active[] base computed by Pass 1. Sequential
-    // processing in expert-index order ensures identical
-    // decisions on every rank.
+    // Pass 2 (sequential): Route multi-replica experts
+    // from the compact list built in Pass 1.  Greedy
+    // load-balanced assignment starting from the
+    // rank_active[] base computed by Pass 1.  Sorted by
+    // expert index for cross-rank determinism.
     if (threadIdx.x == 0) {
-      for (int32_t e = 0; e < NL; e++) {
-        // Skip experts already routed in Pass 1.
-        if (routing_sel[e] != -1) continue;
+      const int32_t nm = s_num_multi[0];
+      // Insertion sort compact list by expert index.
+      for (int32_t i = 1; i < nm; i++) {
+        int32_t key = s_multi_experts[i];
+        int32_t j = i - 1;
+        while (j >= 0 && s_multi_experts[j] > key) {
+          s_multi_experts[j + 1] =
+              s_multi_experts[j];
+          j--;
+        }
+        s_multi_experts[j + 1] = key;
+      }
+      // Greedy assignment over compact list only.
+      for (int32_t idx = 0; idx < nm; idx++) {
+        const int32_t e = s_multi_experts[idx];
         const int32_t count = s_expert_sum[e];
-        if (count == 0) continue;
         int32_t rc = s_replica_count[e];
-        if (rc <= 0) continue;
         if (rc > max_rep) rc = max_rep;
-
-        // Multiple replicas: pick minimum-loaded rank
-        // (ties: lower rank for determinism).
         int32_t best_phys = -1;
         int32_t best_rank = -1;
         int32_t best_cost = INT_MAX;
