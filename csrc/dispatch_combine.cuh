@@ -898,7 +898,7 @@ __global__ void combine_and_scatter_kernel(
       while (dc_ld_flag_acquire(
                  config->combine_done_counter)
               < target)
-        ;
+        __nanosleep(200);
     }
     __syncthreads();
 
@@ -934,9 +934,7 @@ __global__ void combine_and_scatter_kernel(
           barrier_expected);
     }
   } else {
-    // Blocks 1-511: wait for barrier completion.
-    // Blocks >= kPersistentGrid: device fence ensures
-    // Phase 0 accum zeroing is L2-visible for Phase 3.
+    // Blocks 1..(gridDim-1): wait for barrier completion.
     if (blockIdx.x >= kPersistentGrid) {
       __threadfence();
     }
@@ -944,7 +942,7 @@ __global__ void combine_and_scatter_kernel(
       while (dc_ld_flag_acquire(
           &config->self_signals->counter)
               != barrier_expected)
-        ;
+        __nanosleep(200);
     }
     __syncthreads();
   }
@@ -1822,7 +1820,7 @@ __global__ void dispatch_and_route_kernel(
       while (dc_ld_flag_acquire(
                  config->phase_a_done_counter)
               < target)
-        ;
+        __nanosleep(200);
     }
     __syncthreads();
 
@@ -1887,7 +1885,7 @@ __global__ void dispatch_and_route_kernel(
       while (dc_ld_flag_acquire(
           &config->self_signals->counter)
               != barrier_expected)
-        ;
+        __nanosleep(200);
     }
     __syncthreads();
   }
@@ -2026,7 +2024,7 @@ __global__ void dispatch_and_route_kernel(
       while (dc_ld_flag_acquire(
               config->routing_ready_flag)
               != rf_expected)
-        ;
+        __nanosleep(200);
     }
     __syncthreads();
     __threadfence();

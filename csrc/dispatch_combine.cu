@@ -286,7 +286,7 @@ void combine_and_scatter(
 
   // No grid-wide sync needed for scatter-add phase —
   // use enough blocks to saturate all SMs.
-  constexpr int32_t kCombineScatterGrid = 512;
+  constexpr int32_t kCombineScatterGrid = kPersistentGrid;
   int32_t grid_sz = mc32;
   if (grid_sz > kCombineScatterGrid)
     grid_sz = kCombineScatterGrid;
