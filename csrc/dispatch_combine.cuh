@@ -20,6 +20,12 @@ constexpr int kMaxRanks = 64;
 // block 0 increments it (barrier takes microseconds).
 constexpr int kPersistentGrid = 108;
 
+// Max unique (dest_rank, token) groups per block in CAS
+// Phase 1 single-pass accumulation. Dynamic shared memory
+// sized to kCasMaxUnique * K * sizeof(float). If nu exceeds
+// this, falls back to sequential accumulation loop.
+constexpr int kCasMaxUnique = 5;
+
 // ====================================================================
 // P2P flag operations for cross-GPU synchronization.
 // Follows custom_all_reduce.cuh pattern (lines 159-181).
@@ -818,46 +824,43 @@ __global__ void combine_and_scatter_kernel(
     }
     __syncthreads();
 
-    // Local reduction + NVLink write: for each
-    // unique (dr, token), accumulate weight ×
-    // expert_output in shared fp32, then write ONE
-    // reduced bf16 vector. No atomics — each thread
-    // owns unique k positions in s_accum.
+    // Single-pass local reduction + NVLink write.
+    // Each thread owns its k-positions across ALL
+    // accumulators — no inter-thread data dependency,
+    // so no __syncthreads between zero/accumulate/write.
     int32_t nu = s_num_unique;
     int32_t nv = s_num_valid;
 
-    for (int32_t u = 0; u < nu; u++) {
-      // Zero fp32 accumulator.
-      for (int32_t k = threadIdx.x; k < K;
+    if (nu <= kCasMaxUnique) {
+      // Fast path: single-pass with nu accumulators
+      // in shared memory (nu × K floats).
+      for (int32_t k = threadIdx.x; k < nu * K;
            k += blockDim.x)
         s_accum[k] = 0.0f;
-      __syncthreads();
 
-      // Accumulate matching entries.
+      // Accumulate all entries in one pass.
       for (int32_t i = 0; i < nv; i++) {
-        if (s_batch_uid[i] != u) continue;
+        int32_t u = s_batch_uid[i];
         const T* src =
             expert_output + s_batch_ci[i] * K;
         float w = s_batch_weight[i];
         for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x) {
-          s_accum[k] +=
+             k += blockDim.x)
+          s_accum[u * K + k] +=
               static_cast<float>(src[k]) * w;
-        }
       }
-      __syncthreads();
 
-      // Write ONE reduced vector to NVLink.
-      int32_t write_pos = s_unique_wpos[u];
-      if (write_pos < config->max_recv) {
+      // Write all reduced vectors to NVLink.
+      for (int32_t u = 0; u < nu; u++) {
+        int32_t write_pos = s_unique_wpos[u];
+        if (write_pos >= config->max_recv) continue;
         int32_t dr = s_unique_dr[u];
         T* dest = reinterpret_cast<T*>(
             config->remote_combine_recv[dr]);
         for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x) {
+             k += blockDim.x)
           dest[write_pos * K + k] =
-              static_cast<T>(s_accum[k]);
-        }
+              static_cast<T>(s_accum[u * K + k]);
         if (threadIdx.x == 0) {
           TokenMetadata* meta =
               reinterpret_cast<TokenMetadata*>(
@@ -870,7 +873,49 @@ __global__ void combine_and_scatter_kernel(
           meta[write_pos].topk_weight = 1.0f;
         }
       }
-      __syncthreads();
+    } else {
+      // Fallback: sequential loop (rare, nu > 5).
+      for (int32_t u = 0; u < nu; u++) {
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x)
+          s_accum[k] = 0.0f;
+        __syncthreads();
+
+        for (int32_t i = 0; i < nv; i++) {
+          if (s_batch_uid[i] != u) continue;
+          const T* src =
+              expert_output + s_batch_ci[i] * K;
+          float w = s_batch_weight[i];
+          for (int32_t k = threadIdx.x; k < K;
+               k += blockDim.x)
+            s_accum[k] +=
+                static_cast<float>(src[k]) * w;
+        }
+        __syncthreads();
+
+        int32_t write_pos = s_unique_wpos[u];
+        if (write_pos < config->max_recv) {
+          int32_t dr = s_unique_dr[u];
+          T* dest = reinterpret_cast<T*>(
+              config->remote_combine_recv[dr]);
+          for (int32_t k = threadIdx.x; k < K;
+               k += blockDim.x)
+            dest[write_pos * K + k] =
+                static_cast<T>(s_accum[k]);
+          if (threadIdx.x == 0) {
+            TokenMetadata* meta =
+                reinterpret_cast<TokenMetadata*>(
+                    config->
+                        remote_combine_meta[dr]);
+            meta[write_pos].source_rank = rank;
+            meta[write_pos].source_token_idx =
+                s_unique_token[u];
+            meta[write_pos].expert_id = 0;
+            meta[write_pos].topk_weight = 1.0f;
+          }
+        }
+        __syncthreads();
+      }
     }
 
     // Staggered fence: blocks finish at different
@@ -1826,16 +1871,18 @@ __global__ void dispatch_and_route_kernel(
 
     DC_TIMESTAMP(config, 4);  // dar:grid_sync
 
-    // Push dispatch offsets to remote ranks
-    // (fire-and-forget NVLink writes).
-    if (threadIdx.x < ws) {
-      int32_t dr = threadIdx.x;
+    // Push dispatch offsets on threads NL..NL+ws-1
+    // (warp 4), concurrent with expert count push on
+    // warps 0-3. Avoids intra-warp NVLink serialization.
+    if (threadIdx.x >= NL &&
+        threadIdx.x < NL + ws) {
+      int32_t dr = threadIdx.x - NL;
       config->remote_dispatch_offsets[dr][rank] =
           config->local_dispatch_counters[dr];
     }
 
     // Push expert counts to all remote ranks
-    // (fire-and-forget NVLink writes).
+    // (fire-and-forget NVLink writes, warps 0-3).
     for (int32_t e = threadIdx.x; e < NL;
          e += blockDim.x) {
       int32_t count =

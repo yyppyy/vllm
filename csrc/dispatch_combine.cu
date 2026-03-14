@@ -308,7 +308,8 @@ void combine_and_scatter(
         [&] {
           combine_and_scatter_kernel<__nv_bfloat16>
               <<<grid, block,
-                 K32 * sizeof(float), stream>>>(
+                 kCasMaxUnique * K32 * sizeof(float),
+                 stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
               meta, cr,
@@ -325,7 +326,8 @@ void combine_and_scatter(
         [&] {
           combine_and_scatter_kernel<__half>
               <<<grid, block,
-                 K32 * sizeof(float), stream>>>(
+                 kCasMaxUnique * K32 * sizeof(float),
+                 stream>>>(
               reinterpret_cast<const __half*>(
                   expert_output.data_ptr()),
               meta, cr,
