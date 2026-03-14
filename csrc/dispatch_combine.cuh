@@ -167,8 +167,8 @@ struct DispatchCombineConfig {
 };
 
 // Number of timestamp slots per kernel.
-constexpr int kDarNumSteps = 10;
-constexpr int kCasNumSteps = 6;
+constexpr int kDarNumSteps = 12;
+constexpr int kCasNumSteps = 10;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
 
@@ -181,10 +181,12 @@ inline const char* dar_step_name(int i) {
     "dar:threadfence_sys",   // 3
     "dar:grid_sync",         // 4
     "dar:expert_push",       // 5
-    "dar:barrier",           // 6
-    "dar:phase_c_route",     // 7
-    "dar:phase_d2_filter",   // 8
-    "dar:end",               // 9
+    "dar:fence2",            // 6  fence#2 drain
+    "dar:p2p_wait",          // 7  P2P flag exchange
+    "dar:phase_c_preload",   // 8  smem preload
+    "dar:phase_c_route",     // 9  routing compute
+    "dar:phase_d2_filter",   // 10
+    "dar:end",               // 11
   };
   return (i < kDarNumSteps) ? names[i] : "dar:?";
 }
@@ -194,9 +196,13 @@ inline const char* cas_step_name(int i) {
     "cas:read_counters",     // 0
     "cas:zero_accum",        // 1
     "cas:scan_write",        // 2
-    "cas:grid_sync",         // 3
-    "cas:barrier",           // 4
-    "cas:end",               // 5
+    "cas:staggered_fence",   // 3  fence#1 drain
+    "cas:grid_sync",         // 4  grid-wide sync
+    "cas:offset_push",       // 5  NVLink stores
+    "cas:fence2",            // 6  fence#2 drain
+    "cas:p2p_wait",          // 7  P2P flag exchange
+    "cas:scatter_add",       // 8  scatter-add
+    "cas:end",               // 9
   };
   return (i < kCasNumSteps) ? names[i] : "cas:?";
 }
@@ -918,6 +924,9 @@ __global__ void combine_and_scatter_kernel(
       }
     }
 
+    DC_TIMESTAMP(config, kDarNumSteps + 3);
+    // cas:staggered_fence
+
     // Staggered fence: blocks finish at different
     // times, avoiding NVLink ack congestion.
     __syncthreads();
@@ -930,7 +939,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Grid sync + P2P barrier ----
-  DC_TIMESTAMP(config, kDarNumSteps + 3);
+  DC_TIMESTAMP(config, kDarNumSteps + 4);
   // cas:grid_sync
 
   // Block 0 waits for kPersistentGrid (one increment
@@ -947,6 +956,9 @@ __global__ void combine_and_scatter_kernel(
     }
     __syncthreads();
 
+    DC_TIMESTAMP(config, kDarNumSteps + 5);
+    // cas:offset_push
+
     const int32_t tid = threadIdx.x;
     if (tid < ws) {
       if (config->remote_combine_offsets[tid])
@@ -959,7 +971,13 @@ __global__ void combine_and_scatter_kernel(
       config->local_combine_counters[tid] = 0;
     }
 
+    DC_TIMESTAMP(config, kDarNumSteps + 6);
+    // cas:fence2
+
     __threadfence_system();
+
+    DC_TIMESTAMP(config, kDarNumSteps + 7);
+    // cas:p2p_wait
 
     if (tid < ws) {
       dc_st_flag_release(
@@ -993,7 +1011,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 3: Scatter-add to fp32 accum ----
-  DC_TIMESTAMP(config, kDarNumSteps + 4);  // cas:barrier
+  DC_TIMESTAMP(config, kDarNumSteps + 8);  // cas:scatter_add
   // (timestamp after barrier, before scatter-add)
 
   // Native fp32 atomicAdd: no CAS loop, no adjacent-
@@ -1032,7 +1050,7 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, kDarNumSteps + 5);  // cas:end
+  DC_TIMESTAMP(config, kDarNumSteps + 9);  // cas:end
 }
 
 // ====================================================================
@@ -1909,6 +1927,8 @@ __global__ void dispatch_and_route_kernel(
     // barrier flag exchange.
     __threadfence_system();
 
+    DC_TIMESTAMP(config, 6);  // dar:fence2
+
     // P2P barrier exchange.
     if (tid < ws) {
       dc_st_flag_release(
@@ -1937,7 +1957,7 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();
   }
 
-  DC_TIMESTAMP(config, 6);  // dar:barrier
+  DC_TIMESTAMP(config, 7);  // dar:p2p_wait
 
   // Sum per-sender dispatch counts (available after
   // barrier). Each sender pushed its section count
@@ -1958,7 +1978,7 @@ __global__ void dispatch_and_route_kernel(
   // Block 0: parallel preload + deterministic router +
   // zero expert_num_tokens. Other blocks spin-wait on
   // routing_ready_flag.
-  DC_TIMESTAMP(config, 7);  // dar:phase_c_route
+  DC_TIMESTAMP(config, 8);  // dar:phase_c_preload
 
   if (blockIdx.x == 0) {
     // Reuse shared[] for Phase C preload layout.
@@ -2002,6 +2022,8 @@ __global__ void dispatch_and_route_kernel(
       rank_active[r] = 0;
     }
     __syncthreads();
+
+    DC_TIMESTAMP(config, 9);  // dar:phase_c_route
 
     // Sequential routing (thread 0 only).
     // All reads from shared memory (~1 cycle each).
@@ -2078,7 +2100,7 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase D2: Single-pass fill + routing filter ----
-  DC_TIMESTAMP(config, 8);  // dar:phase_d2_filter
+  DC_TIMESTAMP(config, 10);  // dar:phase_d2_filter
 
   // For each entry: write sentinel defaults, then check
   // if real and overwrite. Single pass ensures no cross-
@@ -2189,7 +2211,7 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, 9);  // dar:end
+  DC_TIMESTAMP(config, 11);  // dar:end
 }
 
 }  // namespace dispatch_combine
