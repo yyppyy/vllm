@@ -168,7 +168,7 @@ struct DispatchCombineConfig {
 
 // Number of timestamp slots per kernel.
 constexpr int kDarNumSteps = 19;
-constexpr int kCasNumSteps = 10;
+constexpr int kCasNumSteps = 13;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
 
@@ -202,14 +202,17 @@ inline const char* cas_step_name(int i) {
   static const char* names[] = {
     "cas:read_counters",     // 0
     "cas:zero_accum",        // 1
-    "cas:scan_write",        // 2
-    "cas:staggered_fence",   // 3  fence#1 drain
-    "cas:grid_sync",         // 4  grid-wide sync
-    "cas:offset_push",       // 5  NVLink stores
-    "cas:fence2",            // 6  fence#2 drain
-    "cas:p2p_wait",          // 7  P2P flag exchange
-    "cas:scatter_add",       // 8  scatter-add
-    "cas:end",               // 9
+    "cas:scan_write",        // 2  scan_write start
+    "cas:sw_scan",           // 3  thread-0 scan done
+    "cas:sw_zero",           // 4  accum zeroed
+    "cas:sw_accum",          // 5  HBM accumulation
+    "cas:staggered_fence",   // 6  fence#1 drain
+    "cas:grid_sync",         // 7  grid-wide sync
+    "cas:offset_push",       // 8  NVLink stores
+    "cas:fence2",            // 9  fence#2 drain
+    "cas:p2p_wait",          // 10 P2P flag exchange
+    "cas:scatter_add",       // 11 scatter-add
+    "cas:end",               // 12
   };
   return (i < kCasNumSteps) ? names[i] : "cas:?";
 }
@@ -837,6 +840,9 @@ __global__ void combine_and_scatter_kernel(
     }
     __syncthreads();
 
+    DC_TIMESTAMP(config, kDarNumSteps + 3);
+    // cas:sw_scan — thread-0 scan + group + claim done
+
     // Single-pass local reduction + NVLink write.
     // Each thread owns its k-positions across ALL
     // accumulators — no inter-thread data dependency,
@@ -851,6 +857,9 @@ __global__ void combine_and_scatter_kernel(
            k += blockDim.x)
         s_accum[k] = 0.0f;
 
+      DC_TIMESTAMP(config, kDarNumSteps + 4);
+      // cas:sw_zero — accumulators zeroed
+
       // Accumulate all entries in one pass.
       for (int32_t i = 0; i < nv; i++) {
         int32_t u = s_batch_uid[i];
@@ -862,6 +871,9 @@ __global__ void combine_and_scatter_kernel(
           s_accum[u * K + k] +=
               static_cast<float>(src[k]) * w;
       }
+
+      DC_TIMESTAMP(config, kDarNumSteps + 5);
+      // cas:sw_accum — HBM reads + accumulation done
 
       // Write all reduced vectors to NVLink.
       for (int32_t u = 0; u < nu; u++) {
@@ -931,7 +943,7 @@ __global__ void combine_and_scatter_kernel(
       }
     }
 
-    DC_TIMESTAMP(config, kDarNumSteps + 3);
+    DC_TIMESTAMP(config, kDarNumSteps + 6);
     // cas:staggered_fence (removed — deferred to per-block)
 
     // fence#1 removed: NVLink stores drain in background
@@ -946,7 +958,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Grid sync + P2P barrier ----
-  DC_TIMESTAMP(config, kDarNumSteps + 4);
+  DC_TIMESTAMP(config, kDarNumSteps + 7);
   // cas:grid_sync
 
   // Block 0 waits for kPersistentGrid (one increment
@@ -963,7 +975,7 @@ __global__ void combine_and_scatter_kernel(
     }
     __syncthreads();
 
-    DC_TIMESTAMP(config, kDarNumSteps + 5);
+    DC_TIMESTAMP(config, kDarNumSteps + 8);
     // cas:offset_push
 
     const int32_t tid = threadIdx.x;
@@ -978,12 +990,12 @@ __global__ void combine_and_scatter_kernel(
       config->local_combine_counters[tid] = 0;
     }
 
-    DC_TIMESTAMP(config, kDarNumSteps + 6);
+    DC_TIMESTAMP(config, kDarNumSteps + 9);
     // cas:fence2
 
     __threadfence_system();
 
-    DC_TIMESTAMP(config, kDarNumSteps + 7);
+    DC_TIMESTAMP(config, kDarNumSteps + 10);
     // cas:p2p_wait
 
     if (tid < ws) {
@@ -1022,7 +1034,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 3: Scatter-add to fp32 accum ----
-  DC_TIMESTAMP(config, kDarNumSteps + 8);  // cas:scatter_add
+  DC_TIMESTAMP(config, kDarNumSteps + 11);  // cas:scatter_add
   // (timestamp after barrier, before scatter-add)
 
   // Native fp32 atomicAdd: no CAS loop, no adjacent-
@@ -1061,7 +1073,7 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, kDarNumSteps + 9);  // cas:end
+  DC_TIMESTAMP(config, kDarNumSteps + 12);  // cas:end
 }
 
 // ====================================================================

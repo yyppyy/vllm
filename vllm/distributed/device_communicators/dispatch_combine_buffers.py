@@ -29,7 +29,7 @@ _DC_PROFILE_INTERVAL = int(
 # Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
 # in dispatch_combine.cuh.
 _DAR_NUM_STEPS = 19
-_CAS_NUM_STEPS = 10
+_CAS_NUM_STEPS = 13
 _TOTAL_PROFILE_SLOTS = _DAR_NUM_STEPS + _CAS_NUM_STEPS
 
 _DAR_STEP_NAMES = [
@@ -57,14 +57,17 @@ _DAR_STEP_NAMES = [
 _CAS_STEP_NAMES = [
     "read_counters",     # 0
     "zero_accum",        # 1
-    "scan_write",        # 2
-    "staggered_fence",   # 3  fence#1 drain
-    "grid_sync",         # 4  grid-wide sync
-    "offset_push",       # 5  NVLink stores
-    "fence2",            # 6  fence#2 drain
-    "p2p_wait",          # 7  P2P flag exchange
-    "scatter_add",       # 8
-    "end",               # 9
+    "scan_write",        # 2  scan_write start
+    "sw_scan",           # 3  thread-0 scan done
+    "sw_zero",           # 4  accum zeroed
+    "sw_accum",          # 5  HBM accumulation
+    "staggered_fence",   # 6  fence#1 drain
+    "grid_sync",         # 7  grid-wide sync
+    "offset_push",       # 8  NVLink stores
+    "fence2",            # 9  fence#2 drain
+    "p2p_wait",          # 10 P2P flag exchange
+    "scatter_add",       # 11 scatter-add
+    "end",               # 12
 ]
 
 logger = init_logger(__name__)
