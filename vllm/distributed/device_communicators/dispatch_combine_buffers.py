@@ -28,7 +28,7 @@ _DC_PROFILE_INTERVAL = int(
 
 # Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
 # in dispatch_combine.cuh.
-_DAR_NUM_STEPS = 16
+_DAR_NUM_STEPS = 19
 _CAS_NUM_STEPS = 10
 _TOTAL_PROFILE_SLOTS = _DAR_NUM_STEPS + _CAS_NUM_STEPS
 
@@ -46,9 +46,12 @@ _DAR_STEP_NAMES = [
     "fence2",            # 10 fence#2 drain
     "p2p_wait",          # 11 P2P flag exchange
     "phase_c_preload",   # 12 smem preload
-    "phase_c_route",     # 13 routing compute
-    "phase_d2_filter",   # 14
-    "end",               # 15
+    "phase_c_route",     # 13 routing start
+    "route_pass1",       # 14 parallel rc==1
+    "route_pass2",       # 15 sequential rc>1
+    "route_writeback",   # 16 write+zero+fence
+    "phase_d2_filter",   # 17
+    "end",               # 18
 ]
 
 _CAS_STEP_NAMES = [

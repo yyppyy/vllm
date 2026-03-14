@@ -167,7 +167,7 @@ struct DispatchCombineConfig {
 };
 
 // Number of timestamp slots per kernel.
-constexpr int kDarNumSteps = 16;
+constexpr int kDarNumSteps = 19;
 constexpr int kCasNumSteps = 10;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
@@ -188,9 +188,12 @@ inline const char* dar_step_name(int i) {
     "dar:fence2",            // 10 fence#2 drain
     "dar:p2p_wait",          // 11 P2P flag exchange
     "dar:phase_c_preload",   // 12 smem preload
-    "dar:phase_c_route",     // 13 routing compute
-    "dar:phase_d2_filter",   // 14
-    "dar:end",               // 15
+    "dar:phase_c_route",     // 13 routing start
+    "dar:route_pass1",       // 14 parallel rc==1
+    "dar:route_pass2",       // 15 sequential rc>1
+    "dar:route_writeback",   // 16 write+zero+fence
+    "dar:phase_d2_filter",   // 17
+    "dar:end",               // 18
   };
   return (i < kDarNumSteps) ? names[i] : "dar:?";
 }
@@ -2066,6 +2069,8 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
+    DC_TIMESTAMP(config, 14);  // dar:route_pass1
+
     // Pass 2 (sequential): Route multi-replica experts.
     // Greedy load-balanced assignment starting from the
     // rank_active[] base computed by Pass 1. Sequential
@@ -2104,6 +2109,8 @@ __global__ void dispatch_and_route_kernel(
     }
     __syncthreads();
 
+    DC_TIMESTAMP(config, 15);  // dar:route_pass2
+
     // Write routing_selection to global memory.
     for (int32_t e = threadIdx.x; e < NL;
          e += blockDim.x) {
@@ -2124,6 +2131,7 @@ __global__ void dispatch_and_route_kernel(
       dc_st_flag_release(
           config->routing_ready_flag, rf_expected);
     }
+    DC_TIMESTAMP(config, 16);  // dar:route_writeback
   } else {
     // Wait for routing to complete (blocks 1-31).
     if (threadIdx.x == 0) {
@@ -2137,7 +2145,7 @@ __global__ void dispatch_and_route_kernel(
   }
 
   // ---- Phase D2: Single-pass fill + routing filter ----
-  DC_TIMESTAMP(config, 14);  // dar:phase_d2_filter
+  DC_TIMESTAMP(config, 17);  // dar:phase_d2_filter
 
   // For each entry: write sentinel defaults, then check
   // if real and overwrite. Single pass ensures no cross-
@@ -2248,7 +2256,7 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, 15);  // dar:end
+  DC_TIMESTAMP(config, 18);  // dar:end
 }
 
 }  // namespace dispatch_combine
