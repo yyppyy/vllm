@@ -2025,24 +2025,42 @@ __global__ void dispatch_and_route_kernel(
 
     DC_TIMESTAMP(config, 9);  // dar:phase_c_route
 
-    // Sequential routing (thread 0 only).
-    // All reads from shared memory (~1 cycle each).
+    // ---- Two-pass routing ----
+    // Pass 1 (parallel): Route single-replica experts.
+    // Their routing is fixed (only one physical target),
+    // so all threads can assign them in parallel.
+    // Integer atomicAdd on smem is order-independent,
+    // guaranteeing identical rank_active[] on every rank.
+    for (int32_t e = threadIdx.x; e < NL;
+         e += blockDim.x) {
+      const int32_t count = s_expert_sum[e];
+      if (count == 0) continue;
+      int32_t rc = s_replica_count[e];
+      if (rc <= 0) continue;
+      if (rc > max_rep) rc = max_rep;
+      if (rc == 1) {
+        const int32_t phys =
+            s_l2p_map[e * max_rep];
+        routing_sel[e] = phys;
+        atomicAdd(&rank_active[phys / epr], count);
+      }
+    }
+    __syncthreads();
+
+    // Pass 2 (sequential): Route multi-replica experts.
+    // Greedy load-balanced assignment starting from the
+    // rank_active[] base computed by Pass 1. Sequential
+    // processing in expert-index order ensures identical
+    // decisions on every rank.
     if (threadIdx.x == 0) {
       for (int32_t e = 0; e < NL; e++) {
+        // Skip experts already routed in Pass 1.
+        if (routing_sel[e] != -1) continue;
         const int32_t count = s_expert_sum[e];
         if (count == 0) continue;
-
         int32_t rc = s_replica_count[e];
         if (rc <= 0) continue;
         if (rc > max_rep) rc = max_rep;
-
-        if (rc == 1) {
-          const int32_t phys =
-              s_l2p_map[e * max_rep];
-          routing_sel[e] = phys;
-          rank_active[phys / epr] += count;
-          continue;
-        }
 
         // Multiple replicas: pick minimum-loaded rank
         // (ties: lower rank for determinism).
