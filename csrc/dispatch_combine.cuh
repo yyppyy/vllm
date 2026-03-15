@@ -1135,14 +1135,14 @@ __global__ void dar_compact_kernel(
       const int32_t original_idx = section_start + i;
       const int32_t compact_idx = compact_base + i;
 
-      // Remap data_remap: leader is in same section,
-      // so leader_compact = compact_base + (leader -
-      // section_start).
+      // Map compact position to original position of
+      // the dedup leader. dispatch_recv_tensor has data
+      // at original (scattered) positions, so the gather
+      // in _receiver() needs original indices.
       const int32_t leader_original =
           data_remap[original_idx];
       compact_data_remap[compact_idx] =
-          compact_base
-          + (leader_original - section_start);
+          leader_original;
 
       // Copy expert_topk_ids and weights.
       compact_expert_topk_ids[compact_idx] =

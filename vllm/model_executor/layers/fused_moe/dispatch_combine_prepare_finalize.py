@@ -139,7 +139,11 @@ class DispatchCombinePrepareAndFinalize(
         # Reset compact_reverse to identity if integrated
         # routing is configured (previous call may have
         # modified it via dar_compact).
-        if self.use_integrated_routing:
+        # Guard: compact_reverse_buf is lazily allocated
+        # in init_prepare_buffers(), which may not have
+        # been called yet (e.g. during profile_run).
+        if (self.use_integrated_routing
+                and mgr.expert_num_tokens_buf is not None):
             torch.arange(
                 self.max_recv,
                 out=mgr.compact_reverse_buf)
