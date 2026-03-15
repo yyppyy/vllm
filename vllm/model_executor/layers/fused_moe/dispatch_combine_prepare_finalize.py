@@ -26,6 +26,13 @@ from vllm.model_executor.layers.fused_moe.utils import (
 
 logger = init_logger(__name__)
 
+# Read env var directly to avoid circular import
+# with layer.py (which imports this module).
+import os
+_MOE_LOAD_PROFILE_INTERVAL = int(
+    os.environ.get('VLLM_MOE_LOAD_PROFILE_INTERVAL',
+                    '0'))
+
 # Use integrated dispatch_and_route only when batch
 # size per GPU is at most this threshold. For larger
 # batches (prefill), fall back to standalone dispatch_p2p
@@ -325,6 +332,19 @@ class DispatchCombinePrepareAndFinalize(
             self.rank_expert_offset:
             self.rank_expert_offset
             + self.num_local_experts]
+
+        # MoE load profiling (dispatch_combine path).
+        if _MOE_LOAD_PROFILE_INTERVAL > 0:
+            from vllm.model_executor.layers.fused_moe.layer \
+                import _moe_load_profiler
+            _moe_load_profiler.record(
+                M=a1_orig.shape[0],
+                expert_num_tokens=expert_num_tokens,
+                ep_rank=self.rank_,
+                ep_size=self.world_size_,
+                experts_per_rank=self.experts_per_rank,
+                num_local_experts=self.num_local_experts,
+            )
 
         # expert_num_tokens_cpu=None for CUDA graph
         # compat (no D2H during graph capture).

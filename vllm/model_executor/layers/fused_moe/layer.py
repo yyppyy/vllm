@@ -87,7 +87,108 @@ if current_platform.is_tpu():
 else:
     fused_moe_pallas = None  # type: ignore
 
+import os
+
 logger = init_logger(__name__)
+
+# MoE load profiling: set VLLM_MOE_LOAD_PROFILE_INTERVAL=N
+# to print per-batch-size load stats every N MoE-layer calls.
+_MOE_LOAD_PROFILE_INTERVAL = int(
+    os.environ.get('VLLM_MOE_LOAD_PROFILE_INTERVAL', '0'))
+
+
+class _MoELoadProfiler:
+    """Accumulates per-batch-size MoE load stats and
+    prints periodically."""
+
+    def __init__(self):
+        self._call_count = 0
+        self._stats: dict[int, dict] = {}
+
+    def record(self, M: int,
+               expert_num_tokens: torch.Tensor,
+               ep_rank: int, ep_size: int,
+               experts_per_rank: int,
+               num_local_experts: int):
+        """Record load stats from expert_num_tokens.
+
+        expert_num_tokens: GPU tensor of shape
+            (total_physical_experts,).
+        """
+        if _MOE_LOAD_PROFILE_INTERVAL <= 0:
+            return
+
+        self._call_count += 1
+
+        # Per-rank token totals.
+        per_rank = []
+        for r in range(ep_size):
+            s = r * experts_per_rank
+            e = s + experts_per_rank
+            per_rank.append(
+                expert_num_tokens[s:e].sum().item())
+
+        # Activated experts on THIS rank.
+        s = ep_rank * experts_per_rank
+        e = s + num_local_experts
+        activated = int(
+            (expert_num_tokens[s:e] > 0).sum().item())
+
+        if M not in self._stats:
+            self._stats[M] = {
+                "activated_sum": 0,
+                "count": 0,
+                "per_rank_sum": [0] * ep_size,
+            }
+        st = self._stats[M]
+        st["activated_sum"] += activated
+        st["count"] += 1
+        for r in range(ep_size):
+            st["per_rank_sum"][r] += per_rank[r]
+
+        if (self._call_count
+                % _MOE_LOAD_PROFILE_INTERVAL == 0):
+            self._print_and_reset(
+                ep_rank, num_local_experts)
+
+    def record_from_topk_ids(
+            self, M: int,
+            topk_ids: torch.Tensor,
+            global_num_experts: int,
+            ep_rank: int, ep_size: int):
+        """Compute expert_num_tokens from topk_ids
+        via bincount, then record."""
+        if _MOE_LOAD_PROFILE_INTERVAL <= 0:
+            return
+        expert_num_tokens = torch.bincount(
+            topk_ids.flatten().long(),
+            minlength=global_num_experts)
+        experts_per_rank = global_num_experts // ep_size
+        self.record(
+            M, expert_num_tokens, ep_rank, ep_size,
+            experts_per_rank, experts_per_rank)
+
+    def _print_and_reset(self, ep_rank: int,
+                         num_local_experts: int):
+        for M in sorted(self._stats):
+            s = self._stats[M]
+            n = s["count"]
+            avg_act = s["activated_sum"] / n
+            ws = len(s["per_rank_sum"])
+            avg_pr = [s["per_rank_sum"][r] / n
+                      for r in range(ws)]
+            logger.info(
+                "[MoE Load Profile] rank=%d | M=%d "
+                "calls=%d avg_activated=%.1f/%d "
+                "avg_tokens_per_rank=%s",
+                ep_rank, M, n, avg_act,
+                num_local_experts,
+                [f"{v:.0f}" for v in avg_pr])
+        self._stats.clear()
+        self._call_count = 0
+
+
+_moe_load_profiler = _MoELoadProfiler()
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -647,6 +748,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             ep_rank=self.moe.moe_parallel_config.ep_rank,
             topk_tensor=topk_ids
         )
+
+        # MoE load profiling (non-dispatch_combine backends).
+        # dispatch_combine logs in _receiver() with accurate
+        # post-dispatch expert_num_tokens instead.
+        if _MOE_LOAD_PROFILE_INTERVAL > 0:
+            _is_dc = (
+                self.fused_experts is not None
+                and hasattr(
+                    self.fused_experts, 'prepare_finalize')
+                and isinstance(
+                    self.fused_experts.prepare_finalize,
+                    DispatchCombinePrepareAndFinalize))
+            if not _is_dc:
+                _moe_load_profiler.record_from_topk_ids(
+                    M=x.shape[0],
+                    topk_ids=topk_ids,
+                    global_num_experts=global_num_experts,
+                    ep_rank=(self.moe.moe_parallel_config
+                             .ep_rank),
+                    ep_size=(self.moe.moe_parallel_config
+                             .ep_size),
+                )
 
         if self.rocm_aiter_moe_enabled:
             assert self.fused_experts is None
