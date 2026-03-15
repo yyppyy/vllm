@@ -31,6 +31,9 @@ MAX_TOKEN_PER_BATCH=4096
 MAX_REQ_PER_BATCH=$BATCH_SIZE
 NUM_PROMPTS=$((BATCH_SIZE * NUM_GPUS))
 
+# export VLLM_DC_SPLIT_KERNELS=1 # split kernel debug
+# export VLLM_DC_PROFILE=10 # time breakdown debug
+
 args=(
   serve Qwen/Qwen3-30B-A3B
   --port "$PORT"
@@ -43,6 +46,7 @@ args=(
   --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
 )
+  # --enforce-eager
 
 if (( USE_EP > 0 )); then
   args+=( --enable-expert-parallel )
