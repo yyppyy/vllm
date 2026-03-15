@@ -136,9 +136,12 @@ def shuffle_layer(
                                           expert_weights_buffer):
                     buffer[dst].copy_(weight[src])
 
-    p2p_ops: list[P2POp] = []
+    # Per-expert P2P op groups: each expert's sends and
+    # receives are grouped together so chunked execution
+    # keeps matched pairs in the same batch (avoids deadlock).
+    expert_p2p_ops: dict[int, list[P2POp]] = {}
 
-    # 2. Initiate sending of weights.
+    # 2. Build SEND ops grouped by expert.
     experts_send_loc: dict[int, int] = {}
     for src in range(num_local_experts):
         expert = old_indices[local2global(src)]
@@ -172,15 +175,15 @@ def shuffle_layer(
 
         for dst in recv_ranks:
             dst_global = get_global_rank(ep_group, dst)
-            p2p_ops += [
+            expert_p2p_ops.setdefault(expert, []).extend([
                 P2POp(
                     torch.distributed.isend,
                     weight[src],
                     dst_global,
                 ) for weight in expert_weights
-            ]
+            ])
 
-    # 3. Initiate receiving of weights.
+    # 3. Build RECV ops grouped by expert.
     experts_recv_loc: dict[int, int] = {}
     for dst in range(num_local_experts):
         if is_received_locally[dst]:
@@ -211,19 +214,27 @@ def shuffle_layer(
             src = ranks_to_send[recver_pos - remainder_start]
 
         src_global = get_global_rank(ep_group, src)
-        p2p_ops += [
+        expert_p2p_ops.setdefault(expert, []).extend([
             P2POp(
                 torch.distributed.irecv,
                 weight[dst],
                 src_global,
             ) for weight in expert_weights_buffer
-        ]
+        ])
 
-    # 4. Execute the P2P operations. The real communication happens here.
-    if p2p_ops:
-        reqs = batch_isend_irecv(p2p_ops)
-        for req in reqs:
-            req.wait()
+    # 4. Execute P2P ops in chunks to limit NCCL staging
+    # memory. Processing a few experts at a time keeps peak
+    # NCCL buffer usage under ~300MB instead of ~1.2GB+.
+    _EPLB_P2P_CHUNK = 4  # experts per batch
+    sorted_experts = sorted(expert_p2p_ops.keys())
+    for i in range(0, len(sorted_experts), _EPLB_P2P_CHUNK):
+        chunk_ops: list[P2POp] = []
+        for e in sorted_experts[i:i + _EPLB_P2P_CHUNK]:
+            chunk_ops.extend(expert_p2p_ops[e])
+        if chunk_ops:
+            reqs = batch_isend_irecv(chunk_ops)
+            for req in reqs:
+                req.wait()
 
     # 5. Copy the weights from the buffer back to the original weights.
     for dst in range(num_local_experts):
@@ -302,6 +313,7 @@ def rearrange_expert_weights_inplace(
     # A buffer to hold the expert weights in one layer during the exchange.
     # NOTE: Currently we assume the same weights across different layers
     # have the same shape.
+    torch.cuda.empty_cache()
     expert_weights_buffer = [torch.empty_like(w) for w in expert_weights[0]]
 
     if is_profile:
