@@ -1764,8 +1764,19 @@ class FusedMoE(CustomOp):
 
         mgr = pf.p2p_manager
         NL = ltp.shape[0]
-        max_replicas = ltp.shape[1]
         epr = pf.experts_per_rank
+        ws = pf.world_size_
+
+        # Dedup by rank: the EPLB greedy algorithm may
+        # place multiple physical copies of the same
+        # logical expert on the same rank, inflating
+        # max_replicas beyond world_size. For dispatch
+        # we only need one physical target per rank.
+        if ltp.shape[1] > ws:
+            ltp, lrc = self._dedup_ltp_by_rank(
+                ltp, lrc, epr, ws)
+
+        max_replicas = ltp.shape[1]
 
         # Allocate IPC buffers (idempotent).
         mgr.init_integrated_routing(
@@ -1775,6 +1786,42 @@ class FusedMoE(CustomOp):
 
         pf.use_integrated_routing = True
         pf.expert_load_view = self.expert_load_view
+
+    @staticmethod
+    def _dedup_ltp_by_rank(
+        ltp: torch.Tensor,
+        lrc: torch.Tensor,
+        epr: int,
+        ws: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dedup logical_to_physical_map by rank.
+
+        Keep at most one physical expert per rank per
+        logical expert. Returns (deduped_ltp, deduped_lrc)
+        with ltp.shape[1] == ws.
+        """
+        NL = ltp.shape[0]
+        dev = ltp.device
+        out_ltp = torch.full(
+            (NL, ws), -1,
+            dtype=torch.int32, device=dev)
+        out_lrc = torch.zeros(
+            NL, dtype=torch.int64, device=dev)
+        for e in range(NL):
+            seen = set()
+            rc = int(lrc[e].item())
+            idx = 0
+            for r in range(min(rc, ltp.shape[1])):
+                phys = int(ltp[e, r].item())
+                if phys < 0:
+                    break
+                rank = phys // epr
+                if rank not in seen:
+                    seen.add(rank)
+                    out_ltp[e, idx] = phys
+                    idx += 1
+            out_lrc[e] = idx
+        return out_ltp, out_lrc
 
     def _get_prepare_finalize(self):
         """Get the PrepareAndFinalize from quant_method."""
