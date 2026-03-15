@@ -223,14 +223,24 @@ def shuffle_layer(
         ])
 
     # 4. Execute P2P ops in chunks to limit NCCL staging
-    # memory. Processing a few experts at a time keeps peak
-    # NCCL buffer usage under ~300MB instead of ~1.2GB+.
+    # memory. Use the global expert set (derived from
+    # old/new_indices which are identical on every rank) so
+    # all ranks share the same chunk boundaries — otherwise
+    # mismatched batches cause NCCL deadlock.
     _EPLB_P2P_CHUNK = 4  # experts per batch
-    sorted_experts = sorted(expert_p2p_ops.keys())
+    all_experts: set[int] = set()
+    for e in old_indices:
+        if e != -1:
+            all_experts.add(e)
+    for e in new_indices:
+        if e != -1:
+            all_experts.add(e)
+    sorted_experts = sorted(all_experts)
     for i in range(0, len(sorted_experts), _EPLB_P2P_CHUNK):
         chunk_ops: list[P2POp] = []
         for e in sorted_experts[i:i + _EPLB_P2P_CHUNK]:
-            chunk_ops.extend(expert_p2p_ops[e])
+            if e in expert_p2p_ops:
+                chunk_ops.extend(expert_p2p_ops[e])
         if chunk_ops:
             reqs = batch_isend_irecv(chunk_ops)
             for req in reqs:
