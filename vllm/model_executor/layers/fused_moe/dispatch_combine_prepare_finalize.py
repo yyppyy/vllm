@@ -26,6 +26,13 @@ from vllm.model_executor.layers.fused_moe.utils import (
 
 logger = init_logger(__name__)
 
+# Use integrated dispatch_and_route only when batch
+# size per GPU is at most this threshold. For larger
+# batches (prefill), fall back to standalone dispatch_p2p
+# + prepare_dispatch_recv which avoids the overhead of
+# GPU-side routing, all-reduce, and compaction.
+INTEGRATED_ROUTING_MAX_M = 256
+
 
 class DispatchCombinePrepareAndFinalize(
         mk.FusedMoEPrepareAndFinalize):
@@ -109,7 +116,15 @@ class DispatchCombinePrepareAndFinalize(
 
         mgr = self.p2p_manager
 
-        if self.use_integrated_routing:
+        # Use integrated routing only for small batches.
+        # Large batches (prefill) use standalone dispatch
+        # to avoid GPU-side routing overhead.
+        use_integrated = (
+            self.use_integrated_routing
+            and M <= INTEGRATED_ROUTING_MAX_M)
+        self._used_integrated = use_integrated
+
+        if use_integrated:
             return self._prepare_integrated(
                 a1, topk_weights, topk_ids,
                 num_experts, expert_map,
@@ -120,6 +135,14 @@ class DispatchCombinePrepareAndFinalize(
         # the full buffer to reach all sections.
         self._mc = self.max_recv
         self._mc_full = self.max_recv
+
+        # Reset compact_reverse to identity if integrated
+        # routing is configured (previous call may have
+        # modified it via dar_compact).
+        if self.use_integrated_routing:
+            torch.arange(
+                self.max_recv,
+                out=mgr.compact_reverse_buf)
 
         # Step 1: Launch dispatch P2P kernel.
         # No pre-dispatch barrier needed: dispatch_offset
@@ -147,6 +170,14 @@ class DispatchCombinePrepareAndFinalize(
          expert_num_tokens) = (
             mgr.gpu_prepare_dispatch_recv(
                 self._mc, num_experts))
+
+        # Track load for EPLB even in fallback path.
+        if self.use_integrated_routing:
+            elv = getattr(
+                self, 'expert_load_view', None)
+            if elv is not None:
+                elv.add_(
+                    expert_num_tokens.to(elv.dtype))
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,
@@ -245,7 +276,7 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
         mc = self._mc
 
-        if self.use_integrated_routing:
+        if self._used_integrated:
             # Compacted path: gather mc_compact entries
             # using compact_data_remap which combines
             # section compaction + co-located dedup.

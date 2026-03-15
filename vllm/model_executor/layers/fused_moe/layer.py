@@ -599,17 +599,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         zero_expert_num = getattr(layer, 'zero_expert_num', 0)
         zero_expert_type = getattr(layer, 'zero_expert_type', None)
 
-        # When integrated routing is active, skip
-        # pre-dispatch EPLB mapping — the fused dispatch
-        # kernel handles routing internally with global
-        # demand visibility.
+        # When integrated routing is active AND batch is
+        # small enough, skip pre-dispatch EPLB mapping —
+        # the fused dispatch kernel handles routing
+        # internally with global demand visibility.
+        # For large batches (M > threshold), fall back to
+        # standalone dispatch which needs physical IDs.
+        from vllm.model_executor.layers.fused_moe\
+            .dispatch_combine_prepare_finalize import (
+                INTEGRATED_ROUTING_MAX_M)
         _ir = (enable_eplb
                and self.fused_experts is not None
                and hasattr(
                    self.fused_experts, 'prepare_finalize')
                and getattr(
                    self.fused_experts.prepare_finalize,
-                   'use_integrated_routing', False))
+                   'use_integrated_routing', False)
+               and x.shape[0]
+                   <= INTEGRATED_ROUTING_MAX_M)
         eplb_for_select = enable_eplb and not _ir
 
         topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
