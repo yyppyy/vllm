@@ -979,7 +979,8 @@ class DispatchCombineP2PManager:
                 M, K, topk, mc,
                 num_experts,
                 self._num_logical_experts,
-                self.world_size)
+                self.world_size,
+                self._max_replicas)
 
         if self._profiling_enabled:
             self._read_and_accumulate_timestamps('dar')

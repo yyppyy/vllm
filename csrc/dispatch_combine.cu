@@ -385,7 +385,8 @@ void dispatch_and_route(
     int64_t mc,
     int64_t num_physical_experts,
     int64_t num_logical_experts,
-    int64_t world_size) {
+    int64_t world_size,
+    int64_t max_replicas) {
 
   if (M == 0) return;
 
@@ -404,6 +405,8 @@ void dispatch_and_route(
       static_cast<int32_t>(num_logical_experts);
   const int32_t ws =
       static_cast<int32_t>(world_size);
+  const int32_t mr =
+      static_cast<int32_t>(max_replicas);
 
   // expert_num_tokens zeroed inline by kernel (Phase C,
   // block 0, before routing_ready_flag signal).
@@ -414,22 +417,21 @@ void dispatch_and_route(
   // Phase A allgather writes to this IPC buffer.
 
   // Shared memory: max of scan_write and Phase C needs.
-  // Scan_write: NL + ws + 3*64 + NL + NL*kMaxRep ints
+  // Scan_write: NL + ws + 3*64 + NL + NL*mr ints
   //   (expert_counts + grp_count + entries
   //    + preloaded replica_count + l2p_map).
-  // Phase C: 3*NL + NL*kMaxRep + ws ints
+  // Phase C: 3*NL + NL*mr + ws ints
   //   (s_expert_sum[NL] + s_replica_count[NL]
-  //    + s_l2p_map[NL*kMaxRep] + routing_sel[NL]
+  //    + s_l2p_map[NL*mr] + routing_sel[NL]
   //    + rank_active[ws]).
   // Phases don't overlap, so same memory is reused.
   constexpr int32_t kMaxEntries = 64;
-  constexpr int32_t kMaxRep = 2;
   size_t phase_a_bytes = static_cast<size_t>(
       (2 * NL + ws + 3 * kMaxEntries
-       + NL * kMaxRep)
+       + NL * mr)
       * sizeof(int32_t));
   size_t phase_c_bytes = static_cast<size_t>(
-      (3 * NL + NL * kMaxRep + ws + NL + 1)
+      (3 * NL + NL * mr + ws + NL + 1)
       * sizeof(int32_t));
   size_t shared_bytes = phase_a_bytes > phase_c_bytes
       ? phase_a_bytes : phase_c_bytes;
