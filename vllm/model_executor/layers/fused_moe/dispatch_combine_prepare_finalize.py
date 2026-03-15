@@ -10,17 +10,9 @@ compatibility. Synchronization uses NCCL all-reduce barriers on the
 EP device group instead of host-side torch.cuda.synchronize() or
 dist.barrier(cpu_group).
 """
-import os
 from typing import Callable, Optional
 
 import torch
-
-# When set, dispatch_and_route and combine_and_scatter
-# are split into per-phase kernels for profiling with
-# nsys/ncu. Default: fused (0).
-_DC_SPLIT_KERNELS = (
-    os.environ.get('VLLM_DC_SPLIT_KERNELS', '0')
-    == '1')
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
@@ -202,58 +194,28 @@ class DispatchCombinePrepareAndFinalize(
         if mgr.expert_num_tokens_buf is None:
             mgr.init_prepare_buffers(num_experts)
 
-        if _DC_SPLIT_KERNELS:
-            # Split-phase path: 6 separate kernels
-            # for per-phase latency profiling.
-            mgr.gpu_dar_phase_a(
-                a1, topk_ids_i32, topk_weights_f32,
-                M, K, topk)
-            mgr.gpu_dar_push_and_barrier()
-            mgr.gpu_dar_phase_c()
-            mgr.gpu_dar_phase_d1(num_experts)
-            mgr.gpu_dar_phase_d2(
-                self._mc_full, num_experts)
-            # Compact: gather valid entries from
-            # scattered sections into contiguous
-            # positions [0, mc_compact).
-            mgr.gpu_dar_compact(
-                self._mc, num_experts)
-            mgr.gpu_dar_phase_e()
-
-            expert_topk_ids = (
-                mgr.compact_expert_topk_ids_buf[
-                    :self._mc]
-                .unsqueeze(1))
-            expert_topk_weights = (
-                mgr.compact_expert_topk_weights_buf[
-                    :self._mc]
-                .unsqueeze(1))
-            expert_num_tokens = (
-                mgr.expert_num_tokens_buf)
-            data_remap = None  # Folded into compact
-        else:
-            # Fused path: single kernel launch.
-            (expert_topk_ids,
-             expert_topk_weights,
-             expert_num_tokens,
-             _data_remap) = (
-                mgr.gpu_dispatch_and_route(
-                    a1, topk_ids_i32,
-                    topk_weights_f32,
-                    self._mc_full, M, K, topk,
-                    num_experts))
-            # Compact after fused kernel.
-            mgr.gpu_dar_compact(
-                self._mc, num_experts)
-            expert_topk_ids = (
-                mgr.compact_expert_topk_ids_buf[
-                    :self._mc]
-                .unsqueeze(1))
-            expert_topk_weights = (
-                mgr.compact_expert_topk_weights_buf[
-                    :self._mc]
-                .unsqueeze(1))
-            data_remap = None  # Folded into compact
+        # Fused path: single kernel launch.
+        (expert_topk_ids,
+         expert_topk_weights,
+         expert_num_tokens,
+         _data_remap) = (
+            mgr.gpu_dispatch_and_route(
+                a1, topk_ids_i32,
+                topk_weights_f32,
+                self._mc_full, M, K, topk,
+                num_experts))
+        # Compact after fused kernel.
+        mgr.gpu_dar_compact(
+            self._mc, num_experts)
+        expert_topk_ids = (
+            mgr.compact_expert_topk_ids_buf[
+                :self._mc]
+            .unsqueeze(1))
+        expert_topk_weights = (
+            mgr.compact_expert_topk_weights_buf[
+                :self._mc]
+            .unsqueeze(1))
+        data_remap = None  # Folded into compact
 
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
@@ -398,21 +360,11 @@ class DispatchCombinePrepareAndFinalize(
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc_full]
             .contiguous().view(torch.uint8))
-        if _DC_SPLIT_KERNELS:
-            # Split path: 3 separate kernels.
-            mgr.gpu_combine_p2p(
-                fused_expert_output,
-                meta_bytes, mc_full)
-            mgr.gpu_p2p_barrier_reset_dispatch()
-            mgr.gpu_scatter_add_direct(
-                output, mc_full)
-        else:
-            # Fused path: single kernel launch.
-            mgr.gpu_combine_and_scatter(
-                fused_expert_output,
-                meta_bytes,
-                output,
-                mc_full)
+        mgr.gpu_combine_and_scatter(
+            fused_expert_output,
+            meta_bytes,
+            output,
+            mc_full)
 
         if do_async:
             return lambda: None

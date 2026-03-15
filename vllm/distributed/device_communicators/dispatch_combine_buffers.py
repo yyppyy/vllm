@@ -625,66 +625,6 @@ class DispatchCombineP2PManager:
             self.config_tensor,
             mc, self.hidden_dim)
 
-    # ================================================================
-    # Split-phase dispatch+route ops (profiling mode)
-    # ================================================================
-
-    def gpu_dar_phase_a(
-            self,
-            input_tensor: torch.Tensor,
-            topk_ids: torch.Tensor,
-            topk_weights: torch.Tensor,
-            M: int, K: int, topk: int):
-        """Phase A: broadcast dispatch + expert count
-        accumulation."""
-        torch.ops._C_dispatch_combine\
-            .dar_phase_a(
-                input_tensor, topk_ids,
-                topk_weights,
-                self.config_tensor,
-                M, K, topk,
-                self._num_logical_experts,
-                self.world_size)
-
-    def gpu_dar_push_and_barrier(self):
-        """Allgather push + P2P barrier
-        (RESET_COMBINE)."""
-        torch.ops._C_dispatch_combine\
-            .dar_push_and_barrier(
-                self.config_tensor)
-
-    def gpu_dar_phase_c(self):
-        """Phase C: deterministic router."""
-        torch.ops._C_dispatch_combine\
-            .dar_phase_c(
-                self.config_tensor,
-                self._num_logical_experts,
-                self.world_size)
-
-    def gpu_dar_phase_d1(self, num_experts: int):
-        """Phase D1: zero expert_num_tokens for D2."""
-        torch.ops._C_dispatch_combine\
-            .dar_phase_d1(
-                self.expert_num_tokens_buf,
-                num_experts)
-
-    def gpu_dar_phase_d2(
-            self, mc: int, num_experts: int):
-        """Phase D2: routing filter."""
-        torch.ops._C_dispatch_combine\
-            .dar_phase_d2(
-                self.expert_topk_ids_buf,
-                self.expert_topk_weights_buf,
-                self.expert_num_tokens_buf,
-                self.data_remap_buf,
-                self.config_tensor,
-                mc, num_experts)
-
-    def gpu_dar_phase_e(self):
-        """Phase E: zero counts for next invocation."""
-        torch.ops._C_dispatch_combine\
-            .dar_phase_e(self.config_tensor)
-
     def gpu_dar_compact(
             self, mc_compact: int,
             num_experts: int):

@@ -49,23 +49,6 @@ void dispatch_and_route(torch::Tensor input,
                         int64_t num_physical_experts,
                         int64_t num_logical_experts,
                         int64_t world_size);
-// Split-phase dispatch+route kernels (profiling mode).
-void dar_phase_a(torch::Tensor input, torch::Tensor topk_ids,
-                 torch::Tensor topk_weights, torch::Tensor config_tensor,
-                 int64_t M, int64_t K, int64_t topk,
-                 int64_t num_logical_experts, int64_t world_size);
-void dar_push_and_barrier(torch::Tensor config_tensor);
-void dar_phase_c(torch::Tensor config_tensor,
-                 int64_t num_logical_experts, int64_t world_size);
-void dar_phase_d1(torch::Tensor expert_num_tokens,
-                  int64_t num_physical_experts);
-void dar_phase_d2(torch::Tensor expert_topk_ids,
-                  torch::Tensor expert_topk_weights,
-                  torch::Tensor expert_num_tokens,
-                  torch::Tensor data_remap,
-                  torch::Tensor config_tensor,
-                  int64_t mc, int64_t num_physical_experts);
-void dar_phase_e(torch::Tensor config_tensor);
 void dar_compact(torch::Tensor expert_topk_ids,
                  torch::Tensor expert_topk_weights,
                  torch::Tensor data_remap,
@@ -949,58 +932,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
   dc.impl("dispatch_and_route", torch::kCUDA,
           &vllm::dispatch_combine::
               dispatch_and_route);
-
-  // Split-phase dispatch+route kernels (profiling mode)
-  dc.def(
-      "dar_phase_a("
-      "Tensor input, Tensor topk_ids, "
-      "Tensor topk_weights, "
-      "Tensor config_tensor, "
-      "int M, int K, int topk, "
-      "int num_logical_experts, "
-      "int world_size) -> ()");
-  dc.impl("dar_phase_a", torch::kCUDA,
-          &vllm::dispatch_combine::dar_phase_a);
-
-  dc.def(
-      "dar_push_and_barrier("
-      "Tensor config_tensor) -> ()");
-  dc.impl("dar_push_and_barrier", torch::kCUDA,
-          &vllm::dispatch_combine::
-              dar_push_and_barrier);
-
-  dc.def(
-      "dar_phase_c("
-      "Tensor config_tensor, "
-      "int num_logical_experts, "
-      "int world_size) -> ()");
-  dc.impl("dar_phase_c", torch::kCUDA,
-          &vllm::dispatch_combine::dar_phase_c);
-
-  dc.def(
-      "dar_phase_d1("
-      "Tensor! expert_num_tokens, "
-      "int num_physical_experts) -> ()");
-  dc.impl("dar_phase_d1", torch::kCUDA,
-          &vllm::dispatch_combine::dar_phase_d1);
-
-  dc.def(
-      "dar_phase_d2("
-      "Tensor! expert_topk_ids, "
-      "Tensor! expert_topk_weights, "
-      "Tensor! expert_num_tokens, "
-      "Tensor! data_remap, "
-      "Tensor config_tensor, "
-      "int mc, "
-      "int num_physical_experts) -> ()");
-  dc.impl("dar_phase_d2", torch::kCUDA,
-          &vllm::dispatch_combine::dar_phase_d2);
-
-  dc.def(
-      "dar_phase_e("
-      "Tensor config_tensor) -> ()");
-  dc.impl("dar_phase_e", torch::kCUDA,
-          &vllm::dispatch_combine::dar_phase_e);
 
   // Section compaction: gather valid entries into
   // contiguous buffer, build reverse mapping for combine.
