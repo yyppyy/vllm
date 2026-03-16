@@ -145,9 +145,9 @@ if [[ -n "${NSYS_PID:-}" ]]; then
   # causing "Collecting data..." to hang forever.
   kill -INT "$NSYS_PID" 2>/dev/null || true
 
-  # Give nsys generous time to collect + write (up to 5min).
+  # Give nsys generous time to collect + write (up to 10min).
   # Large profiles with many traced processes can take a while.
-  for _ in {1..3000}; do
+  for _ in {1..6000}; do
     kill -0 "$NSYS_PID" 2>/dev/null || break
     sleep 0.1
   done
