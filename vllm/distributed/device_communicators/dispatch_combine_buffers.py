@@ -290,6 +290,7 @@ class DispatchCombineP2PManager:
             device=f'cuda:{self._device}')
         self.expert_num_tokens_buf = None
         self.data_remap_buf = None
+        self.expert_x_buf = None
         self._num_experts = None
 
         # Init barrier: sync all ranks after IPC setup.
@@ -713,6 +714,14 @@ class DispatchCombineP2PManager:
             torch.arange(self.max_recv,
                          dtype=torch.int32,
                          device=dev))
+        # Pre-allocated gather result buffer.
+        # Avoids per-call allocation from fancy indexing
+        # in _receiver(). Size: max_recv * hidden_dim
+        # (worst case mc entries).
+        self.expert_x_buf = torch.empty(
+            self.max_recv, self.hidden_dim,
+            dtype=self.dtype,
+            device=dev)
 
     def gpu_prepare_dispatch_recv(
             self, mc: int, num_experts: int):

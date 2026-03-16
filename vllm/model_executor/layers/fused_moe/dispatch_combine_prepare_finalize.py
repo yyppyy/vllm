@@ -298,14 +298,19 @@ class DispatchCombinePrepareAndFinalize(
             # positions from section compaction).
             compact_remap = (
                 mgr.compact_data_remap_buf[:mc])
-            expert_x = (
-                mgr.dispatch_recv_tensor[compact_remap])
+            torch.index_select(
+                mgr.dispatch_recv_tensor, 0,
+                compact_remap.long(),
+                out=mgr.expert_x_buf[:mc])
+            expert_x = mgr.expert_x_buf[:mc]
         else:
-            # Non-integrated path: gather via data_remap.
-            # data_remap maps metadata positions to compact
-            # data positions (sender*M + token_idx).
-            expert_x = (
-                mgr.dispatch_recv_tensor[data_remap])
+            # Non-integrated path: gather via data_remap
+            # into pre-allocated buffer (no allocation).
+            torch.index_select(
+                mgr.dispatch_recv_tensor, 0,
+                data_remap.long(),
+                out=mgr.expert_x_buf[:mc])
+            expert_x = mgr.expert_x_buf[:mc]
 
         # Post-dispatch quantization.
         expert_x_scale = None
