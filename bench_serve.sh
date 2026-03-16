@@ -46,7 +46,7 @@ args=(
   --max-model-len 4096
   --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
-  --gpu-memory-utilization "0.85"
+  --gpu-memory-utilization "0.9"
 )
   # --enforce-eager
 
