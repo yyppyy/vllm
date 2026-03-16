@@ -138,19 +138,24 @@ vllm bench serve "${cli_args[@]}"
 
 ############## kill server & collect profile and logs ##############
 if [[ -n "${NSYS_PID:-}" ]]; then
-  # Profiler path: signal entire process group so nsys + forked
-  # vllm workers all receive INT and nsys can collect from them.
-  kill -INT -- "-$NSYS_PID" 2>/dev/null || true
+  # Profiler path: signal ONLY nsys (not the process group).
+  # nsys must stay alive to collect profiling data from its
+  # traced children. Killing the group would terminate vllm
+  # workers before nsys can read their profiling buffers,
+  # causing "Collecting data..." to hang forever.
+  kill -INT "$NSYS_PID" 2>/dev/null || true
 
-  # Give nsys generous time to finalize (up to 60s)
-  for _ in {1..600}; do
+  # Give nsys generous time to collect + write (up to 5min).
+  # Large profiles with many traced processes can take a while.
+  for _ in {1..3000}; do
     kill -0 "$NSYS_PID" 2>/dev/null || break
     sleep 0.1
   done
 
-  # If nsys is still alive, escalate (but avoid SIGKILL — it corrupts output)
+  # If nsys is still alive, escalate to TERM (avoids SIGKILL
+  # which corrupts the output file).
   if kill -0 "$NSYS_PID" 2>/dev/null; then
-    kill -TERM -- "-$NSYS_PID" 2>/dev/null || true
+    kill -TERM "$NSYS_PID" 2>/dev/null || true
     for _ in {1..100}; do
       kill -0 "$NSYS_PID" 2>/dev/null || break
       sleep 0.1
@@ -158,6 +163,13 @@ if [[ -n "${NSYS_PID:-}" ]]; then
   fi
 
   wait "$NSYS_PID" 2>/dev/null || true
+
+  # Now kill any remaining vllm workers that nsys left behind.
+  # SESSION_PID == NSYS_PID (setsid leader), so the process
+  # group contains both nsys (now dead) and vllm children.
+  kill -TERM -- "-$SESSION_PID" 2>/dev/null || true
+  sleep 1
+  kill -KILL -- "-$SESSION_PID" 2>/dev/null || true
 else
   # Non-profiler path: kill the session group
   kill -INT  -- "-$SESSION_PID" 2>/dev/null || true
