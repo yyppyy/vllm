@@ -396,7 +396,8 @@ void dispatch_and_route(
     int64_t num_physical_experts,
     int64_t num_logical_experts,
     int64_t world_size,
-    int64_t max_replicas) {
+    int64_t max_replicas,
+    int64_t routing_mode) {
 
   if (M == 0) return;
 
@@ -417,6 +418,8 @@ void dispatch_and_route(
       static_cast<int32_t>(world_size);
   const int32_t mr =
       static_cast<int32_t>(max_replicas);
+  const int32_t rm32 =
+      static_cast<int32_t>(routing_mode);
 
   // expert_num_tokens zeroed inline by kernel (Phase C,
   // block 0, before routing_ready_flag signal).
@@ -430,19 +433,27 @@ void dispatch_and_route(
   // Scan_write: NL + ws + 3*64 + NL + NL*mr ints
   //   (expert_counts + grp_count + entries
   //    + preloaded replica_count + l2p_map).
-  // Phase C: 3*NL + NL*mr + ws ints
-  //   (s_expert_sum[NL] + s_replica_count[NL]
-  //    + s_l2p_map[NL*mr] + routing_sel[NL]
-  //    + rank_active[ws]).
+  // Phase C mode 0: 3*NL + NL*mr + ws + NL + 1 ints
+  //   (routing_sel[NL] + rank_active[ws] + compact)
+  // Phase C mode 1: 3*NL + NL*mr + 2*ws*NL + ws + NL + 1
+  //   (section_routing[ws*NL] + s_section_counts[ws*NL])
   // Phases don't overlap, so same memory is reused.
   constexpr int32_t kMaxEntries = 64;
   size_t phase_a_bytes = static_cast<size_t>(
       (2 * NL + ws + 3 * kMaxEntries
        + NL * mr)
       * sizeof(int32_t));
-  size_t phase_c_bytes = static_cast<size_t>(
-      (3 * NL + NL * mr + ws + NL + 1)
-      * sizeof(int32_t));
+  size_t phase_c_bytes;
+  if (routing_mode == 0) {
+    phase_c_bytes = static_cast<size_t>(
+        (3 * NL + NL * mr + ws + NL + 1)
+        * sizeof(int32_t));
+  } else {
+    phase_c_bytes = static_cast<size_t>(
+        (3 * NL + NL * mr + 2 * ws * NL
+         + ws + NL + 1)
+        * sizeof(int32_t));
+  }
   size_t shared_bytes = phase_a_bytes > phase_c_bytes
       ? phase_a_bytes : phase_c_bytes;
 
@@ -470,7 +481,7 @@ void dispatch_and_route(
               expert_num_tokens.data_ptr<int32_t>(),
               data_remap.data_ptr<int32_t>(),
               config, M32, K32, topk32,
-              mc32, ne32);
+              mc32, ne32, rm32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -487,7 +498,7 @@ void dispatch_and_route(
               expert_num_tokens.data_ptr<int32_t>(),
               data_remap.data_ptr<int32_t>(),
               config, M32, K32, topk32,
-              mc32, ne32);
+              mc32, ne32, rm32);
         })
   );
 }

@@ -1291,7 +1291,8 @@ __global__ void dispatch_and_route_kernel(
     const DispatchCombineConfig* __restrict__ config,
     int32_t M, int32_t K, int32_t topk,
     int32_t mc,
-    int32_t num_physical_experts) {
+    int32_t num_physical_experts,
+    int32_t routing_mode) {
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
   const int32_t max_rep = config->max_replicas;
@@ -1642,16 +1643,38 @@ __global__ void dispatch_and_route_kernel(
 
   if (blockIdx.x == 0) {
     // Reuse shared[] for Phase C preload layout.
+    // routing_mode=0 (minimize experts):
+    //   routing_sel[NL], rank_active[ws],
+    //   s_multi_experts[NL], s_num_multi[1]
+    // routing_mode=1 (balance tokens):
+    //   section_routing[ws*NL], s_section_counts[ws*NL],
+    //   rank_active[ws], s_multi_experts[NL],
+    //   s_num_multi[1]
     int32_t* s_expert_sum = shared;           // [NL]
     int32_t* s_replica_count = shared + NL;   // [NL]
     int32_t* s_l2p_map = shared + 2 * NL;    // [NL*mr]
-    int32_t* routing_sel =
-        shared + 2 * NL + NL * max_rep;       // [NL]
-    int32_t* rank_active = routing_sel + NL;   // [ws]
-    int32_t* s_multi_experts =
-        rank_active + ws;                      // [NL]
-    int32_t* s_num_multi =
-        s_multi_experts + NL;                  // [1]
+    int32_t* base_ptr = shared + 2 * NL + NL * max_rep;
+
+    // Mode-dependent layout after base_ptr.
+    int32_t* routing_sel = nullptr;       // mode 0 only
+    int32_t* section_routing = nullptr;   // mode 1 only
+    int32_t* s_section_counts = nullptr;  // mode 1 only
+    int32_t* rank_active = nullptr;       // [ws]
+    int32_t* s_multi_experts = nullptr;   // [NL]
+    int32_t* s_num_multi = nullptr;       // [1]
+
+    if (routing_mode == 0) {
+      routing_sel = base_ptr;             // [NL]
+      rank_active = routing_sel + NL;     // [ws]
+      s_multi_experts = rank_active + ws; // [NL]
+      s_num_multi = s_multi_experts + NL; // [1]
+    } else {
+      section_routing = base_ptr;                 // [ws*NL]
+      s_section_counts = section_routing + ws*NL; // [ws*NL]
+      rank_active = s_section_counts + ws * NL;   // [ws]
+      s_multi_experts = rank_active + ws;         // [NL]
+      s_num_multi = s_multi_experts + NL;         // [1]
+    }
 
     // All threads: parallel preload from global to smem.
     // Sum expert counts across allgather sections.
@@ -1677,9 +1700,19 @@ __global__ void dispatch_and_route_kernel(
       s_l2p_map[i] =
           config->logical_to_physical_map[i];
     }
-    for (int32_t e = threadIdx.x; e < NL;
-         e += blockDim.x) {
-      routing_sel[e] = -1;
+    // Mode-specific init.
+    if (routing_mode == 0) {
+      for (int32_t e = threadIdx.x; e < NL;
+           e += blockDim.x) {
+        routing_sel[e] = -1;
+      }
+    } else {
+      // Preload per-section per-expert counts.
+      for (int32_t i = threadIdx.x;
+           i < ws * NL; i += blockDim.x) {
+        s_section_counts[i] = ec_buf[i];
+        section_routing[i] = -1;
+      }
     }
     for (int32_t r = threadIdx.x; r < ws;
          r += blockDim.x) {
@@ -1692,10 +1725,8 @@ __global__ void dispatch_and_route_kernel(
 
     // ---- Two-pass routing ----
     // Pass 1 (parallel): Route single-replica experts.
-    // Their routing is fixed (only one physical target),
-    // so all threads can assign them in parallel.
-    // Integer atomicAdd on smem is order-independent,
-    // guaranteeing identical rank_active[] on every rank.
+    // routing_mode=0: rank_active += 1 (min experts)
+    // routing_mode=1: rank_active += count (balance tok)
     for (int32_t e = threadIdx.x; e < NL;
          e += blockDim.x) {
       const int32_t count = s_expert_sum[e];
@@ -1706,8 +1737,14 @@ __global__ void dispatch_and_route_kernel(
       if (rc == 1) {
         const int32_t phys =
             s_l2p_map[e * max_rep];
-        routing_sel[e] = phys;
-        atomicAdd(&rank_active[phys / epr], count);
+        if (routing_mode == 0) {
+          routing_sel[e] = phys;
+          atomicAdd(&rank_active[phys / epr], 1);
+        } else {
+          for (int32_t s = 0; s < ws; s++)
+            section_routing[s * NL + e] = phys;
+          atomicAdd(&rank_active[phys / epr], count);
+        }
       } else {
         // rc > 1: defer to Pass 2 via compact list.
         int32_t idx = atomicAdd(s_num_multi, 1);
@@ -1718,11 +1755,12 @@ __global__ void dispatch_and_route_kernel(
 
     DC_TIMESTAMP(config, 14);  // dar:route_pass1
 
-    // Pass 2 (sequential): Route multi-replica experts
-    // from the compact list built in Pass 1.  Greedy
-    // load-balanced assignment starting from the
-    // rank_active[] base computed by Pass 1.  Sorted by
-    // expert index for cross-rank determinism.
+    // Pass 2 (sequential): Route multi-replica experts.
+    // routing_mode=0: pick ONE replica per expert,
+    //   rank_active += 1 (minimize activated experts).
+    // routing_mode=1: section-level splitting — assign
+    //   each section's tokens independently to the
+    //   least-loaded replica, rank_active += section_cnt.
     if (threadIdx.x == 0) {
       const int32_t nm = s_num_multi[0];
       // Insertion sort compact list by expert index.
@@ -1736,39 +1774,79 @@ __global__ void dispatch_and_route_kernel(
         }
         s_multi_experts[j + 1] = key;
       }
-      // Greedy assignment over compact list only.
-      for (int32_t idx = 0; idx < nm; idx++) {
-        const int32_t e = s_multi_experts[idx];
-        const int32_t count = s_expert_sum[e];
-        int32_t rc = s_replica_count[e];
-        if (rc > max_rep) rc = max_rep;
-        int32_t best_phys = -1;
-        int32_t best_rank = -1;
-        int32_t best_cost = INT_MAX;
-        for (int32_t i = 0; i < rc; i++) {
-          const int32_t phys =
-              s_l2p_map[e * max_rep + i];
-          const int32_t r = phys / epr;
-          const int32_t c = rank_active[r];
-          if (c < best_cost ||
-              (c == best_cost && r < best_rank)) {
-            best_cost = c;
-            best_rank = r;
-            best_phys = phys;
+      if (routing_mode == 0) {
+        // Greedy: one replica per expert.
+        for (int32_t idx = 0; idx < nm; idx++) {
+          const int32_t e = s_multi_experts[idx];
+          int32_t rc = s_replica_count[e];
+          if (rc > max_rep) rc = max_rep;
+          int32_t best_phys = -1;
+          int32_t best_rank = -1;
+          int32_t best_cost = INT_MAX;
+          for (int32_t i = 0; i < rc; i++) {
+            const int32_t phys =
+                s_l2p_map[e * max_rep + i];
+            const int32_t r = phys / epr;
+            const int32_t c = rank_active[r];
+            if (c < best_cost ||
+                (c == best_cost && r < best_rank)) {
+              best_cost = c;
+              best_rank = r;
+              best_phys = phys;
+            }
+          }
+          routing_sel[e] = best_phys;
+          rank_active[best_rank] += 1;
+        }
+      } else {
+        // Section-level splitting: for each section,
+        // greedily assign to least-loaded replica.
+        for (int32_t idx = 0; idx < nm; idx++) {
+          const int32_t e = s_multi_experts[idx];
+          int32_t rc = s_replica_count[e];
+          if (rc > max_rep) rc = max_rep;
+          for (int32_t s = 0; s < ws; s++) {
+            int32_t cnt_s =
+                s_section_counts[s * NL + e];
+            if (cnt_s == 0) continue;
+            int32_t best_phys = -1;
+            int32_t best_rank = -1;
+            int32_t best_cost = INT_MAX;
+            for (int32_t i = 0; i < rc; i++) {
+              const int32_t phys =
+                  s_l2p_map[e * max_rep + i];
+              const int32_t r = phys / epr;
+              const int32_t c = rank_active[r];
+              if (c < best_cost ||
+                  (c == best_cost
+                   && r < best_rank)) {
+                best_cost = c;
+                best_rank = r;
+                best_phys = phys;
+              }
+            }
+            section_routing[s * NL + e] = best_phys;
+            rank_active[best_rank] += cnt_s;
           }
         }
-        routing_sel[e] = best_phys;
-        rank_active[best_rank] += count;
       }
     }
     __syncthreads();
 
     DC_TIMESTAMP(config, 15);  // dar:route_pass2
 
-    // Write routing_selection to global memory.
-    for (int32_t e = threadIdx.x; e < NL;
-         e += blockDim.x) {
-      config->routing_selection[e] = routing_sel[e];
+    // Write routing decisions to global memory.
+    if (routing_mode == 0) {
+      for (int32_t e = threadIdx.x; e < NL;
+           e += blockDim.x) {
+        config->routing_selection[e] = routing_sel[e];
+      }
+    } else {
+      for (int32_t i = threadIdx.x;
+           i < ws * NL; i += blockDim.x) {
+        config->routing_selection[i] =
+            section_routing[i];
+      }
     }
 
     // Zero expert_num_tokens for Phase D2's atomicAdd.
@@ -1847,9 +1925,13 @@ __global__ void dispatch_and_route_kernel(
               || logical_id >= NL) {
             meta_w[idx].topk_weight = 0.0f;
           } else {
-            const int32_t sel =
-                config->routing_selection[
-                    logical_id];
+            // routing_mode=0: one selection per expert.
+            // routing_mode=1: per-section selection
+            //   (section_routing[sec * NL + expert]).
+            const int32_t sel = (routing_mode == 0)
+                ? config->routing_selection[logical_id]
+                : config->routing_selection[
+                    sec * NL + logical_id];
             if (sel < 0
                 || sel >= num_physical_experts) {
               meta_w[idx].topk_weight = 0.0f;

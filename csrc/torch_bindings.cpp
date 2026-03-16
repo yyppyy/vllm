@@ -51,7 +51,8 @@ void dispatch_and_route(torch::Tensor input,
                         int64_t num_physical_experts,
                         int64_t num_logical_experts,
                         int64_t world_size,
-                        int64_t max_replicas);
+                        int64_t max_replicas,
+                        int64_t routing_mode);
 void dar_compact(torch::Tensor expert_topk_ids,
                  torch::Tensor expert_topk_weights,
                  torch::Tensor data_remap,
@@ -934,7 +935,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "int mc, int num_physical_experts, "
       "int num_logical_experts, "
       "int world_size, "
-      "int max_replicas) -> ()");
+      "int max_replicas, "
+      "int routing_mode) -> ()");
   dc.impl("dispatch_and_route", torch::kCUDA,
           &vllm::dispatch_combine::
               dispatch_and_route);

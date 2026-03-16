@@ -815,7 +815,11 @@ class DispatchCombineP2PManager:
             self._raw_expert_counts, 0, ec_bytes)
 
         # Routing selection buffer (local only).
-        rs_bytes = num_logical_experts * 4
+        # Sized for ws * NL to support section-level
+        # routing (routing_mode=1 uses per-section
+        # decisions: section_routing[s * NL + e]).
+        rs_bytes = (self.world_size
+                    * num_logical_experts * 4)
         self._raw_routing_selection = (
             cuda_rt.cudaMalloc(rs_bytes))
         cuda_rt.cudaMemset(
@@ -1018,8 +1022,15 @@ class DispatchCombineP2PManager:
         K: int,
         topk: int,
         num_experts: int,
+        routing_mode: int = 0,
     ):
         """Launch the fused dispatch+route+filter kernel.
+
+        routing_mode=0: minimize activated experts
+          (rank_active += 1, one replica per expert).
+        routing_mode=1: balance tokens via section-level
+          splitting (rank_active += section_count,
+          each section assigned independently).
 
         Returns (expert_topk_ids, expert_topk_weights,
                  expert_num_tokens) sliced to mc.
@@ -1044,7 +1055,8 @@ class DispatchCombineP2PManager:
                 num_experts,
                 self._num_logical_experts,
                 self.world_size,
-                self._max_replicas)
+                self._max_replicas,
+                routing_mode)
 
         if self._profiling_enabled:
             self._read_and_accumulate_timestamps('dar')

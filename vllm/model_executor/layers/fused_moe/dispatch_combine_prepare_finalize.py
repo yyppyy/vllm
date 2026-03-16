@@ -33,12 +33,11 @@ _MOE_LOAD_PROFILE_INTERVAL = int(
     os.environ.get('VLLM_MOE_LOAD_PROFILE_INTERVAL',
                     '0'))
 
-# Use integrated dispatch_and_route only when batch
-# size per GPU is at most this threshold. For larger
-# batches (prefill), fall back to standalone dispatch_p2p
-# + prepare_dispatch_recv which avoids the overhead of
-# GPU-side routing, all-reduce, and compaction.
-INTEGRATED_ROUTING_MAX_M = 256
+# Routing mode threshold: M <= this uses routing_mode=0
+# (minimize activated experts), M > this uses
+# routing_mode=1 (balance tokens via section-level
+# splitting across replicas).
+ROUTING_MODE_THRESHOLD = 256
 
 
 class DispatchCombinePrepareAndFinalize(
@@ -127,19 +126,21 @@ class DispatchCombinePrepareAndFinalize(
         if getattr(mgr, 'topk_ids_i32_buf', None) is None:
             mgr.init_prepare_buffers(num_experts)
 
-        # Use integrated routing only for small batches.
-        # Large batches (prefill) use standalone dispatch
-        # to avoid GPU-side routing overhead.
-        use_integrated = (
-            self.use_integrated_routing
-            and M <= INTEGRATED_ROUTING_MAX_M)
+        # Use integrated routing for all batch sizes when
+        # enabled. routing_mode selects the algorithm:
+        # 0 = minimize experts (decode), 1 = balance
+        # tokens via section-level splitting (prefill).
+        use_integrated = self.use_integrated_routing
         self._used_integrated = use_integrated
 
         if use_integrated:
+            routing_mode = (
+                0 if M <= ROUTING_MODE_THRESHOLD else 1)
             return self._prepare_integrated(
                 a1, topk_weights, topk_ids,
                 num_experts, expert_map,
-                quant_config, M, K, topk)
+                quant_config, M, K, topk,
+                routing_mode)
 
         # Per-sender sections: entries are spread across
         # ws sections in the recv buffer, so mc must cover
@@ -219,6 +220,7 @@ class DispatchCombinePrepareAndFinalize(
         M: int,
         K: int,
         topk: int,
+        routing_mode: int = 0,
     ) -> mk.ReceiverType:
         """Integrated routing path: fused dispatch + route.
 
@@ -227,6 +229,12 @@ class DispatchCombinePrepareAndFinalize(
         ranks, performs push-based all-reduce of per-expert
         counts, runs deterministic routing, and filters
         tokens in a single kernel launch.
+
+        routing_mode=0: minimize activated experts
+          (increment rank_active by 1 per expert).
+        routing_mode=1: balance tokens via section-level
+          splitting (each section assigned independently
+          to the least-loaded replica).
         """
         mgr = self.p2p_manager
 
@@ -262,7 +270,8 @@ class DispatchCombinePrepareAndFinalize(
                 a1, topk_ids_i32,
                 topk_weights_f32,
                 self._mc_full, M, K, topk,
-                num_experts))
+                num_experts,
+                routing_mode=routing_mode))
         # Compact after fused kernel.
         mgr.gpu_dar_compact(
             self._mc, num_experts)

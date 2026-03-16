@@ -712,24 +712,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         zero_expert_num = getattr(layer, 'zero_expert_num', 0)
         zero_expert_type = getattr(layer, 'zero_expert_type', None)
 
-        # When integrated routing is active AND batch is
-        # small enough, skip pre-dispatch EPLB mapping —
+        # When integrated routing is active, skip
+        # pre-dispatch EPLB mapping for all batch sizes —
         # the fused dispatch kernel handles routing
         # internally with global demand visibility.
-        # For large batches (M > threshold), fall back to
-        # standalone dispatch which needs physical IDs.
-        from vllm.model_executor.layers.fused_moe\
-            .dispatch_combine_prepare_finalize import (
-                INTEGRATED_ROUTING_MAX_M)
         _ir = (enable_eplb
                and self.fused_experts is not None
                and hasattr(
                    self.fused_experts, 'prepare_finalize')
                and getattr(
                    self.fused_experts.prepare_finalize,
-                   'use_integrated_routing', False)
-               and x.shape[0]
-                   <= INTEGRATED_ROUTING_MAX_M)
+                   'use_integrated_routing', False))
         eplb_for_select = enable_eplb and not _ir
 
         topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
@@ -1870,21 +1863,13 @@ class FusedMoE(CustomOp):
         """Init/update integrated routing on p2p_manager.
 
         Called from set_eplb_state() when dispatch_combine
-        backend is used with EPLB and mem_bound_aware_routing
-        is enabled. Routes routing decisions into the fused
-        dispatch kernel instead of doing pre-dispatch EPLB
-        mapping on host.
-
-        When mem_bound_aware_routing is not set, EPLB uses
-        the normal dispatch_combine path with pre-dispatch
-        logical-to-physical mapping.
+        backend is used with EPLB. Always activates
+        integrated routing so the fused dispatch kernel
+        handles routing decisions internally with global
+        demand visibility, using routing_mode=0 (minimize
+        experts) for decode and routing_mode=1 (balance
+        tokens via section-level splitting) for prefill.
         """
-        # Only activate when mem_bound_aware_routing is
-        # explicitly requested (e.g. "greedy").
-        mbr = self.moe_parallel_config.mem_bound_aware_routing
-        if not mbr:
-            return
-
         pf = self._get_prepare_finalize()
         if pf is None:
             return
