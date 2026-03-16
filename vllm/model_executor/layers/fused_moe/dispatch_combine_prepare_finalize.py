@@ -161,8 +161,12 @@ class DispatchCombinePrepareAndFinalize(
         # barrier (RESET_DISPATCH mode), which includes
         # threadfence_system for cross-GPU visibility.
         # First layer uses init barrier + cudaMemset.
-        topk_ids_i32 = topk_ids.to(torch.int32)
-        topk_weights_f32 = topk_weights.to(torch.float32)
+        # Use pre-allocated buffers for dtype conversion
+        # (.to() allocates; .copy_() is graph-safe).
+        topk_ids_i32 = mgr.topk_ids_i32_buf[:M]
+        topk_ids_i32.copy_(topk_ids)
+        topk_weights_f32 = mgr.topk_weights_f32_buf[:M]
+        topk_weights_f32.copy_(topk_weights)
 
         torch.ops._C_dispatch_combine.dispatch_p2p(
             a1,
@@ -188,7 +192,7 @@ class DispatchCombinePrepareAndFinalize(
                 self, 'expert_load_view', None)
             if elv is not None:
                 elv.add_(
-                    expert_num_tokens.to(elv.dtype))
+                    expert_num_tokens)
 
         # data_remap computed by prepare_dispatch_recv:
         # maps each metadata entry to its compact data
@@ -235,8 +239,12 @@ class DispatchCombinePrepareAndFinalize(
         # IPC section layout, unchanged by compaction).
         self._mc_full = self.max_recv
 
-        topk_ids_i32 = topk_ids.to(torch.int32)
-        topk_weights_f32 = topk_weights.to(torch.float32)
+        # Pre-allocated dtype conversion buffers
+        # (.to() allocates; .copy_() is graph-safe).
+        topk_ids_i32 = mgr.topk_ids_i32_buf[:M]
+        topk_ids_i32.copy_(topk_ids)
+        topk_weights_f32 = mgr.topk_weights_f32_buf[:M]
+        topk_weights_f32.copy_(topk_weights)
 
         if mgr.expert_num_tokens_buf is None:
             mgr.init_prepare_buffers(num_experts)
@@ -269,7 +277,7 @@ class DispatchCombinePrepareAndFinalize(
         # physical expert counts from the fused kernel.
         elv = getattr(self, 'expert_load_view', None)
         if elv is not None:
-            elv.add_(expert_num_tokens.to(elv.dtype))
+            elv.add_(expert_num_tokens)
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,

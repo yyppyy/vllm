@@ -730,6 +730,15 @@ class DispatchCombineP2PManager:
         self.remap_i64_buf = torch.empty(
             self.max_recv, dtype=torch.int64,
             device=dev)
+        # Pre-allocated dtype conversion buffers.
+        # Avoids .to() allocations during CUDA
+        # graph capture.
+        self.topk_ids_i32_buf = torch.empty(
+            self.max_num_tokens, self.topk,
+            dtype=torch.int32, device=dev)
+        self.topk_weights_f32_buf = torch.empty(
+            self.max_num_tokens, self.topk,
+            dtype=torch.float32, device=dev)
 
     def gpu_prepare_dispatch_recv(
             self, mc: int, num_experts: int):
