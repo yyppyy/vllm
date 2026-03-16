@@ -292,6 +292,8 @@ class DispatchCombineP2PManager:
         self.data_remap_buf = None
         self.expert_x_buf = None
         self.remap_i64_buf = None
+        self.topk_ids_i32_buf = None
+        self.topk_weights_f32_buf = None
         self._num_experts = None
 
         # Init barrier: sync all ranks after IPC setup.

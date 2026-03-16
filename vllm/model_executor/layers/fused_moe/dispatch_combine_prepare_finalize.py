@@ -123,6 +123,10 @@ class DispatchCombinePrepareAndFinalize(
 
         mgr = self.p2p_manager
 
+        # Ensure pre-allocated buffers exist (lazy init).
+        if mgr.topk_ids_i32_buf is None:
+            mgr.init_prepare_buffers(num_experts)
+
         # Use integrated routing only for small batches.
         # Large batches (prefill) use standalone dispatch
         # to avoid GPU-side routing overhead.
