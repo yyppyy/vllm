@@ -605,23 +605,6 @@ class DispatchCombineP2PManager:
         torch.ops._C_dispatch_combine.p2p_barrier(
             self.config_tensor)
 
-    def gpu_scatter_add_direct(
-            self, output: torch.Tensor, mc: int):
-        """Scatter-add from IPC combine buffers directly
-        into output using native bf16/fp16 atomicAdd.
-        Output zeroed inline by kernel."""
-        M = output.shape[0]
-        torch.ops._C_dispatch_combine\
-            .scatter_add_direct(
-                output, self.config_tensor,
-                mc, self.hidden_dim, M)
-
-    def gpu_p2p_barrier_reset_dispatch(self):
-        """Reset dispatch offset + P2P barrier."""
-        torch.ops._C_dispatch_combine\
-            .p2p_barrier_reset_dispatch(
-                self.config_tensor)
-
     def gpu_combine_and_scatter(
             self,
             expert_output: torch.Tensor,
@@ -645,18 +628,6 @@ class DispatchCombineP2PManager:
         if self._profiling_enabled:
             if self._read_and_accumulate_timestamps('cas'):
                 self._maybe_print_profile()
-
-    def gpu_combine_p2p(
-            self,
-            expert_output: torch.Tensor,
-            dispatch_meta: torch.Tensor,
-            mc: int):
-        """Combine P2P writes (standalone kernel)."""
-        torch.ops._C_dispatch_combine.combine_p2p(
-            expert_output, dispatch_meta,
-            self.compact_reverse_buf,
-            self.config_tensor,
-            mc, self.hidden_dim)
 
     def gpu_dar_compact(
             self, mc_compact: int,
@@ -750,32 +721,6 @@ class DispatchCombineP2PManager:
         self.accum_buf = torch.empty(
             self.max_num_tokens, self.hidden_dim,
             dtype=torch.float32, device=dev)
-
-    def gpu_prepare_dispatch_recv(
-            self, mc: int, num_experts: int):
-        """Fused stamp/zero + routing metadata
-        extraction + data_remap computation. Returns
-        (expert_topk_ids, expert_topk_weights,
-         expert_num_tokens) sliced to mc."""
-        if self.expert_num_tokens_buf is None:
-            self.init_prepare_buffers(num_experts)
-        torch.ops._C_dispatch_combine\
-            .prepare_dispatch_recv(
-                self.dispatch_recv_tensor,
-                self.expert_topk_ids_buf,
-                self.expert_topk_weights_buf,
-                self.expert_num_tokens_buf,
-                self.data_remap_buf,
-                self.config_tensor,
-                mc, self.hidden_dim,
-                num_experts)
-        return (
-            self.expert_topk_ids_buf[:mc]
-            .unsqueeze(1),
-            self.expert_topk_weights_buf[:mc]
-            .unsqueeze(1),
-            self.expert_num_tokens_buf,
-        )
 
     # ================================================================
     # Integrated routing (EPLB) support

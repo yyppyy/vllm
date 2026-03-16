@@ -720,9 +720,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                and self.fused_experts is not None
                and hasattr(
                    self.fused_experts, 'prepare_finalize')
-               and getattr(
+               and isinstance(
                    self.fused_experts.prepare_finalize,
-                   'use_integrated_routing', False))
+                   DispatchCombinePrepareAndFinalize)
+               and self.moe_parallel_config
+               .mem_bound_aware_routing)
         eplb_for_select = enable_eplb and not _ir
 
         topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
@@ -1913,7 +1915,6 @@ class FusedMoE(CustomOp):
         # Push latest routing tables to GPU.
         mgr.update_routing_tables(ltp, lrc)
 
-        pf.use_integrated_routing = True
         pf.expert_load_view = self.expert_load_view
 
     @staticmethod

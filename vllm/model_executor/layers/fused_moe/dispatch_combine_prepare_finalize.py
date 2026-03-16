@@ -27,9 +27,6 @@ from vllm.model_executor.layers.fused_moe.utils import (
 
 logger = init_logger(__name__)
 
-# Read env var directly to avoid circular import
-# with layer.py (which imports this module).
-import os
 _MOE_LOAD_PROFILE_INTERVAL = int(
     os.environ.get('VLLM_MOE_LOAD_PROFILE_INTERVAL',
                     '0'))
@@ -65,7 +62,6 @@ class DispatchCombinePrepareAndFinalize(
         rank: int,
         world_size: int,
         rank_expert_offset: int,
-        use_integrated_routing: bool = False,
     ):
         super().__init__()
         self.p2p_manager = p2p_manager
@@ -78,8 +74,6 @@ class DispatchCombinePrepareAndFinalize(
         self.rank_expert_offset = rank_expert_offset
         self.experts_per_rank = num_experts // world_size
         self.max_recv = p2p_manager.max_recv
-        self.use_integrated_routing = (
-            use_integrated_routing)
         # Set by layer.py when integrated routing is on.
         self.expert_load_view = None
 
@@ -128,88 +122,16 @@ class DispatchCombinePrepareAndFinalize(
         if getattr(mgr, 'topk_ids_i32_buf', None) is None:
             mgr.init_prepare_buffers(num_experts)
 
-        # Use integrated routing for all batch sizes when
-        # enabled. routing_mode selects the algorithm:
+        # routing_mode selects the algorithm:
         # 0 = minimize experts (decode), 1 = balance
         # tokens via section-level splitting (prefill).
-        use_integrated = self.use_integrated_routing
-        self._used_integrated = use_integrated
-
-        if use_integrated:
-            routing_mode = (
-                0 if M <= ROUTING_MODE_THRESHOLD else 1)
-            return self._prepare_integrated(
-                a1, topk_weights, topk_ids,
-                num_experts, expert_map,
-                quant_config, M, K, topk,
-                routing_mode)
-
-        # Per-sender sections: entries are spread across
-        # ws sections in the recv buffer, so mc must cover
-        # the full buffer to reach all sections.
-        self._mc = self.max_recv
-        self._mc_full = self.max_recv
-
-        # Reset compact_reverse to identity if integrated
-        # routing is configured (previous call may have
-        # modified it via dar_compact).
-        # Guard: compact_reverse_buf is lazily allocated
-        # in init_prepare_buffers(), which may not have
-        # been called yet (e.g. during profile_run).
-        if (self.use_integrated_routing
-                and mgr.expert_num_tokens_buf is not None):
-            torch.arange(
-                self.max_recv,
-                out=mgr.compact_reverse_buf)
-
-        # Step 1: Launch dispatch P2P kernel.
-        # No pre-dispatch barrier needed: dispatch_offset
-        # was reset by previous layer's post-combine
-        # barrier (RESET_DISPATCH mode), which includes
-        # threadfence_system for cross-GPU visibility.
-        # First layer uses init barrier + cudaMemset.
-        # Use pre-allocated buffers for dtype conversion
-        # (.to() allocates; .copy_() is graph-safe).
-        topk_ids_i32 = mgr.topk_ids_i32_buf[:M]
-        topk_ids_i32.copy_(topk_ids)
-        topk_weights_f32 = mgr.topk_weights_f32_buf[:M]
-        topk_weights_f32.copy_(topk_weights)
-
-        torch.ops._C_dispatch_combine.dispatch_p2p(
-            a1,
-            topk_ids_i32,
-            topk_weights_f32,
-            mgr.config_tensor,
-            M, K, topk,
-        )
-
-        # Step 2: Fused barrier + stamp/zero + routing.
-        # Inline barrier(RESET_COMBINE) syncs dispatch
-        # writes and resets combine_offset to 0. Then
-        # stamp/zero + routing extraction in one kernel.
-        (expert_topk_ids,
-         expert_topk_weights,
-         expert_num_tokens) = (
-            mgr.gpu_prepare_dispatch_recv(
-                self._mc, num_experts))
-
-        # Track load for EPLB even in fallback path.
-        if self.use_integrated_routing:
-            elv = getattr(
-                self, 'expert_load_view', None)
-            if elv is not None:
-                elv.add_(
-                    expert_num_tokens)
-
-        # data_remap computed by prepare_dispatch_recv:
-        # maps each metadata entry to its compact data
-        # position (sender_rank * M + token_idx).
-        data_remap = mgr.data_remap_buf[:self._mc]
-        return lambda: self._receiver(
-            a1, K, num_experts, quant_config,
-            expert_map, expert_topk_ids,
-            expert_topk_weights, expert_num_tokens,
-            data_remap)
+        routing_mode = (
+            0 if M <= ROUTING_MODE_THRESHOLD else 1)
+        return self._prepare_integrated(
+            a1, topk_weights, topk_ids,
+            num_experts, expert_map,
+            quant_config, M, K, topk,
+            routing_mode)
 
     def _prepare_integrated(
         self,
@@ -285,8 +207,6 @@ class DispatchCombinePrepareAndFinalize(
             mgr.compact_expert_topk_weights_buf[
                 :self._mc]
             .unsqueeze(1))
-        data_remap = None  # Folded into compact
-
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
         # physical expert counts from the fused kernel.
@@ -297,8 +217,7 @@ class DispatchCombinePrepareAndFinalize(
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,
             expert_map, expert_topk_ids,
-            expert_topk_weights, expert_num_tokens,
-            data_remap)
+            expert_topk_weights, expert_num_tokens)
 
     def _receiver(
         self,
@@ -310,7 +229,6 @@ class DispatchCombinePrepareAndFinalize(
         expert_topk_ids: torch.Tensor,
         expert_topk_weights: torch.Tensor,
         expert_num_tokens: torch.Tensor,
-        data_remap: Optional[torch.Tensor] = None,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
         mc = self._mc
@@ -320,11 +238,8 @@ class DispatchCombinePrepareAndFinalize(
         # .copy_() is CUDA graph safe; .long() is not
         # (it allocates a new tensor).
         remap_i64 = mgr.remap_i64_buf[:mc]
-        if self._used_integrated:
-            remap_i64.copy_(
-                mgr.compact_data_remap_buf[:mc])
-        else:
-            remap_i64.copy_(data_remap)
+        remap_i64.copy_(
+            mgr.compact_data_remap_buf[:mc])
         torch.index_select(
             mgr.dispatch_recv_tensor, 0,
             remap_i64,
