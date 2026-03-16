@@ -31,7 +31,11 @@ MAX_TOKEN_PER_BATCH=4096
 MAX_REQ_PER_BATCH=$BATCH_SIZE
 NUM_PROMPTS=$((BATCH_SIZE * NUM_GPUS))
 
-export VLLM_ROUTING_MODE_THRESHOLD=256
+# Patch ROUTING_MODE_THRESHOLD directly in source instead of
+# setting env var, which conflicts with nsys profiling.
+DCPF_PY="$(python3 -c 'from vllm.model_executor.layers.fused_moe import dispatch_combine_prepare_finalize as m; print(m.__file__)')"
+sed -i 's|"VLLM_ROUTING_MODE_THRESHOLD", "[^"]*"|"VLLM_ROUTING_MODE_THRESHOLD", "256"|' "$DCPF_PY"
+unset VLLM_ROUTING_MODE_THRESHOLD
 # export VLLM_DC_PROFILE=10 # time breakdown debug
 # export VLLM_MOE_LOAD_PROFILE_INTERVAL=10 # print expert activation / token distribution
 
