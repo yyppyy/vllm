@@ -1863,13 +1863,22 @@ class FusedMoE(CustomOp):
         """Init/update integrated routing on p2p_manager.
 
         Called from set_eplb_state() when dispatch_combine
-        backend is used with EPLB. Always activates
-        integrated routing so the fused dispatch kernel
-        handles routing decisions internally with global
-        demand visibility, using routing_mode=0 (minimize
-        experts) for decode and routing_mode=1 (balance
-        tokens via section-level splitting) for prefill.
+        backend is used with EPLB and mem_bound_aware_routing
+        is enabled (e.g. --mem-bound-aware-routing greedy).
+        When active, the fused dispatch kernel handles
+        routing internally with global demand visibility,
+        using routing_mode=0 (minimize experts) for decode
+        and routing_mode=1 (balance tokens via section-level
+        splitting) for prefill.
+
+        When mem_bound_aware_routing is not set, EPLB uses
+        the separated dispatch_combine path with pre-dispatch
+        logical-to-physical mapping.
         """
+        mbr = self.moe_parallel_config.mem_bound_aware_routing
+        if not mbr:
+            return
+
         pf = self._get_prepare_finalize()
         if pf is None:
             return
