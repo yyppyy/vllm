@@ -316,8 +316,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             )
 
         elif moe.moe_parallel_config.use_dispatch_combine_kernels:
+            # Buffer must accommodate actual max batch, not
+            # DP chunk size, to avoid section overflow at
+            # large M (prefill). IPC buffers are allocated
+            # once and cannot be resized per-call.
+            from vllm.config import get_current_vllm_config
+            _vllm_cfg = get_current_vllm_config()
+            _max_batched = getattr(
+                _vllm_cfg.scheduler_config,
+                'max_num_batched_tokens', None)
+            buffer_max_tokens = max(
+                moe.max_num_tokens,
+                _max_batched or moe.max_num_tokens)
             all_to_all_args = dict(
-                max_num_tokens=moe.max_num_tokens,
+                max_num_tokens=buffer_max_tokens,
                 hidden_dim=moe.hidden_dim,
                 topk=moe.experts_per_token,
                 dtype=moe.in_dtype,

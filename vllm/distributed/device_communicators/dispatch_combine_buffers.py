@@ -81,8 +81,8 @@ class DispatchCombineP2PManager:
     - dispatch_recv: (max_recv * hidden_dim * dtype_size) bytes
     - dispatch_meta: (max_recv * 16) bytes  (4 int32s per entry)
     - dispatch_offset: (64 * 4) bytes (int32[kMaxRanks] per-sender)
-    - combine_recv: (max_recv * hidden_dim * dtype_size) bytes
-    - combine_meta: (max_recv * 16) bytes
+    - combine_recv: (max_combine_recv * hidden_dim * dtype_size)
+    - combine_meta: (max_combine_recv * 16) bytes
     - combine_offset: (64 * 4) bytes (int32[kMaxRanks] per-sender)
     - local_dispatch_counters: (64 * 4) bytes (int32[kMaxRanks])
     - local_combine_counters: (64 * 4) bytes (int32[kMaxRanks])
@@ -121,13 +121,31 @@ class DispatchCombineP2PManager:
             rank, self._device, world_size,
             max_num_tokens, hidden_dim, topk, str(dtype))
 
-        # Max tokens any rank can receive.
+        # Max dispatch metadata entries any rank receives.
         self.max_recv = max_num_tokens * topk * 2
+        # Dispatch data: dedup writes one entry per
+        # unique (sender, token). Max = ws * M.
+        self.max_dispatch_data_recv = (
+            world_size * max_num_tokens)
+        # Combine pre-reduces to one entry per unique
+        # (computing_rank, source_token) group. Max per
+        # section = M (hard bound from dedup dispatch).
+        self.max_combine_recv = world_size * max_num_tokens
 
-        # Buffer sizes in bytes.
+        # Dispatch buffer sizes in bytes.
+        # Data buffer: compact (ws * M entries).
+        # Meta buffer: full (M * topk * 2 entries).
         self._recv_bytes = (
-            self.max_recv * hidden_dim * self._dtype_size)
+            self.max_dispatch_data_recv * hidden_dim
+            * self._dtype_size)
         self._meta_bytes = self.max_recv * 4 * 4
+        # Combine buffer sizes (smaller due to
+        # pre-reduction in fused combine_and_scatter).
+        self._combine_recv_bytes = (
+            self.max_combine_recv * hidden_dim
+            * self._dtype_size)
+        self._combine_meta_bytes = (
+            self.max_combine_recv * 4 * 4)
         # Per-sender section offsets: int32[kMaxRanks].
         self._offset_bytes = 4 * 64
 
@@ -151,14 +169,16 @@ class DispatchCombineP2PManager:
             self._raw_dispatch_offset, 0, self._offset_bytes)
 
         self._raw_combine_recv = self._cuda_rt.cudaMalloc(
-            self._recv_bytes)
+            self._combine_recv_bytes)
         self._cuda_rt.cudaMemset(
-            self._raw_combine_recv, 0, self._recv_bytes)
+            self._raw_combine_recv, 0,
+            self._combine_recv_bytes)
 
         self._raw_combine_meta = self._cuda_rt.cudaMalloc(
-            self._meta_bytes)
+            self._combine_meta_bytes)
         self._cuda_rt.cudaMemset(
-            self._raw_combine_meta, 0, self._meta_bytes)
+            self._raw_combine_meta, 0,
+            self._combine_meta_bytes)
 
         self._raw_combine_offset = self._cuda_rt.cudaMalloc(
             self._offset_bytes)
@@ -250,8 +270,8 @@ class DispatchCombineP2PManager:
         self.dispatch_recv_tensor = (
             torch.ops._C_dispatch_combine.wrap_cuda_ptr(
                 ct, self._raw_dispatch_recv.value,
-                self.max_recv, hidden_dim,
-                dtype_code))
+                self.max_dispatch_data_recv,
+                hidden_dim, dtype_code))
         self.dispatch_meta_tensor = (
             torch.ops._C_dispatch_combine.wrap_cuda_ptr(
                 ct, self._raw_dispatch_meta.value,
@@ -279,8 +299,12 @@ class DispatchCombineP2PManager:
 
         logger.info(
             "DispatchCombineP2PManager initialized: rank=%d,"
-            " world_size=%d, max_recv=%d, hidden_dim=%d",
-            rank, world_size, self.max_recv, hidden_dim)
+            " world_size=%d, max_recv=%d,"
+            " max_dispatch_data_recv=%d,"
+            " max_combine_recv=%d, hidden_dim=%d",
+            rank, world_size, self.max_recv,
+            self.max_dispatch_data_recv,
+            self.max_combine_recv, hidden_dim)
 
     @staticmethod
     def _handle_to_bytes(handle) -> bytes:
@@ -523,10 +547,13 @@ class DispatchCombineP2PManager:
         data += struct.pack('Q', ptr)
 
         # ---- Per-sender section support ----
-        section_size = (self.max_recv // self.world_size
-                        if self.world_size > 0 else 0)
-        data += struct.pack('i', section_size)  # dispatch
-        data += struct.pack('i', section_size)  # combine
+        dispatch_ss = (self.max_recv // self.world_size
+                       if self.world_size > 0 else 0)
+        combine_ss = (self.max_combine_recv
+                      // self.world_size
+                      if self.world_size > 0 else 0)
+        data += struct.pack('i', dispatch_ss)
+        data += struct.pack('i', combine_ss)
         data += struct.pack(
             'Q', self._raw_local_dispatch_counters.value)
         data += struct.pack(
@@ -690,8 +717,7 @@ class DispatchCombineP2PManager:
     def gpu_prepare_dispatch_recv(
             self, mc: int, num_experts: int):
         """Fused stamp/zero + routing metadata
-        extraction. Replaces stamp_and_zero_dispatch +
-        8 PyTorch ops in _receiver(). Returns
+        extraction + data_remap computation. Returns
         (expert_topk_ids, expert_topk_weights,
          expert_num_tokens) sliced to mc."""
         if self.expert_num_tokens_buf is None:
@@ -702,6 +728,7 @@ class DispatchCombineP2PManager:
                 self.expert_topk_ids_buf,
                 self.expert_topk_weights_buf,
                 self.expert_num_tokens_buf,
+                self.data_remap_buf,
                 self.config_tensor,
                 mc, self.hidden_dim,
                 num_experts)

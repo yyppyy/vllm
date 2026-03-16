@@ -30,16 +30,23 @@ void dispatch_p2p(
   const int32_t M32 = static_cast<int32_t>(M);
   const int32_t K32 = static_cast<int32_t>(K);
   const int32_t topk32 = static_cast<int32_t>(topk);
-  int num_pairs = M32 * topk32;
-  dim3 grid(num_pairs);
+  // Persistent grid: per-token processing with dedup.
+  int32_t grid_sz = M32;
+  if (grid_sz > kPersistentGrid)
+    grid_sz = kPersistentGrid;
+  if (grid_sz < 1) grid_sz = 1;
+  dim3 grid(grid_sz);
   dim3 block(kBlockSize);
+  // Dynamic shared memory: ws*4 + 3*kMaxEntries*4.
+  constexpr int kMaxEntries = 64;
+  int smem = kMaxRanks * 4 + 3 * kMaxEntries * 4;
 
   AT_DISPATCH_SWITCH(
       input.scalar_type(), "dispatch_p2p",
       AT_DISPATCH_CASE(at::ScalarType::BFloat16,
         [&] {
           dispatch_p2p_kernel<__nv_bfloat16>
-              <<<grid, block, 0, stream>>>(
+              <<<grid, block, smem, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   input.data_ptr()),
               topk_ids.data_ptr<int32_t>(),
@@ -49,7 +56,7 @@ void dispatch_p2p(
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
           dispatch_p2p_kernel<__half>
-              <<<grid, block, 0, stream>>>(
+              <<<grid, block, smem, stream>>>(
               reinterpret_cast<const __half*>(
                   input.data_ptr()),
               topk_ids.data_ptr<int32_t>(),
@@ -139,6 +146,7 @@ void prepare_dispatch_recv(
     torch::Tensor expert_topk_ids,
     torch::Tensor expert_topk_weights,
     torch::Tensor expert_num_tokens,
+    torch::Tensor data_remap,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t num_experts) {
@@ -178,6 +186,7 @@ void prepare_dispatch_recv(
               expert_topk_ids.data_ptr<int64_t>(),
               expert_topk_weights.data_ptr<float>(),
               expert_num_tokens.data_ptr<int32_t>(),
+              data_remap.data_ptr<int32_t>(),
               config, mc32, K32, ne32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
@@ -189,6 +198,7 @@ void prepare_dispatch_recv(
               expert_topk_ids.data_ptr<int64_t>(),
               expert_topk_weights.data_ptr<float>(),
               expert_num_tokens.data_ptr<int32_t>(),
+              data_remap.data_ptr<int32_t>(),
               config, mc32, K32, ne32);
         })
   );

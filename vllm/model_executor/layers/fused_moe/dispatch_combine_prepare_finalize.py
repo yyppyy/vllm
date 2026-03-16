@@ -190,10 +190,15 @@ class DispatchCombinePrepareAndFinalize(
                 elv.add_(
                     expert_num_tokens.to(elv.dtype))
 
+        # data_remap computed by prepare_dispatch_recv:
+        # maps each metadata entry to its compact data
+        # position (sender_rank * M + token_idx).
+        data_remap = mgr.data_remap_buf[:self._mc]
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,
             expert_map, expert_topk_ids,
-            expert_topk_weights, expert_num_tokens)
+            expert_topk_weights, expert_num_tokens,
+            data_remap)
 
     def _prepare_integrated(
         self,
@@ -289,18 +294,18 @@ class DispatchCombinePrepareAndFinalize(
 
         if self._used_integrated:
             # Compacted path: gather mc_compact entries
-            # using compact_data_remap which combines
-            # section compaction + co-located dedup.
+            # using compact_data_remap (compact data
+            # positions from section compaction).
             compact_remap = (
                 mgr.compact_data_remap_buf[:mc])
             expert_x = (
                 mgr.dispatch_recv_tensor[compact_remap])
         else:
-            # Non-integrated path: use original recv.
-            expert_x = mgr.dispatch_recv_tensor[:mc]
-            # Expand shared data for co-located dedup.
-            if data_remap is not None:
-                expert_x = expert_x[data_remap]
+            # Non-integrated path: gather via data_remap.
+            # data_remap maps metadata positions to compact
+            # data positions (sender*M + token_idx).
+            expert_x = (
+                mgr.dispatch_recv_tensor[data_remap])
 
         # Post-dispatch quantization.
         expert_x_scale = None

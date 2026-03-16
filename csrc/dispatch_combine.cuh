@@ -297,8 +297,15 @@ __global__ void p2p_barrier_kernel(
 }
 
 // ====================================================================
-// Dispatch P2P kernel
+// Dispatch P2P kernel (dedup: data sent once per group)
 // ====================================================================
+// Persistent-grid per-token dispatch: groups topk entries by
+// dest_rank, claims contiguous positions per group, writes
+// activation data ONCE per (token, dest_rank) group over
+// NVLink. Metadata written per entry. Same pattern as
+// dispatch_and_route_kernel Phase A but without routing.
+// Grid = kPersistentGrid, block = kBlockSize.
+// Requires dynamic shared memory: ws*4 + 3*kMaxEntries*4.
 template <typename T>
 __global__ void dispatch_p2p_kernel(
     const T* __restrict__ input,
@@ -309,61 +316,129 @@ __global__ void dispatch_p2p_kernel(
     int32_t K,
     int32_t topk) {
   const int32_t rank = config->rank;
-  const int32_t experts_per_rank = config->experts_per_rank;
+  const int32_t ws = config->world_size;
+  const int32_t epr = config->experts_per_rank;
 
-  const int32_t pair_idx = blockIdx.x;
-  if (pair_idx >= M * topk) return;
+  constexpr int32_t kMaxEntries = 64;
+  extern __shared__ int32_t shared[];
+  int32_t* s_grp_count = shared;              // [ws]
+  int32_t* s_ent_eid   = shared + ws;         // [kME]
+  float*   s_ent_wt    = reinterpret_cast<float*>(
+      s_ent_eid + kMaxEntries);                // [kME]
+  int32_t* s_ent_grp   = reinterpret_cast<int32_t*>(
+      s_ent_wt + kMaxEntries);                 // [kME]
+  __shared__ int32_t s_total_entries;
+  __shared__ int32_t s_grp_base[kMaxRanks];
 
-  const int32_t token_idx = pair_idx / topk;
-  const int32_t expert_slot = pair_idx % topk;
-
-  const int32_t expert_id =
-      topk_ids[token_idx * topk + expert_slot];
-  const float weight =
-      topk_weights[token_idx * topk + expert_slot];
-  const int32_t dest_rank = expert_id / experts_per_rank;
-
-  if (dest_rank < 0 || dest_rank >= config->world_size)
-    return;
-
-  if (!config->remote_dispatch_offsets[dest_rank] ||
-      !config->remote_dispatch_recv[dest_rank] ||
-      !config->remote_dispatch_meta[dest_rank]) {
-    return;
-  }
-
-  __shared__ int32_t s_write_pos;
-  if (threadIdx.x == 0) {
-    // Local atomicAdd for position claiming.
-    int32_t local_off = atomicAdd(
-        &config->local_dispatch_counters[dest_rank], 1);
-    int32_t ss = config->dispatch_section_size;
-    // Section overflow: drop if section full.
-    s_write_pos = (local_off < ss)
-        ? rank * ss + local_off : config->max_recv;
-  }
+  // Init per-token state.
+  if (threadIdx.x < ws)
+    s_grp_count[threadIdx.x] = 0;
+  if (threadIdx.x == 0) s_total_entries = 0;
   __syncthreads();
 
-  const int32_t write_pos = s_write_pos;
-  if (write_pos >= config->max_recv) return;
+  for (int32_t t = blockIdx.x; t < M;
+       t += gridDim.x) {
+    // Step 1: threads 0..topk-1 expand entries,
+    // group by dest_rank.
+    if (threadIdx.x < topk) {
+      int32_t eid =
+          topk_ids[t * topk + threadIdx.x];
+      if (eid >= 0) {
+        int32_t dr = eid / epr;
+        if (dr >= 0 && dr < ws
+            && config->remote_dispatch_recv[dr]
+            && config->remote_dispatch_meta[dr]
+            && config->
+                   remote_dispatch_offsets[dr]) {
+          float wt = topk_weights[
+              t * topk + threadIdx.x];
+          int32_t ei =
+              atomicAdd(&s_total_entries, 1);
+          if (ei < kMaxEntries) {
+            s_ent_eid[ei] = eid;
+            s_ent_wt[ei] = wt;
+            s_ent_grp[ei] = dr;
+            atomicAdd(&s_grp_count[dr], 1);
+          }
+        }
+      }
+    }
+    __syncthreads();
 
-  T* dest_data = reinterpret_cast<T*>(
-      config->remote_dispatch_recv[dest_rank]);
-  const T* src_data = input + token_idx * K;
-  for (int32_t k = threadIdx.x; k < K; k += blockDim.x) {
-    dest_data[write_pos * K + k] = src_data[k];
+    // Step 2: Claim contiguous positions per group.
+    if (threadIdx.x < ws
+        && s_grp_count[threadIdx.x] > 0) {
+      int32_t local_off = atomicAdd(
+          &config->local_dispatch_counters[
+              threadIdx.x],
+          s_grp_count[threadIdx.x]);
+      int32_t ss = config->dispatch_section_size;
+      s_grp_base[threadIdx.x] =
+          (local_off < ss)
+          ? rank * ss + local_off
+          : config->max_recv;
+    }
+    __syncthreads();
+
+    // Step 3: Data copy ONCE per group + metadata.
+    // int4 = 16 bytes → 8x fewer stores than bf16.
+    const int32_t K4 = K *
+        static_cast<int32_t>(sizeof(T)) /
+        static_cast<int32_t>(sizeof(int4));
+    for (int32_t g = 0; g < ws; g++) {
+      if (s_grp_count[g] == 0) continue;
+      int32_t base = s_grp_base[g];
+      int32_t n = s_grp_count[g];
+      if (base >= config->max_recv) continue;
+      if (base + n > config->max_recv)
+        n = config->max_recv - base;
+
+      // Vectorized data copy (int4).
+      // Data position: deterministic from (rank, t).
+      // Each token written once per dest (dedup).
+      int32_t data_pos =
+          rank * config->max_num_tokens_per_rank
+          + t;
+      const int4* src4 =
+          reinterpret_cast<const int4*>(
+              input + t * K);
+      int4* dest4 = reinterpret_cast<int4*>(
+          reinterpret_cast<T*>(
+              config->remote_dispatch_recv[g])
+          + data_pos * K);
+      for (int32_t i = threadIdx.x; i < K4;
+           i += blockDim.x) {
+        dest4[i] = src4[i];
+      }
+
+      // Thread 0: write metadata per entry.
+      if (threadIdx.x == 0) {
+        TokenMetadata* meta =
+            reinterpret_cast<TokenMetadata*>(
+                config->remote_dispatch_meta[g]);
+        int32_t ne2 = s_total_entries;
+        if (ne2 > kMaxEntries) ne2 = kMaxEntries;
+        int32_t mi = 0;
+        for (int32_t ei = 0;
+             ei < ne2 && mi < n; ei++) {
+          if (s_ent_grp[ei] != g) continue;
+          meta[base + mi].source_rank = rank;
+          meta[base + mi].source_token_idx = t;
+          meta[base + mi].expert_id =
+              s_ent_eid[ei];
+          meta[base + mi].topk_weight =
+              s_ent_wt[ei];
+          mi++;
+        }
+      }
+    }
+
+    // Reset per-token state for next iteration.
+    if (threadIdx.x < ws)
+      s_grp_count[threadIdx.x] = 0;
+    if (threadIdx.x == 0) s_total_entries = 0;
+    __syncthreads();
   }
-
-  if (threadIdx.x == 0) {
-    TokenMetadata* dest_meta =
-        reinterpret_cast<TokenMetadata*>(
-            config->remote_dispatch_meta[dest_rank]);
-    dest_meta[write_pos].source_rank = rank;
-    dest_meta[write_pos].source_token_idx = token_idx;
-    dest_meta[write_pos].expert_id = expert_id;
-    dest_meta[write_pos].topk_weight = weight;
-  }
-
 }
 
 // ====================================================================
@@ -424,14 +499,16 @@ __global__ void combine_p2p_kernel(
             &config->local_combine_counters[
                 dest_rank], 1);
         int32_t ss = config->combine_section_size;
+        int32_t max_c = ss * config->world_size;
         s_write_pos = (local_off < ss)
             ? config->rank * ss + local_off
-            : config->max_recv;
+            : max_c;
       }
       __syncthreads();
 
       const int32_t write_pos = s_write_pos;
-      if (write_pos >= config->max_recv) continue;
+      if (write_pos >= config->combine_section_size
+          * config->world_size) continue;
 
       T* dest_data = reinterpret_cast<T*>(
           config->remote_combine_recv[dest_rank]);
@@ -466,17 +543,23 @@ __global__ void combine_p2p_kernel(
 // Fused prepare: barrier + stamp/zero + routing metadata
 // ====================================================================
 // Fuses p2p_barrier(RESET_COMBINE) + stamp_and_zero_dispatch
-// + routing extraction into one kernel. Block 0 does the
-// cross-GPU barrier; other blocks spin on the counter.
+// + routing extraction + data_remap computation into one
+// kernel. Block 0 does the cross-GPU barrier; other blocks
+// spin on the counter.
 // Grid = kPersistentGrid, block = kBlockSize.
 // expert_num_tokens is zeroed inline by block 0 after
 // barrier, before signaling other blocks.
+// data_remap: maps each entry to its group leader (first
+// entry with same source_rank + source_token_idx within
+// the section). Enables dispatch_p2p dedup: data is only
+// at the leader position, other entries share it.
 template <typename T>
 __global__ void prepare_dispatch_recv_kernel(
     T* __restrict__ dispatch_recv,
     int64_t* __restrict__ expert_topk_ids,
     float* __restrict__ expert_topk_weights,
     int32_t* __restrict__ expert_num_tokens,
+    int32_t* __restrict__ data_remap,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc,
     int32_t K,
@@ -543,47 +626,62 @@ __global__ void prepare_dispatch_recv_kernel(
     __syncthreads();
   }
 
-  // Phase 2: Stamp/zero + routing (persistent loop).
+  // Phase 2: Stamp/zero + routing (thread-parallel).
   // Section-aware: each sender owns a section of size
   // dispatch_section_size. Entry is real if its offset
   // within its section < that section's count.
+  // All threads participate (thread-stride) for 256x
+  // throughput vs old block-stride/thread-0-only.
   const int32_t rank = config->rank;
   const int32_t ws_p = config->world_size;
   const int32_t ss_p = config->dispatch_section_size;
+  const TokenMetadata* meta_p2 =
+      reinterpret_cast<const TokenMetadata*>(
+          config->remote_dispatch_meta[rank]);
 
-  for (int32_t idx = blockIdx.x; idx < mc;
-       idx += gridDim.x) {
+  for (int32_t idx = blockIdx.x * blockDim.x
+           + threadIdx.x;
+       idx < mc;
+       idx += gridDim.x * blockDim.x) {
     int32_t sec = idx / ss_p;
     int32_t off = idx % ss_p;
     int32_t sec_cnt_p = config->
         remote_dispatch_offsets[rank][sec];
     if (sec_cnt_p > ss_p) sec_cnt_p = ss_p;
-    bool is_real = (sec < ws_p)
-        && (off < sec_cnt_p);
-    if (is_real) {
-      if (threadIdx.x == 0) {
-        const TokenMetadata* meta =
-            reinterpret_cast<const TokenMetadata*>(
-                config->remote_dispatch_meta[rank]);
-        int32_t eid = meta[idx].expert_id;
-        expert_topk_ids[idx] =
-            static_cast<int64_t>(eid);
-        expert_topk_weights[idx] = 1.0f;
-        if (eid >= 0 && eid < num_experts) {
-          atomicAdd(&expert_num_tokens[eid], 1);
-        }
+    if (sec < ws_p && off < sec_cnt_p) {
+      int32_t eid = meta_p2[idx].expert_id;
+      expert_topk_ids[idx] =
+          static_cast<int64_t>(eid);
+      expert_topk_weights[idx] = 1.0f;
+      if (eid >= 0 && eid < num_experts) {
+        atomicAdd(&expert_num_tokens[eid], 1);
       }
     } else {
-      // Stale: K-data zeroing removed (never consumed,
-      // bounded by expert_num_tokens). Metadata sentinels
-      // removed (combine_p2p is section-aware).
-      // Only expert_topk_ids/weights needed by
-      // moe_align_block_size downstream.
-      if (threadIdx.x == 0) {
-        expert_topk_ids[idx] =
-            static_cast<int64_t>(num_experts);
-        expert_topk_weights[idx] = 0.0f;
-      }
+      expert_topk_ids[idx] =
+          static_cast<int64_t>(num_experts);
+      expert_topk_weights[idx] = 0.0f;
+    }
+  }
+
+  // Phase 3: Compute data_remap (compact data position).
+  // Data is at sender_rank * max_num_tokens_per_rank +
+  // source_token_idx (deterministic, no scan needed).
+  for (int32_t idx = blockIdx.x * blockDim.x
+           + threadIdx.x;
+       idx < mc;
+       idx += gridDim.x * blockDim.x) {
+    int32_t sec = idx / ss_p;
+    int32_t off = idx % ss_p;
+    int32_t sec_cnt_dr = config->
+        remote_dispatch_offsets[rank][sec];
+    if (sec_cnt_dr > ss_p) sec_cnt_dr = ss_p;
+    if (sec < ws_p && off < sec_cnt_dr) {
+      data_remap[idx] =
+          meta_p2[idx].source_rank
+          * config->max_num_tokens_per_rank
+          + meta_p2[idx].source_token_idx;
+    } else {
+      data_remap[idx] = 0;  // Harmless for stale
     }
   }
 }
@@ -830,12 +928,13 @@ __global__ void combine_and_scatter_kernel(
       int32_t pos[kMaxRanks];
       for (int32_t d = 0; d < ws; d++)
         pos[d] = cdr_start[d];
+      int32_t max_c = ss_c * ws;
       for (int32_t g = 0; g < nu; g++) {
         int32_t dr = s_unique_dr[g];
         int32_t local_off = pos[dr]++;
         s_unique_wpos[g] = (local_off < ss_c)
             ? rank * ss_c + local_off
-            : config->max_recv;
+            : max_c;
       }
     }
     __syncthreads();
@@ -876,9 +975,10 @@ __global__ void combine_and_scatter_kernel(
       // cas:sw_accum — HBM reads + accumulation done
 
       // Write all reduced vectors to NVLink.
+      int32_t max_c_wr = ss_c * ws;
       for (int32_t u = 0; u < nu; u++) {
         int32_t write_pos = s_unique_wpos[u];
-        if (write_pos >= config->max_recv) continue;
+        if (write_pos >= max_c_wr) continue;
         int32_t dr = s_unique_dr[u];
         T* dest = reinterpret_cast<T*>(
             config->remote_combine_recv[dr]);
@@ -919,7 +1019,7 @@ __global__ void combine_and_scatter_kernel(
         __syncthreads();
 
         int32_t write_pos = s_unique_wpos[u];
-        if (write_pos < config->max_recv) {
+        if (write_pos < ss_c * ws) {
           int32_t dr = s_unique_dr[u];
           T* dest = reinterpret_cast<T*>(
               config->remote_combine_recv[dr]);
@@ -1080,7 +1180,7 @@ __global__ void combine_and_scatter_kernel(
 // ---- Section compaction ----
 // Gathers valid entries from scattered per-sender sections
 // into contiguous positions. Builds compact_data_remap
-// (compact_idx → original leader index for dedup + gather),
+// (compact_idx → compact data position for gather),
 // compact_expert_topk_ids, compact_expert_topk_weights,
 // and compact_reverse (original_idx → compact_idx for
 // combine kernel to read expert output).
@@ -1135,14 +1235,11 @@ __global__ void dar_compact_kernel(
       const int32_t original_idx = section_start + i;
       const int32_t compact_idx = compact_base + i;
 
-      // Map compact position to original position of
-      // the dedup leader. dispatch_recv_tensor has data
-      // at original (scattered) positions, so the gather
-      // in _receiver() needs original indices.
-      const int32_t leader_original =
-          data_remap[original_idx];
+      // Map compact position to compact data position
+      // (sender_rank * M + token_idx). The gather in
+      // _receiver() indexes dispatch_recv_tensor.
       compact_data_remap[compact_idx] =
-          leader_original;
+          data_remap[original_idx];
 
       // Copy expert_topk_ids and weights.
       compact_expert_topk_ids[compact_idx] =
@@ -1357,13 +1454,18 @@ __global__ void dispatch_and_route_kernel(
         n = config->max_recv - base;
 
       // All threads: vectorized data copy (int4).
+      // Data position: deterministic from (rank, t).
+      // Each token written once per dest (dedup).
+      int32_t data_pos =
+          rank * config->max_num_tokens_per_rank
+          + t;
       const int4* src4 =
           reinterpret_cast<const int4*>(
               input + t * K);
       int4* dest4 = reinterpret_cast<int4*>(
           reinterpret_cast<T*>(
               config->remote_dispatch_recv[g])
-          + base * K);
+          + data_pos * K);
       for (int32_t i = threadIdx.x; i < K4;
            i += blockDim.x) {
         dest4[i] = src4[i];
@@ -1722,7 +1824,7 @@ __global__ void dispatch_and_route_kernel(
         // Write sentinel defaults for ALL entries.
         expert_topk_ids[idx] = d2_sentinel;
         expert_topk_weights[idx] = 0.0f;
-        data_remap[idx] = idx;
+        data_remap[idx] = 0;  // Harmless for stale
 
         // Section-aware real check. Clamp count to
         // section size: raw counter may exceed ss_d2.
@@ -1732,23 +1834,11 @@ __global__ void dispatch_and_route_kernel(
             remote_dispatch_offsets[rank][sec];
         if (sec_cnt > ss_d2) sec_cnt = ss_d2;
         if (sec < ws && off < sec_cnt) {
-          // Backward scan for group leader.
-          int32_t section_start = sec * ss_d2;
-          int32_t leader = idx;
-          if (idx > section_start) {
-            int32_t sr = meta_r[idx].source_rank;
-            int32_t st =
-                meta_r[idx].source_token_idx;
-            int32_t chk = idx - 1;
-            while (chk >= section_start
-                   && meta_r[chk].source_rank == sr
-                   && meta_r[chk].source_token_idx
-                       == st) {
-              leader = chk;
-              chk--;
-            }
-          }
-          data_remap[idx] = leader;
+          // Compact data position (deterministic).
+          data_remap[idx] =
+              meta_r[idx].source_rank
+              * config->max_num_tokens_per_rank
+              + meta_r[idx].source_token_idx;
 
           // Routing filter.
           const int32_t logical_id =
