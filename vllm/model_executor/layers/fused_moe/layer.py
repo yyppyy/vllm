@@ -723,7 +723,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                and isinstance(
                    self.fused_experts.prepare_finalize,
                    DispatchCombinePrepareAndFinalize)
-               and self.moe_parallel_config
+               and getattr(
+                   layer, 'moe_parallel_config', None)
+               and layer.moe_parallel_config
                .mem_bound_aware_routing)
         eplb_for_select = enable_eplb and not _ir
 
