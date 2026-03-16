@@ -10,6 +10,7 @@ compatibility. Synchronization uses NCCL all-reduce barriers on the
 EP device group instead of host-side torch.cuda.synchronize() or
 dist.barrier(cpu_group).
 """
+import os
 from typing import Callable, Optional
 
 import torch
@@ -37,7 +38,8 @@ _MOE_LOAD_PROFILE_INTERVAL = int(
 # (minimize activated experts), M > this uses
 # routing_mode=1 (balance tokens via section-level
 # splitting across replicas).
-ROUTING_MODE_THRESHOLD = 256
+ROUTING_MODE_THRESHOLD = int(
+    os.environ.get("VLLM_ROUTING_MODE_THRESHOLD", "256"))
 
 
 class DispatchCombinePrepareAndFinalize(
