@@ -137,8 +137,9 @@ vllm bench serve "${cli_args[@]}"
 
 ############## kill server & collect profile and logs ##############
 if [[ -n "${NSYS_PID:-}" ]]; then
-  # Profiler path: signal nsys directly so it can flush its trace data
-  kill -INT "$NSYS_PID" 2>/dev/null || true
+  # Profiler path: signal entire process group so nsys + forked
+  # vllm workers all receive INT and nsys can collect from them.
+  kill -INT -- "-$NSYS_PID" 2>/dev/null || true
 
   # Give nsys generous time to finalize (up to 60s)
   for _ in {1..600}; do
@@ -148,7 +149,7 @@ if [[ -n "${NSYS_PID:-}" ]]; then
 
   # If nsys is still alive, escalate (but avoid SIGKILL — it corrupts output)
   if kill -0 "$NSYS_PID" 2>/dev/null; then
-    kill -TERM "$NSYS_PID" 2>/dev/null || true
+    kill -TERM -- "-$NSYS_PID" 2>/dev/null || true
     for _ in {1..100}; do
       kill -0 "$NSYS_PID" 2>/dev/null || break
       sleep 0.1
