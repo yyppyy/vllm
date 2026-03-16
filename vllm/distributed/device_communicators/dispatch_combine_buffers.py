@@ -291,6 +291,7 @@ class DispatchCombineP2PManager:
         self.expert_num_tokens_buf = None
         self.data_remap_buf = None
         self.expert_x_buf = None
+        self.remap_i64_buf = None
         self._num_experts = None
 
         # Init barrier: sync all ranks after IPC setup.
@@ -721,6 +722,13 @@ class DispatchCombineP2PManager:
         self.expert_x_buf = torch.empty(
             self.max_recv, self.hidden_dim,
             dtype=self.dtype,
+            device=dev)
+        # Pre-allocated int64 remap buffer for
+        # index_select (requires int64 indices).
+        # Avoids .long() allocation during CUDA
+        # graph capture.
+        self.remap_i64_buf = torch.empty(
+            self.max_recv, dtype=torch.int64,
             device=dev)
 
     def gpu_prepare_dispatch_recv(

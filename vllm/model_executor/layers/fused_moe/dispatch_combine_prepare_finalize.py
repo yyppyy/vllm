@@ -292,25 +292,21 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
         mc = self._mc
 
+        # Copy int32 remap indices into pre-allocated
+        # int64 buffer (index_select requires int64).
+        # .copy_() is CUDA graph safe; .long() is not
+        # (it allocates a new tensor).
+        remap_i64 = mgr.remap_i64_buf[:mc]
         if self._used_integrated:
-            # Compacted path: gather mc_compact entries
-            # using compact_data_remap (compact data
-            # positions from section compaction).
-            compact_remap = (
+            remap_i64.copy_(
                 mgr.compact_data_remap_buf[:mc])
-            torch.index_select(
-                mgr.dispatch_recv_tensor, 0,
-                compact_remap.long(),
-                out=mgr.expert_x_buf[:mc])
-            expert_x = mgr.expert_x_buf[:mc]
         else:
-            # Non-integrated path: gather via data_remap
-            # into pre-allocated buffer (no allocation).
-            torch.index_select(
-                mgr.dispatch_recv_tensor, 0,
-                data_remap.long(),
-                out=mgr.expert_x_buf[:mc])
-            expert_x = mgr.expert_x_buf[:mc]
+            remap_i64.copy_(data_remap)
+        torch.index_select(
+            mgr.dispatch_recv_tensor, 0,
+            remap_i64,
+            out=mgr.expert_x_buf[:mc])
+        expert_x = mgr.expert_x_buf[:mc]
 
         # Post-dispatch quantization.
         expert_x_scale = None
