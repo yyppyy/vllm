@@ -294,6 +294,7 @@ class DispatchCombineP2PManager:
         self.remap_i64_buf = None
         self.topk_ids_i32_buf = None
         self.topk_weights_f32_buf = None
+        self.accum_buf = None
         self._num_experts = None
 
         # Init barrier: sync all ranks after IPC setup.
@@ -637,6 +638,7 @@ class DispatchCombineP2PManager:
                 dispatch_meta,
                 self.compact_reverse_buf,
                 output,
+                self.accum_buf,
                 self.config_tensor,
                 mc, self.hidden_dim, M)
 
@@ -740,6 +742,13 @@ class DispatchCombineP2PManager:
             dtype=torch.int32, device=dev)
         self.topk_weights_f32_buf = torch.empty(
             self.max_num_tokens, self.topk,
+            dtype=torch.float32, device=dev)
+        # Pre-allocated fp32 accumulation buffer for
+        # combine_and_scatter kernel. Avoids
+        # torch::empty in C++ during CUDA graph
+        # capture.
+        self.accum_buf = torch.empty(
+            self.max_num_tokens, self.hidden_dim,
             dtype=torch.float32, device=dev)
 
     def gpu_prepare_dispatch_recv(

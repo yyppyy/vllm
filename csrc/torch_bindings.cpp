@@ -32,6 +32,7 @@ void combine_and_scatter(torch::Tensor expert_output,
                          torch::Tensor dispatch_meta,
                          torch::Tensor compact_reverse,
                          torch::Tensor output,
+                         torch::Tensor accum,
                          torch::Tensor config_tensor,
                          int64_t mc, int64_t K,
                          int64_t M);
@@ -909,6 +910,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "Tensor dispatch_meta, "
       "Tensor compact_reverse, "
       "Tensor! output, "
+      "Tensor! accum, "
       "Tensor config_tensor, "
       "int mc, int K, int M) -> ()");
   dc.impl("combine_and_scatter", torch::kCUDA,

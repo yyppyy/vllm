@@ -273,6 +273,7 @@ void combine_and_scatter(
     torch::Tensor dispatch_meta,
     torch::Tensor compact_reverse,
     torch::Tensor output,
+    torch::Tensor accum,
     torch::Tensor config_tensor,
     int64_t mc, int64_t K,
     int64_t M) {
@@ -304,12 +305,11 @@ void combine_and_scatter(
   dim3 grid(grid_sz);
   dim3 block(kBlockSize);
 
-  // fp32 accum buffer — zeroed inline by kernel Phase 0.
-  // Native fp32 atomicAdd avoids bf16 CAS loops and
-  // adjacent-element contention. Converted to output
-  // dtype by fp32_to_half_kernel after the fused kernel.
-  auto accum = torch::empty(
-      {M, K}, output.options().dtype(at::kFloat));
+  // accum is a pre-allocated fp32 buffer passed from
+  // Python (CUDA graph safe — no runtime allocation).
+  // Zeroed inline by kernel Phase 0. Native fp32
+  // atomicAdd avoids bf16 CAS loops. Converted to
+  // output dtype by fp32_to_half_kernel after.
 
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
