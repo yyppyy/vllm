@@ -126,13 +126,34 @@ class _MoELoadProfiler:
             s = r * experts_per_rank
             e = s + experts_per_rank
             per_rank.append(
-                expert_num_tokens[s:e].sum().item())
+                int(expert_num_tokens[s:e].sum().item()))
+
+        # Local expert slice for this rank.
+        s = ep_rank * experts_per_rank
+        e_local = s + num_local_experts
+        local_counts = expert_num_tokens[s:e_local]
 
         # Activated experts on THIS rank.
-        s = ep_rank * experts_per_rank
-        e = s + num_local_experts
         activated = int(
-            (expert_num_tokens[s:e] > 0).sum().item())
+            (local_counts > 0).sum().item())
+
+        # Per-layer detailed logging.
+        local_tokens = per_rank[ep_rank]
+        block_size = 128
+        padded = int(
+            ((local_counts + block_size - 1)
+             // block_size * block_size).sum().item())
+        max_expert = int(local_counts.max().item())
+        logger.info(
+            "[MoE Per-Layer] rank=%d layer=%d M=%d "
+            "local_tokens=%d activated=%d/%d "
+            "total_tokens_post_pad=%d "
+            "max_expert_tokens=%d "
+            "all_rank_tokens=%s",
+            ep_rank, self._call_count, M,
+            local_tokens, activated,
+            num_local_experts, padded,
+            max_expert, per_rank)
 
         if M not in self._stats:
             self._stats[M] = {
