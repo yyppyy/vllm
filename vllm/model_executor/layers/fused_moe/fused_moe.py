@@ -2006,7 +2006,11 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             B_bias=self.w2_bias,
         )
 
-        if (expert_tokens_meta is not None
+        if top_k_num == 1:
+            # topk=1: sum across topk dim is identity.
+            # Direct copy avoids expensive reduce_kernel.
+            output.copy_(intermediate_cache3.squeeze(1))
+        elif (expert_tokens_meta is not None
                 and expert_tokens_meta.topk_ids_for_masking
                 is not None):
             E_local = w1.size(0)

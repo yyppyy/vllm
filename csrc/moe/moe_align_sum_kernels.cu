@@ -315,6 +315,12 @@ void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   switch (topk) {
+    case 1:
+      // topk=1: sum is identity — just copy (squeeze dim 1).
+      // Avoids expensive at::sum_out fallback in default case.
+      output.copy_(input.squeeze(1));
+      break;
+
     case 2:
       VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
         vllm::moe::moe_sum_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(
