@@ -1077,10 +1077,20 @@ __global__ void combine_and_scatter_kernel(
           meta[write_pos].topk_weight = 1.0f;
         }
       }
+
+      // Stamp tiled-path slots so stale values don't
+      // produce garbage deltas in profiling output.
+      DC_TIMESTAMP(config, kDarNumSteps + 6);
+      DC_TIMESTAMP(config, kDarNumSteps + 7);
+      DC_TIMESTAMP(config, kDarNumSteps + 8);
     } else {
       // Tiled accumulation with sorted entries.
       // Each tile iterates ONLY its uid range
       // (no wasted scanning of all entries).
+      // Stamp fast-path slots so stale values don't
+      // produce garbage deltas in profiling output.
+      DC_TIMESTAMP(config, kDarNumSteps + 4);
+      DC_TIMESTAMP(config, kDarNumSteps + 5);
       int32_t max_c_wr = ss_c * ws;
       for (int32_t tile = 0; tile < nu;
            tile += kCasMaxUnique) {
