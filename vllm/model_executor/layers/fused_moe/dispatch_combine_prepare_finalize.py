@@ -20,8 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-    TopKWeightAndReduceContiguous,
-    TopKWeightAndReduceDelegate)
+    TopKWeightAndReduceContiguous)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input)
 
@@ -76,6 +75,9 @@ class DispatchCombinePrepareAndFinalize(
         self.max_recv = p2p_manager.max_recv
         # Set by layer.py when integrated routing is on.
         self.expert_load_view = None
+        # Resolved weight+reduce impl (avoids isinstance
+        # checks in the hot path which cause graph breaks).
+        self._weight_reduce = TopKWeightAndReduceContiguous()
 
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
@@ -119,8 +121,12 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
 
         # Ensure pre-allocated buffers exist (lazy init).
-        if getattr(mgr, 'topk_ids_i32_buf', None) is None:
-            mgr.init_prepare_buffers(num_experts)
+        # Guard with is_compiling() so Dynamo doesn't trace
+        # the init path (which is never re-entered).
+        if not torch.compiler.is_compiling():
+            if getattr(mgr, 'topk_ids_i32_buf',
+                       None) is None:
+                mgr.init_prepare_buffers(num_experts)
 
         # routing_mode selects the algorithm:
         # 0 = minimize experts (decode), 1 = balance
@@ -179,7 +185,8 @@ class DispatchCombinePrepareAndFinalize(
         topk_weights_f32 = mgr.topk_weights_f32_buf[:M]
         topk_weights_f32.copy_(topk_weights)
 
-        if mgr.expert_num_tokens_buf is None:
+        if (not torch.compiler.is_compiling()
+                and mgr.expert_num_tokens_buf is None):
             mgr.init_prepare_buffers(num_experts)
 
         # mc for combine kernel (iterates over original
@@ -211,7 +218,10 @@ class DispatchCombinePrepareAndFinalize(
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
         # physical expert counts from the fused kernel.
-        if self.expert_load_view is not None:
+        # Guard with is_compiling() to avoid graph breaks
+        # from the None check on a mutable attribute.
+        if (not torch.compiler.is_compiling()
+                and self.expert_load_view is not None):
             self.expert_load_view.add_(
                 expert_num_tokens)
 
@@ -250,29 +260,22 @@ class DispatchCombinePrepareAndFinalize(
 
         # Post-dispatch quantization.
         # Always call quantize (no numel guard) for
-        # CUDA graph compatibility.
-        expert_x_scale = None
-        if not quant_config.is_block_quantized:
-            expert_x, expert_x_scale = (
-                moe_kernel_quantize_input(
-                    expert_x,
-                    quant_config.a1_scale,
-                    quant_dtype=(
-                        quant_config.quant_dtype),
-                    per_act_token_quant=False,
-                    block_shape=(
-                        quant_config.block_shape)))
-        else:
-            expert_x, expert_x_scale = (
-                moe_kernel_quantize_input(
-                    expert_x,
-                    quant_config.a1_scale,
-                    quant_dtype=(
-                        quant_config.quant_dtype),
-                    per_act_token_quant=(
-                        quant_config.per_act_token_quant),
-                    block_shape=(
-                        quant_config.block_shape)))
+        # CUDA graph compatibility. Use a single call
+        # path to avoid branching that may cause graph
+        # breaks in torch.compile.
+        per_act_token_quant = (
+            quant_config.per_act_token_quant
+            if quant_config.is_block_quantized
+            else False)
+        expert_x, expert_x_scale = (
+            moe_kernel_quantize_input(
+                expert_x,
+                quant_config.a1_scale,
+                quant_dtype=(
+                    quant_config.quant_dtype),
+                per_act_token_quant=per_act_token_quant,
+                block_shape=(
+                    quant_config.block_shape)))
 
         # Slice to local experts only.
         local_expert_num_tokens = expert_num_tokens[
@@ -281,7 +284,10 @@ class DispatchCombinePrepareAndFinalize(
             + self.num_local_experts]
 
         # MoE load profiling (dispatch_combine path).
-        if _MOE_LOAD_PROFILE_INTERVAL > 0:
+        # Guard with is_compiling() to prevent graph breaks
+        # from the lazy import and profiler call.
+        if (_MOE_LOAD_PROFILE_INTERVAL > 0
+                and not torch.compiler.is_compiling()):
             from vllm.model_executor.layers.fused_moe.layer \
                 import _moe_load_profiler
             _moe_load_profiler.record(
@@ -340,15 +346,10 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
 
         # Step 1: Apply weights + reduce on dispatched tokens.
-        # Always execute (no numel/isinstance guards) for
-        # CUDA graph compatibility — dynamic branches cause
-        # graph breaks in torch.compile.
-        if isinstance(weight_and_reduce_impl,
-                      TopKWeightAndReduceDelegate):
-            weight_and_reduce_impl = (
-                TopKWeightAndReduceContiguous())
+        # Use init-time resolved impl to avoid isinstance
+        # checks that cause torch.compile graph breaks.
         fused_expert_output = (
-            weight_and_reduce_impl.apply(
+            self._weight_reduce.apply(
                 output=None,
                 fused_expert_output=fused_expert_output,
                 topk_weights=topk_weights,
