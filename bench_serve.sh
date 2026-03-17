@@ -33,7 +33,7 @@ NUM_PROMPTS=$((BATCH_SIZE * NUM_GPUS))
 
 # Patch ROUTING_MODE_THRESHOLD directly in source instead of
 # setting env var, which conflicts with nsys profiling.
-DCPF_PY="$(python3 -c 'from vllm.model_executor.layers.fused_moe import dispatch_combine_prepare_finalize as m; print(m.__file__)')"
+DCPF_PY="$(VLLM_LOGGING_LEVEL=ERROR python3 -c 'from vllm.model_executor.layers.fused_moe import dispatch_combine_prepare_finalize as m; print(m.__file__)')"
 sed -i 's|"VLLM_ROUTING_MODE_THRESHOLD", "[^"]*"|"VLLM_ROUTING_MODE_THRESHOLD", "256"|' "$DCPF_PY"
 unset VLLM_ROUTING_MODE_THRESHOLD
 # export VLLM_DC_PROFILE=10 # time breakdown debug
@@ -71,7 +71,7 @@ unset VLLM_TORCH_PROFILER_DIR
 unset TOPK_DUMP_PREFIX
 # HACK: patch the default VLLM_ALL2ALL_BACKEND in envs.py instead of
 # setting the env var, which conflicts with nsys profiling.
-ENVS_PY="$(python3 -c 'import vllm.envs; print(vllm.envs.__file__)')"
+ENVS_PY="$(VLLM_LOGGING_LEVEL=ERROR python3 -c 'import vllm.envs; print(vllm.envs.__file__)')"
 sed -i "s|env_with_choices(\"VLLM_ALL2ALL_BACKEND\", \"[^\"]*\"|env_with_choices(\"VLLM_ALL2ALL_BACKEND\", \"${ALLTOALL_BACKEND}\"|" "$ENVS_PY"
 unset VLLM_ALL2ALL_BACKEND
 
