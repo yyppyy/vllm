@@ -20,10 +20,11 @@ constexpr int kMaxRanks = 64;
 // block 0 increments it (barrier takes microseconds).
 constexpr int kPersistentGrid = 108;
 
-// Max unique (dest_rank, token) groups per block in CAS
-// Phase 1 single-pass accumulation. Dynamic shared memory
-// sized to kCasMaxUnique * K * sizeof(float). If nu exceeds
-// this, falls back to sequential accumulation loop.
+// Max unique (dest_rank, token) groups per tile in CAS
+// Phase 1 accumulation. Dynamic shared memory sized to
+// kCasMaxUnique * K * sizeof(float). If nu exceeds this,
+// tiled accumulation processes groups in batches of
+// kCasMaxUnique (ceil(nu/kCasMaxUnique) tiles).
 constexpr int kCasMaxUnique = 5;
 
 // ====================================================================
@@ -999,34 +1000,50 @@ __global__ void combine_and_scatter_kernel(
         }
       }
     } else {
-      // Fallback: sequential loop (rare, nu > 5).
-      for (int32_t u = 0; u < nu; u++) {
-        for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x)
+      // Tiled accumulation: process kCasMaxUnique
+      // groups per tile using fast-path shared memory
+      // approach. Reduces __syncthreads from 2*nu to
+      // 2*ceil(nu/kCasMaxUnique).
+      int32_t max_c_wr = ss_c * ws;
+      for (int32_t tile = 0; tile < nu;
+           tile += kCasMaxUnique) {
+        int32_t tile_end = tile + kCasMaxUnique;
+        if (tile_end > nu) tile_end = nu;
+        int32_t tile_sz = tile_end - tile;
+
+        // Zero tile accumulators.
+        for (int32_t k = threadIdx.x;
+             k < tile_sz * K; k += blockDim.x)
           s_accum[k] = 0.0f;
         __syncthreads();
 
+        // Single-pass accumulate entries in
+        // [tile, tile_end).
         for (int32_t i = 0; i < nv; i++) {
-          if (s_batch_uid[i] != u) continue;
+          int32_t u = s_batch_uid[i];
+          if (u < tile || u >= tile_end) continue;
           const T* src =
               expert_output + s_batch_ci[i] * K;
           float w = s_batch_weight[i];
           for (int32_t k = threadIdx.x; k < K;
                k += blockDim.x)
-            s_accum[k] +=
+            s_accum[(u - tile) * K + k] +=
                 static_cast<float>(src[k]) * w;
         }
         __syncthreads();
 
-        int32_t write_pos = s_unique_wpos[u];
-        if (write_pos < ss_c * ws) {
+        // Write tile results to NVLink.
+        for (int32_t u = tile; u < tile_end; u++) {
+          int32_t write_pos = s_unique_wpos[u];
+          if (write_pos >= max_c_wr) continue;
           int32_t dr = s_unique_dr[u];
           T* dest = reinterpret_cast<T*>(
               config->remote_combine_recv[dr]);
           for (int32_t k = threadIdx.x; k < K;
                k += blockDim.x)
             dest[write_pos * K + k] =
-                static_cast<T>(s_accum[k]);
+                static_cast<T>(
+                    s_accum[(u - tile) * K + k]);
           if (threadIdx.x == 0) {
             TokenMetadata* meta =
                 reinterpret_cast<TokenMetadata*>(
@@ -1039,7 +1056,6 @@ __global__ void combine_and_scatter_kernel(
             meta[write_pos].topk_weight = 1.0f;
           }
         }
-        __syncthreads();
       }
     }
 
