@@ -167,13 +167,10 @@ class DispatchCombinePrepareAndFinalize(
         # contiguous positions, so mc can be tight.
         # Worst case: all ws source ranks send M*topk
         # entries, with max_rep=2 replicas each.
-        self._mc = min(
+        mc = min(
             M * self.experts_per_token
             * self.world_size_ * 2,
             self.max_recv)
-        # mc for combine kernel (iterates over original
-        # IPC section layout, unchanged by compaction).
-        self._mc_full = self.max_recv
 
         # Pre-allocated dtype conversion buffers
         # (.to() allocates; .copy_() is graph-safe).
@@ -185,6 +182,10 @@ class DispatchCombinePrepareAndFinalize(
         if mgr.expert_num_tokens_buf is None:
             mgr.init_prepare_buffers(num_experts)
 
+        # mc for combine kernel (iterates over original
+        # IPC section layout, unchanged by compaction).
+        mc_full = self.max_recv
+
         # Fused path: single kernel launch.
         (expert_topk_ids,
          expert_topk_weights,
@@ -193,31 +194,32 @@ class DispatchCombinePrepareAndFinalize(
             mgr.gpu_dispatch_and_route(
                 a1, topk_ids_i32,
                 topk_weights_f32,
-                self._mc_full, M, K, topk,
+                mc_full, M, K, topk,
                 num_experts,
                 routing_mode=routing_mode))
         # Compact after fused kernel.
         mgr.gpu_dar_compact(
-            self._mc, num_experts)
+            mc, num_experts)
         expert_topk_ids = (
             mgr.compact_expert_topk_ids_buf[
-                :self._mc]
+                :mc]
             .unsqueeze(1))
         expert_topk_weights = (
             mgr.compact_expert_topk_weights_buf[
-                :self._mc]
+                :mc]
             .unsqueeze(1))
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
         # physical expert counts from the fused kernel.
-        elv = getattr(self, 'expert_load_view', None)
-        if elv is not None:
-            elv.add_(expert_num_tokens)
+        if self.expert_load_view is not None:
+            self.expert_load_view.add_(
+                expert_num_tokens)
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,
             expert_map, expert_topk_ids,
-            expert_topk_weights, expert_num_tokens)
+            expert_topk_weights, expert_num_tokens,
+            mc)
 
     def _receiver(
         self,
@@ -229,9 +231,9 @@ class DispatchCombinePrepareAndFinalize(
         expert_topk_ids: torch.Tensor,
         expert_topk_weights: torch.Tensor,
         expert_num_tokens: torch.Tensor,
+        mc: int,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
-        mc = self._mc
 
         # Copy int32 remap indices into pre-allocated
         # int64 buffer (index_select requires int64).
@@ -247,18 +249,19 @@ class DispatchCombinePrepareAndFinalize(
         expert_x = mgr.expert_x_buf[:mc]
 
         # Post-dispatch quantization.
+        # Always call quantize (no numel guard) for
+        # CUDA graph compatibility.
         expert_x_scale = None
         if not quant_config.is_block_quantized:
-            if expert_x.numel() != 0:
-                expert_x, expert_x_scale = (
-                    moe_kernel_quantize_input(
-                        expert_x,
-                        quant_config.a1_scale,
-                        quant_dtype=(
-                            quant_config.quant_dtype),
-                        per_act_token_quant=False,
-                        block_shape=(
-                            quant_config.block_shape)))
+            expert_x, expert_x_scale = (
+                moe_kernel_quantize_input(
+                    expert_x,
+                    quant_config.a1_scale,
+                    quant_dtype=(
+                        quant_config.quant_dtype),
+                    per_act_token_quant=False,
+                    block_shape=(
+                        quant_config.block_shape)))
         else:
             expert_x, expert_x_scale = (
                 moe_kernel_quantize_input(
@@ -333,24 +336,26 @@ class DispatchCombinePrepareAndFinalize(
         K = output.shape[-1]
         # mc_full: combine iterates over original IPC
         # section layout (unchanged by compaction).
-        mc_full = self._mc_full
+        mc_full = self.max_recv
         mgr = self.p2p_manager
 
         # Step 1: Apply weights + reduce on dispatched tokens.
-        if fused_expert_output.numel() != 0:
-            if isinstance(weight_and_reduce_impl,
-                          TopKWeightAndReduceDelegate):
-                weight_and_reduce_impl = (
-                    TopKWeightAndReduceContiguous())
-            fused_expert_output = (
-                weight_and_reduce_impl.apply(
-                    output=None,
-                    fused_expert_output=fused_expert_output,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    apply_router_weight_on_input=(
-                        apply_router_weight_on_input),
-                ))
+        # Always execute (no numel/isinstance guards) for
+        # CUDA graph compatibility — dynamic branches cause
+        # graph breaks in torch.compile.
+        if isinstance(weight_and_reduce_impl,
+                      TopKWeightAndReduceDelegate):
+            weight_and_reduce_impl = (
+                TopKWeightAndReduceContiguous())
+        fused_expert_output = (
+            weight_and_reduce_impl.apply(
+                output=None,
+                fused_expert_output=fused_expert_output,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                apply_router_weight_on_input=(
+                    apply_router_weight_on_input),
+            ))
 
         # Step 2: Combine + barrier + scatter-add.
         # Use mc_full (not mc_compact) because combine

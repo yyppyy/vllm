@@ -113,6 +113,8 @@ def _dispatch_and_route_fake(
     num_physical_experts: int,
     num_logical_experts: int,
     world_size: int,
+    max_replicas: int,
+    routing_mode: int,
 ) -> None:
     return
 
@@ -140,6 +142,7 @@ def _combine_and_scatter_fake(
     dispatch_meta: torch.Tensor,
     compact_reverse: torch.Tensor,
     output: torch.Tensor,
+    accum: torch.Tensor,
     config_tensor: torch.Tensor,
     mc: int,
     K: int,
