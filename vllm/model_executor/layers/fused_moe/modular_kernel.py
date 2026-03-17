@@ -373,6 +373,15 @@ class FusedMoEPrepareAndFinalize(ABC):
     def num_dispatchers(self) -> int:
         raise NotImplementedError
 
+    @property
+    def skip_expert_chunking(self) -> bool:
+        """If True, expert computation runs in a single pass.
+
+        Override to True when prepare flattens token-expert pairs
+        (topk=1) and fused_moe handles padding via
+        sorted_token_ids sentinel."""
+        return False
+
 
 # TODO: add supported activations method (return string)
 class FusedMoEPermuteExpertsUnpermute(ABC):
@@ -754,7 +763,9 @@ class FusedMoEModularKernel(torch.nn.Module):
         # TODO(bnell): get rid of one level here, update slice functions
         # to nops on num_chunks==1
 
-        if not self.fused_experts.supports_chunking() or num_chunks == 1:
+        if (not self.fused_experts.supports_chunking()
+                or num_chunks == 1
+                or self.prepare_finalize.skip_expert_chunking):
             return self._do_fused_experts(
                 fused_out=None,
                 a1=a1,

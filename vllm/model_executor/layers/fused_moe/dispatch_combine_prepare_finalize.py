@@ -85,6 +85,14 @@ class DispatchCombinePrepareAndFinalize(
     def max_num_tokens_per_rank(self) -> Optional[int]:
         return None
 
+    @property
+    def skip_expert_chunking(self) -> bool:
+        # DC flattens (token, expert) pairs to (mc, 1).
+        # mc includes padding but fused_moe skips padding
+        # via sorted_token_ids sentinel. Single pass avoids
+        # extra kernel launches from chunking.
+        return True
+
     def topk_indices_dtype(self) -> Optional[torch.dtype]:
         return torch.int64
 
