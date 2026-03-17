@@ -19,9 +19,6 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig)
-from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-    TopKWeightAndReduceContiguous,
-    TopKWeightAndReduceDelegate)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input)
 
@@ -339,25 +336,16 @@ class DispatchCombinePrepareAndFinalize(
         mc_full = self.max_recv
         mgr = self.p2p_manager
 
-        # Step 1: Apply weights + reduce on dispatched tokens.
-        # Always execute (no numel/isinstance guards) for
-        # CUDA graph compatibility — dynamic branches cause
-        # graph breaks in torch.compile.
-        if isinstance(weight_and_reduce_impl,
-                      TopKWeightAndReduceDelegate):
-            weight_and_reduce_impl = (
-                TopKWeightAndReduceContiguous())
-        fused_expert_output = (
-            weight_and_reduce_impl.apply(
-                output=None,
-                fused_expert_output=fused_expert_output,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                apply_router_weight_on_input=(
-                    apply_router_weight_on_input),
-            ))
+        # Weight multiplication is handled by
+        # combine_and_scatter kernel: dispatch_meta stores
+        # the real topk_weights (set during dispatch_and_route)
+        # and applies them during P2P accumulation.
+        # expert_topk_weights returned by dispatch are all 1.0,
+        # so TopKWeightAndReduceContiguous.apply() was a no-op
+        # (multiply by 1.0 + trivial topk=1 sum).
+        # Skipping it saves ~2.4ms/layer.
 
-        # Step 2: Combine + barrier + scatter-add.
+        # Combine + barrier + scatter-add.
         # Use mc_full (not mc_compact) because combine
         # reads dispatch_meta at original IPC positions
         # and uses compact_reverse to index expert_output.

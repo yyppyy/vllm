@@ -10,8 +10,6 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.logger import init_logger as _cg_init_logger
-_cg_logger = _cg_init_logger(__name__)
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import (
@@ -120,10 +118,6 @@ class CUDAGraphWrapper:
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
-            _cg_logger.warning_once(
-                "DIAG CG skip: rt_mode=%s self=%s bd=%s",
-                cudagraph_runtime_mode, self.runtime_mode,
-                batch_descriptor)
             return self.runnable(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_cudagraph_entries:

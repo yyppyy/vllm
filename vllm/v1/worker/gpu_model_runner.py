@@ -2274,15 +2274,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                   == self.input_batch.num_reqs * max_query_len)
             batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
                                                uniform_decode=uniform_decode)
-            if not hasattr(self, '_diag_logged'):
-                self._diag_logged = True
-                logger.warning(
-                    "DIAG runner: sched=%d input=%d "
-                    "ud=%s bd=%s",
-                    num_scheduled_tokens,
-                    num_input_tokens,
-                    uniform_decode,
-                    batch_descriptor)
             cudagraph_runtime_mode, batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(batch_descriptor)
 
