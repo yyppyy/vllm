@@ -73,6 +73,9 @@ class DispatchCombinePrepareAndFinalize(
         self.max_recv = p2p_manager.max_recv
         # Set by layer.py when integrated routing is on.
         self.expert_load_view = None
+        # Routing mode for the current batch (set in
+        # _prepare_integrated, read in _finalize).
+        self._routing_mode = 0
 
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
@@ -166,6 +169,7 @@ class DispatchCombinePrepareAndFinalize(
           to the least-loaded replica).
         """
         mgr = self.p2p_manager
+        self._routing_mode = routing_mode
 
         # Per-batch tight bound: compaction moves valid
         # entries from scattered per-sender sections into
@@ -352,6 +356,14 @@ class DispatchCombinePrepareAndFinalize(
         # so TopKWeightAndReduceContiguous.apply() was a no-op
         # (multiply by 1.0 + trivial topk=1 sum).
         # Skipping it saves ~2.4ms/layer.
+
+        # Pre-combine barrier: synchronize EP ranks so
+        # combine P2P writes don't overlap with the other
+        # rank's fused_moe (prevents L2 cache pollution).
+        # Only for prefill (routing_mode=1) where expert
+        # computation is long enough for contention.
+        if self._routing_mode == 1:
+            mgr.gpu_p2p_barrier()
 
         # Combine + barrier + scatter-add.
         # Use mc_full (not mc_compact) because combine
