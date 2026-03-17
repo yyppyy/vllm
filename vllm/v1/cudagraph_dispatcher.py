@@ -109,6 +109,9 @@ class CudagraphDispatcher:
 
         # check if key exists for full cudagraph
         if batch_descriptor in self.cudagraph_keys[CUDAGraphMode.FULL]:
+            logger.warning_once(
+                "DIAG dispatch FULL: %s",
+                batch_descriptor)
             return CUDAGraphMode.FULL, batch_descriptor
 
         # otherwise, check if non-uniform key exists
@@ -119,7 +122,15 @@ class CudagraphDispatcher:
         # also check if non-uniform key exists for more "general"
         # piecewise cudagraph
         if non_uniform_key in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+            logger.warning_once(
+                "DIAG dispatch PIECEWISE: %s",
+                non_uniform_key)
             return CUDAGraphMode.PIECEWISE, non_uniform_key
 
         # finally, just return no cudagraphs
+        logger.warning("DIAG dispatch NONE: %s "
+                        "(PW keys=%s)",
+                        batch_descriptor,
+                        self.cudagraph_keys[
+                            CUDAGraphMode.PIECEWISE])
         return CUDAGraphMode.NONE, None
