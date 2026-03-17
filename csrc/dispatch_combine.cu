@@ -311,15 +311,23 @@ void combine_and_scatter(
   // atomicAdd avoids bf16 CAS loops. Converted to
   // output dtype by fp32_to_half_kernel after.
 
+  // Opt 3: kCasMaxUnique=11 needs up to 154KB dynamic
+  // smem. Request max shared memory for the kernel.
+  const size_t dyn_smem =
+      kCasMaxUnique * K32 * sizeof(float);
+
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
       "combine_and_scatter",
       AT_DISPATCH_CASE(at::ScalarType::BFloat16,
         [&] {
-          combine_and_scatter_kernel<__nv_bfloat16>
-              <<<grid, block,
-                 kCasMaxUnique * K32 * sizeof(float),
-                 stream>>>(
+          auto kern = combine_and_scatter_kernel<
+              __nv_bfloat16>;
+          cudaFuncSetAttribute(
+              kern,
+              cudaFuncAttributeMaxDynamicSharedMemorySize,
+              dyn_smem);
+          kern<<<grid, block, dyn_smem, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
               meta, cr,
@@ -334,10 +342,12 @@ void combine_and_scatter(
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
-          combine_and_scatter_kernel<__half>
-              <<<grid, block,
-                 kCasMaxUnique * K32 * sizeof(float),
-                 stream>>>(
+          auto kern = combine_and_scatter_kernel<__half>;
+          cudaFuncSetAttribute(
+              kern,
+              cudaFuncAttributeMaxDynamicSharedMemorySize,
+              dyn_smem);
+          kern<<<grid, block, dyn_smem, stream>>>(
               reinterpret_cast<const __half*>(
                   expert_output.data_ptr()),
               meta, cr,

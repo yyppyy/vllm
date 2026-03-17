@@ -29,7 +29,7 @@ _DC_PROFILE_INTERVAL = int(
 # Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
 # in dispatch_combine.cuh.
 _DAR_NUM_STEPS = 19
-_CAS_NUM_STEPS = 13
+_CAS_NUM_STEPS = 17
 _TOTAL_PROFILE_SLOTS = _DAR_NUM_STEPS + _CAS_NUM_STEPS
 
 _DAR_STEP_NAMES = [
@@ -57,17 +57,21 @@ _DAR_STEP_NAMES = [
 _CAS_STEP_NAMES = [
     "read_counters",     # 0
     "zero_accum",        # 1
-    "scan_write",        # 2  scan_write start
-    "sw_scan",           # 3  thread-0 scan done
-    "sw_zero",           # 4  accum zeroed
-    "sw_accum",          # 5  HBM accumulation
-    "staggered_fence",   # 6  fence#1 drain
-    "grid_sync",         # 7  grid-wide sync
-    "offset_push",       # 8  NVLink stores
-    "fence2",            # 9  fence#2 drain
-    "p2p_wait",          # 10 P2P flag exchange
-    "scatter_add",       # 11 scatter-add
-    "end",               # 12
+    "coop_load",         # 2  cooperative HBM load
+    "sw_scan",           # 3  thread-0 scan+sort
+    "sw_zero",           # 4  accum zeroed (fast)
+    "sw_accum",          # 5  accumulation (fast)
+    "tile_zero",         # 6  tiled: zero done
+    "tile_accum",        # 7  tiled: accumulate
+    "tile_nvlink",       # 8  tiled: NVLink write
+    "tile_done",         # 9  all tiles done
+    "grid_sync",         # 10 grid-wide sync
+    "offset_push",       # 11 NVLink stores
+    "fence2",            # 12 fence#2 drain
+    "p2p_wait",          # 13 P2P flag exchange
+    "scatter_add",       # 14 scatter-add
+    "end",               # 15
+    "unused",            # 16
 ]
 
 logger = init_logger(__name__)

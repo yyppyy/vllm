@@ -25,7 +25,9 @@ constexpr int kPersistentGrid = 108;
 // kCasMaxUnique * K * sizeof(float). If nu exceeds this,
 // tiled accumulation processes groups in batches of
 // kCasMaxUnique (ceil(nu/kCasMaxUnique) tiles).
-constexpr int kCasMaxUnique = 5;
+// A100: 164KB smem max. 11 × 3584 × 4 = 154KB + ~4KB
+// static = ~158KB < 164KB.
+constexpr int kCasMaxUnique = 11;
 
 // ====================================================================
 // P2P flag operations for cross-GPU synchronization.
@@ -169,7 +171,7 @@ struct DispatchCombineConfig {
 
 // Number of timestamp slots per kernel.
 constexpr int kDarNumSteps = 19;
-constexpr int kCasNumSteps = 13;
+constexpr int kCasNumSteps = 17;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
 
@@ -203,17 +205,21 @@ inline const char* cas_step_name(int i) {
   static const char* names[] = {
     "cas:read_counters",     // 0
     "cas:zero_accum",        // 1
-    "cas:scan_write",        // 2  scan_write start
-    "cas:sw_scan",           // 3  thread-0 scan done
-    "cas:sw_zero",           // 4  accum zeroed
-    "cas:sw_accum",          // 5  HBM accumulation
-    "cas:staggered_fence",   // 6  fence#1 drain
-    "cas:grid_sync",         // 7  grid-wide sync
-    "cas:offset_push",       // 8  NVLink stores
-    "cas:fence2",            // 9  fence#2 drain
-    "cas:p2p_wait",          // 10 P2P flag exchange
-    "cas:scatter_add",       // 11 scatter-add
-    "cas:end",               // 12
+    "cas:coop_load",         // 2  cooperative HBM load
+    "cas:sw_scan",           // 3  thread-0 scan+sort done
+    "cas:sw_zero",           // 4  accum zeroed (fast path)
+    "cas:sw_accum",          // 5  accumulation (fast path)
+    "cas:tile_zero",         // 6  tiled: zero done
+    "cas:tile_accum",        // 7  tiled: accumulate done
+    "cas:tile_nvlink",       // 8  tiled: NVLink write done
+    "cas:tile_done",         // 9  all tiles done
+    "cas:grid_sync",         // 10 grid-wide sync
+    "cas:offset_push",       // 11 NVLink stores
+    "cas:fence2",            // 12 fence#2 drain
+    "cas:p2p_wait",          // 13 P2P flag exchange
+    "cas:scatter_add",       // 14 scatter-add
+    "cas:end",               // 15
+    "cas:?",                 // 16 unused
   };
   return (i < kCasNumSteps) ? names[i] : "cas:?";
 }
@@ -808,11 +814,9 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 1: Hybrid one-pass combine P2P writes ----
-  // Thread 0 scans entries ONCE: counts per dest_rank,
-  // fills batch arrays, atomicAdds to claim positions,
-  // assigns write positions. One __syncthreads(), then
-  // all threads write data. No grid sync before writing.
-  DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:scan_write
+  // Cooperative HBM loading + thread-0 dedup/sort +
+  // tiled accumulation with sorted entry ranges.
+  DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:coop_load
 
   // Dynamic shared memory: fp32 accumulator [K].
   extern __shared__ char dyn_shared_raw[];
@@ -826,92 +830,136 @@ __global__ void combine_and_scatter_kernel(
   __shared__ int32_t s_unique_dr[kMaxBatch];
   __shared__ int32_t s_unique_token[kMaxBatch];
   __shared__ int32_t s_unique_wpos[kMaxBatch];
+  // Per-uid start indices for sorted entry access
+  // in tiled path. s_uid_start[u] = first entry
+  // index for uid u in sorted batch arrays.
+  __shared__ int32_t s_uid_start[kMaxBatch + 1];
   __shared__ int32_t s_num_valid;
   __shared__ int32_t s_num_unique;
 
-  if (blockIdx.x < kPersistentGrid) {
-    if (threadIdx.x == 0) {
-      s_num_valid = 0;
-      s_num_unique = 0;
-    }
-    __syncthreads();
+  // Opt 2: Cooperative loading buffers.
+  // Pre-load dispatch_meta + compact_reverse into smem
+  // so thread-0 scan reads smem (0-cycle) not HBM.
+  __shared__ TokenMetadata s_entries[kMaxBatch];
+  __shared__ int32_t s_cr[kMaxBatch];
+  // Per-section load ranges computed by thread 0.
+  __shared__ int32_t s_load_sec_start[kMaxRanks];
+  __shared__ int32_t s_load_sec_count[kMaxRanks];
+  __shared__ int32_t s_load_sec_pair_base[kMaxRanks];
+  __shared__ int32_t s_total_load;
 
-    // Thread 0: chunk-based scan — group entries
-    // by (source_rank, source_token_idx) for local
-    // reduction. Contiguous chunks ensure entries
-    // from the same token land in the same block.
+  if (blockIdx.x < kPersistentGrid) {
     const int32_t ss_d =
         config->dispatch_section_size;
     const int32_t ss_c =
         config->combine_section_size;
+
+    // Step 1: Thread 0 computes per-section chunk
+    // ranges and flat load count.
     if (threadIdx.x == 0) {
-      int32_t nv = 0;
-      int32_t nu = 0;
+      s_num_valid = 0;
+      s_num_unique = 0;
+      int32_t total = 0;
       for (int32_t s = 0; s < ws; s++) {
-        int32_t section_start = s * ss_d;
         int32_t count = config->
             remote_dispatch_offsets[rank][s];
         if (count > ss_d) count = ss_d;
-        // Chunk-based: contiguous range per block.
-        int32_t chunk = (count + kPersistentGrid
-                         - 1) / kPersistentGrid;
+        int32_t chunk =
+            (count + kPersistentGrid - 1)
+            / kPersistentGrid;
         int32_t my_start = blockIdx.x * chunk;
         int32_t my_end = my_start + chunk;
         if (my_end > count) my_end = count;
-
-        for (int32_t i = my_start;
-             i < my_end; i++) {
-          int32_t pair_idx = section_start + i;
-          float weight =
-              dispatch_meta[pair_idx].topk_weight;
-          if (weight == 0.0f) continue;
-          int32_t dr =
-              dispatch_meta[pair_idx].source_rank;
-          if (dr < 0 || dr >= ws) continue;
-          if (!config->
-                  remote_combine_offsets[dr] ||
-              !config->
-                  remote_combine_recv[dr] ||
-              !config->
-                  remote_combine_meta[dr])
-            continue;
-
-          int32_t token =
-              dispatch_meta[pair_idx]
-                  .source_token_idx;
-          int32_t ci =
-              compact_reverse[pair_idx];
-
-          // Find or create unique (dr, token).
-          int32_t g = -1;
-          for (int32_t j = 0; j < nu; j++) {
-            if (s_unique_token[j] == token &&
-                s_unique_dr[j] == dr) {
-              g = j;
-              break;
-            }
-          }
-          if (g == -1) {
-            if (nu >= kMaxBatch) continue;
-            g = nu++;
-            s_unique_token[g] = token;
-            s_unique_dr[g] = dr;
-          }
-
-          if (nv < kMaxBatch) {
-            s_batch_ci[nv] = ci;
-            s_batch_weight[nv] = weight;
-            s_batch_uid[nv] = g;
-          }
-          nv++;
-        }
+        int32_t cnt = (my_end > my_start)
+            ? (my_end - my_start) : 0;
+        s_load_sec_start[s] = my_start;
+        s_load_sec_count[s] = cnt;
+        s_load_sec_pair_base[s] = s * ss_d;
+        total += cnt;
       }
-      s_num_valid =
+      s_total_load =
+          (total < kMaxBatch) ? total : kMaxBatch;
+    }
+    __syncthreads();
+
+    // Step 2: All threads cooperatively load
+    // dispatch_meta + compact_reverse into smem.
+    // Coalesced reads within each section.
+    {
+      int32_t flat_off = 0;
+      for (int32_t s = 0; s < ws; s++) {
+        int32_t cnt = s_load_sec_count[s];
+        int32_t pair_base =
+            s_load_sec_pair_base[s]
+            + s_load_sec_start[s];
+        for (int32_t i = threadIdx.x; i < cnt;
+             i += blockDim.x) {
+          int32_t dest = flat_off + i;
+          if (dest < kMaxBatch) {
+            int32_t pi = pair_base + i;
+            s_entries[dest] = dispatch_meta[pi];
+            s_cr[dest] = compact_reverse[pi];
+          }
+        }
+        flat_off += cnt;
+      }
+    }
+    __syncthreads();
+
+    // Step 3: Thread-0 scan on smem data (no HBM).
+    // Dedup into unique (dr, token) groups, fill
+    // batch arrays, claim combine positions, then
+    // counting-sort entries by uid for tiled path.
+    if (threadIdx.x == 0) {
+      int32_t total_load = s_total_load;
+      int32_t nv = 0;
+      int32_t nu = 0;
+      for (int32_t i = 0; i < total_load; i++) {
+        float weight = s_entries[i].topk_weight;
+        if (weight == 0.0f) continue;
+        int32_t dr = s_entries[i].source_rank;
+        if (dr < 0 || dr >= ws) continue;
+        if (!config->
+                remote_combine_offsets[dr] ||
+            !config->
+                remote_combine_recv[dr] ||
+            !config->
+                remote_combine_meta[dr])
+          continue;
+
+        int32_t token =
+            s_entries[i].source_token_idx;
+        int32_t ci = s_cr[i];
+
+        // Find or create unique (dr, token).
+        int32_t g = -1;
+        for (int32_t j = 0; j < nu; j++) {
+          if (s_unique_token[j] == token &&
+              s_unique_dr[j] == dr) {
+            g = j;
+            break;
+          }
+        }
+        if (g == -1) {
+          if (nu >= kMaxBatch) continue;
+          g = nu++;
+          s_unique_token[g] = token;
+          s_unique_dr[g] = dr;
+        }
+
+        if (nv < kMaxBatch) {
+          s_batch_ci[nv] = ci;
+          s_batch_weight[nv] = weight;
+          s_batch_uid[nv] = g;
+        }
+        nv++;
+      }
+      int32_t nv_clamped =
           (nv < kMaxBatch) ? nv : kMaxBatch;
+      s_num_valid = nv_clamped;
       s_num_unique = nu;
 
-      // Claim combine buffer positions: ONE per
-      // unique (dr, token) — not per entry.
+      // Claim combine buffer positions.
       int32_t cdr_count[kMaxRanks] = {};
       for (int32_t g = 0; g < nu; g++)
         cdr_count[s_unique_dr[g]]++;
@@ -926,27 +974,57 @@ __global__ void combine_and_scatter_kernel(
             : 0;
       }
 
-      int32_t pos[kMaxRanks];
+      int32_t pos_arr[kMaxRanks];
       for (int32_t d = 0; d < ws; d++)
-        pos[d] = cdr_start[d];
+        pos_arr[d] = cdr_start[d];
       int32_t max_c = ss_c * ws;
       for (int32_t g = 0; g < nu; g++) {
         int32_t dr = s_unique_dr[g];
-        int32_t local_off = pos[dr]++;
+        int32_t local_off = pos_arr[dr]++;
         s_unique_wpos[g] = (local_off < ss_c)
             ? rank * ss_c + local_off
             : max_c;
+      }
+
+      // Opt 1: Counting-sort entries by uid so
+      // each tile iterates only its own entries.
+      // Compute per-uid prefix sums.
+      int32_t uid_count[kMaxBatch] = {};
+      for (int32_t i = 0; i < nv_clamped; i++)
+        uid_count[s_batch_uid[i]]++;
+
+      s_uid_start[0] = 0;
+      for (int32_t u = 0; u < nu; u++)
+        s_uid_start[u + 1] =
+            s_uid_start[u] + uid_count[u];
+
+      // Scatter into sorted order.
+      int32_t spos[kMaxBatch];
+      for (int32_t u = 0; u < nu; u++)
+        spos[u] = s_uid_start[u];
+
+      int32_t tmp_ci[kMaxBatch];
+      float tmp_w[kMaxBatch];
+      int32_t tmp_uid[kMaxBatch];
+      for (int32_t i = 0; i < nv_clamped; i++) {
+        int32_t u = s_batch_uid[i];
+        int32_t p = spos[u]++;
+        tmp_ci[p] = s_batch_ci[i];
+        tmp_w[p] = s_batch_weight[i];
+        tmp_uid[p] = u;
+      }
+      for (int32_t i = 0; i < nv_clamped; i++) {
+        s_batch_ci[i] = tmp_ci[i];
+        s_batch_weight[i] = tmp_w[i];
+        s_batch_uid[i] = tmp_uid[i];
       }
     }
     __syncthreads();
 
     DC_TIMESTAMP(config, kDarNumSteps + 3);
-    // cas:sw_scan — thread-0 scan + group + claim done
+    // cas:sw_scan — coop load + scan + sort done
 
     // Single-pass local reduction + NVLink write.
-    // Each thread owns its k-positions across ALL
-    // accumulators — no inter-thread data dependency,
-    // so no __syncthreads between zero/accumulate/write.
     int32_t nu = s_num_unique;
     int32_t nv = s_num_valid;
 
@@ -1000,10 +1078,9 @@ __global__ void combine_and_scatter_kernel(
         }
       }
     } else {
-      // Tiled accumulation: process kCasMaxUnique
-      // groups per tile using fast-path shared memory
-      // approach. Reduces __syncthreads from 2*nu to
-      // 2*ceil(nu/kCasMaxUnique).
+      // Tiled accumulation with sorted entries.
+      // Each tile iterates ONLY its uid range
+      // (no wasted scanning of all entries).
       int32_t max_c_wr = ss_c * ws;
       for (int32_t tile = 0; tile < nu;
            tile += kCasMaxUnique) {
@@ -1017,11 +1094,17 @@ __global__ void combine_and_scatter_kernel(
           s_accum[k] = 0.0f;
         __syncthreads();
 
-        // Single-pass accumulate entries in
-        // [tile, tile_end).
-        for (int32_t i = 0; i < nv; i++) {
+        DC_TIMESTAMP(config, kDarNumSteps + 6);
+        // cas:tile_zero
+
+        // Accumulate only entries belonging to
+        // this tile (sorted by uid).
+        int32_t entry_start = s_uid_start[tile];
+        int32_t entry_end =
+            s_uid_start[tile_end];
+        for (int32_t i = entry_start;
+             i < entry_end; i++) {
           int32_t u = s_batch_uid[i];
-          if (u < tile || u >= tile_end) continue;
           const T* src =
               expert_output + s_batch_ci[i] * K;
           float w = s_batch_weight[i];
@@ -1031,6 +1114,9 @@ __global__ void combine_and_scatter_kernel(
                 static_cast<float>(src[k]) * w;
         }
         __syncthreads();
+
+        DC_TIMESTAMP(config, kDarNumSteps + 7);
+        // cas:tile_accum
 
         // Write tile results to NVLink.
         for (int32_t u = tile; u < tile_end; u++) {
@@ -1056,11 +1142,14 @@ __global__ void combine_and_scatter_kernel(
             meta[write_pos].topk_weight = 1.0f;
           }
         }
+
+        DC_TIMESTAMP(config, kDarNumSteps + 8);
+        // cas:tile_nvlink
       }
     }
 
-    DC_TIMESTAMP(config, kDarNumSteps + 6);
-    // cas:staggered_fence (removed — deferred to per-block)
+    DC_TIMESTAMP(config, kDarNumSteps + 9);
+    // cas:tile_done — all tiles / fast path done
 
     // fence#1 removed: NVLink stores drain in background
     // during grid_sync + offset_push. Each block fences
@@ -1074,7 +1163,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Grid sync + P2P barrier ----
-  DC_TIMESTAMP(config, kDarNumSteps + 7);
+  DC_TIMESTAMP(config, kDarNumSteps + 10);
   // cas:grid_sync
 
   // Block 0 waits for kPersistentGrid (one increment
@@ -1091,7 +1180,7 @@ __global__ void combine_and_scatter_kernel(
     }
     __syncthreads();
 
-    DC_TIMESTAMP(config, kDarNumSteps + 8);
+    DC_TIMESTAMP(config, kDarNumSteps + 11);
     // cas:offset_push
 
     const int32_t tid = threadIdx.x;
@@ -1106,14 +1195,17 @@ __global__ void combine_and_scatter_kernel(
       config->local_combine_counters[tid] = 0;
     }
 
-    DC_TIMESTAMP(config, kDarNumSteps + 9);
+    DC_TIMESTAMP(config, kDarNumSteps + 12);
     // cas:fence2
 
     __threadfence_system();
 
-    DC_TIMESTAMP(config, kDarNumSteps + 10);
+    DC_TIMESTAMP(config, kDarNumSteps + 13);
     // cas:p2p_wait
 
+    // Opt 4: Add __nanosleep to P2P spin loop
+    // (was tight spin, now yields to reduce NVLink
+    // polling pressure).
     if (tid < ws) {
       dc_st_flag_release(
           &config->peer_signals[tid]->flags[rank],
@@ -1121,7 +1213,7 @@ __global__ void combine_and_scatter_kernel(
       while (dc_ld_flag_acquire(
           &config->self_signals->flags[tid])
               != barrier_expected)
-        ;
+        __nanosleep(100);
     }
 
     __syncthreads();
@@ -1150,7 +1242,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   // ---- Phase 3: Scatter-add to fp32 accum ----
-  DC_TIMESTAMP(config, kDarNumSteps + 11);  // cas:scatter_add
+  DC_TIMESTAMP(config, kDarNumSteps + 14);  // cas:scatter_add
   // (timestamp after barrier, before scatter-add)
 
   // Native fp32 atomicAdd: no CAS loop, no adjacent-
@@ -1189,7 +1281,7 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, kDarNumSteps + 12);  // cas:end
+  DC_TIMESTAMP(config, kDarNumSteps + 15);  // cas:end
 }
 
 // ====================================================================
