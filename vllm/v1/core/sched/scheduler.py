@@ -211,17 +211,23 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        # Precompute once: are there any prefill requests pending?
+        # Precompute once: is there schedulable prefill work pending?
         # Used to skip decode requests when prefill_before_decode is set.
+        # Two cases where prefill can be scheduled this step:
+        #   1. A running request is still in its prefill phase.
+        #   2. Waiting requests exist AND the running queue has capacity.
+        # Without the capacity check, a full running queue (all decode) +
+        # non-empty waiting queue would cause all decode to be skipped
+        # while no new prefill can be admitted → empty batch → deadlock.
         has_any_prefill = False
         if self.prefill_before_decode:
-            if self.waiting:
-                has_any_prefill = True
-            else:
-                for req in self.running:
-                    if req.num_computed_tokens < req.num_prompt_tokens:
-                        has_any_prefill = True
-                        break
+            for req in self.running:
+                if req.num_computed_tokens < req.num_prompt_tokens:
+                    has_any_prefill = True
+                    break
+            if not has_any_prefill and self.waiting:
+                if len(self.running) < self.max_num_running_reqs:
+                    has_any_prefill = True
 
         # First, schedule the RUNNING requests.
         req_index = 0
