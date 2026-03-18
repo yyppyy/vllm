@@ -31,22 +31,32 @@ __global__ void act_and_mul_kernel(
   }
 }
 
-// EP variant: persistent grid, each block iterates over a
-// contiguous chunk and skips stale entries via topk_ids check.
-// Small fixed grid avoids block-scheduling overhead (mc blocks
-// on 108 SMs = ~38 waves = ~10us just for scheduling).
+// EP variant: bounded persistent grid. Each block covers a contiguous chunk
+// of the (large) max_recv buffer, but exits early once past the active range
+// indicated by num_tokens_post_padded (a device-memory scalar written by
+// moe_align_block_size). This mirrors the pattern used in the Triton
+// fused_moe_kernel (tl.load(num_tokens_post_padded_ptr) + early return) and
+// is CUDA-graph-safe: the pointer is fixed at capture time; the value is
+// updated by moe_align at replay time.
+//
+// Grid size 512 (vs old 64): with early exit, inactive blocks cost only a
+// single device-memory load (~few ns each). Active blocks are spread across
+// more SMs, eliminating the 2048-token serial loop that caused 1660us/call.
 template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&),
           bool act_first>
 __global__ void act_and_mul_kernel(
-    scalar_t* __restrict__ out,              // [..., d]
-    const scalar_t* __restrict__ input,      // [..., 2, d]
+    scalar_t* __restrict__ out,                       // [..., d]
+    const scalar_t* __restrict__ input,               // [..., 2, d]
     const int d,
-    const int64_t* __restrict__ topk_ids,    // [num_tokens]
+    const int64_t* __restrict__ topk_ids,             // [num_tokens]
     const int64_t num_local_experts,
-    const int64_t num_tokens) {
+    const int64_t num_tokens,
+    const int32_t* __restrict__ num_tokens_post_padded_ptr) {  // device scalar
+  const int64_t ntp = (int64_t)(*num_tokens_post_padded_ptr);
   const int64_t chunk = (num_tokens + gridDim.x - 1) / gridDim.x;
   const int64_t start = blockIdx.x * chunk;
-  const int64_t end = min(start + chunk, num_tokens);
+  if (start >= ntp) return;  // early exit: beyond active range
+  const int64_t end = min(start + chunk, ntp);
   for (int64_t token_idx = start; token_idx < end; ++token_idx) {
     if (topk_ids[token_idx] >= num_local_experts) continue;
     for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
@@ -116,15 +126,19 @@ void silu_and_mul(torch::Tensor& out,    // [..., d]
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, true);
 }
 
-void silu_and_mul_ep(torch::Tensor& out,      // [..., d]
-                     torch::Tensor& input,    // [..., 2 * d]
-                     torch::Tensor topk_ids,  // [num_tokens]
-                     int64_t num_local_experts) {
+void silu_and_mul_ep(torch::Tensor& out,                    // [..., d]
+                     torch::Tensor& input,                  // [..., 2 * d]
+                     torch::Tensor topk_ids,                // [num_tokens]
+                     int64_t num_local_experts,
+                     torch::Tensor num_tokens_post_padded)  // device int32 scalar
+{
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  // Persistent grid: few blocks iterate over tokens,
-  // avoiding 4096-block scheduling overhead.
-  constexpr int kPersistentGrid = 64;
+  // 512-block grid: enough to saturate all SMs (A100: 108, H100: 132).
+  // Blocks beyond num_tokens_post_padded exit immediately after one
+  // device-memory load, so scheduling overhead is negligible for small
+  // batches while large batches get full parallelism.
+  constexpr int kPersistentGrid = 512;
   dim3 grid(std::min((int64_t)kPersistentGrid, num_tokens));
   dim3 block(std::min(d, 1024));
   if (num_tokens == 0) {
@@ -141,7 +155,8 @@ void silu_and_mul_ep(torch::Tensor& out,      // [..., d]
                 input.data_ptr<scalar_t>(), d,
                 topk_ids.data_ptr<int64_t>(),
                 num_local_experts,
-                num_tokens);
+                num_tokens,
+                num_tokens_post_padded.data_ptr<int32_t>());
       });
 }
 

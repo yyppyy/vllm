@@ -185,7 +185,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "silu_and_mul_ep(Tensor! result, Tensor input, "
-      "Tensor topk_ids, int num_local_experts) -> ()");
+      "Tensor topk_ids, int num_local_experts, "
+      "Tensor num_tokens_post_padded) -> ()");
   ops.impl("silu_and_mul_ep", torch::kCUDA, &silu_and_mul_ep);
 
   ops.def(

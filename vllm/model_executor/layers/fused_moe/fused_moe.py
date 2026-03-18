@@ -1970,7 +1970,8 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 intermediate_cache2,
                 intermediate_cache1.view(-1, N),
                 expert_tokens_meta.topk_ids_for_masking,
-                E_local)
+                E_local,
+                num_tokens_post_padded)
         else:
             self.activation(
                 activation, intermediate_cache2,
