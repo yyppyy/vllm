@@ -37,7 +37,7 @@ DCPF_PY="$(VLLM_LOGGING_LEVEL=ERROR python3 -c 'from vllm.model_executor.layers.
 sed -i 's|"VLLM_ROUTING_MODE_THRESHOLD", "[^"]*"|"VLLM_ROUTING_MODE_THRESHOLD", "256"|' "$DCPF_PY"
 unset VLLM_ROUTING_MODE_THRESHOLD
 # export VLLM_DC_PROFILE=10 # time breakdown debug
-# export VLLM_MOE_LOAD_PROFILE_INTERVAL=10 # print expert activation / token distribution
+# export VLLM_MOE_LOAD_PROFILE_INTERVAL=1 # print expert activation / token distribution
 
 if (( NUM_GPUS <= 2 )); then
   GPU_MEM_UTIL="0.9"
