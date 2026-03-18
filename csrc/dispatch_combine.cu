@@ -311,10 +311,17 @@ void combine_and_scatter(
   // atomicAdd avoids bf16 CAS loops. Converted to
   // output dtype by fp32_to_half_kernel after.
 
-  // Opt 3: kCasMaxUnique=11 needs up to 154KB dynamic
-  // smem. Request max shared memory for the kernel.
-  const size_t dyn_smem =
+  // Set max dynamic smem to prefill worst case (154KB)
+  // so both decode and prefill launches are legal.
+  // Actual launch smem varies: decode uses 70KB (2
+  // blocks/SM on A100), prefill uses 154KB (1 block/SM).
+  const size_t max_dyn_smem =
       kCasMaxUnique * K32 * sizeof(float);
+  const size_t dyn_smem =
+      (M32 <= kCasDecodeThreshold)
+      ? static_cast<size_t>(kCasMaxUniqueDecode)
+            * K32 * sizeof(float)
+      : max_dyn_smem;
 
   AT_DISPATCH_SWITCH(
       output.scalar_type(),
@@ -326,7 +333,7 @@ void combine_and_scatter(
           cudaFuncSetAttribute(
               kern,
               cudaFuncAttributeMaxDynamicSharedMemorySize,
-              dyn_smem);
+              max_dyn_smem);
           kern<<<grid, block, dyn_smem, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   expert_output.data_ptr()),
@@ -346,7 +353,7 @@ void combine_and_scatter(
           cudaFuncSetAttribute(
               kern,
               cudaFuncAttributeMaxDynamicSharedMemorySize,
-              dyn_smem);
+              max_dyn_smem);
           kern<<<grid, block, dyn_smem, stream>>>(
               reinterpret_cast<const __half*>(
                   expert_output.data_ptr()),

@@ -29,6 +29,14 @@ constexpr int kPersistentGrid = 108;
 // static = ~158KB < 164KB.
 constexpr int kCasMaxUnique = 11;
 
+// Decode path uses fewer accumulators for lower smem
+// (5 × 3584 × 4 = 70KB → 2 blocks/SM on A100).
+constexpr int kCasMaxUniqueDecode = 5;
+
+// M threshold: decode path (direct HBM scan, small smem)
+// vs prefill path (cooperative loading, large smem).
+constexpr int kCasDecodeThreshold = 256;
+
 // ====================================================================
 // P2P flag operations for cross-GPU synchronization.
 // Follows custom_all_reduce.cuh pattern (lines 159-181).
@@ -854,6 +862,221 @@ __global__ void combine_and_scatter_kernel(
     const int32_t ss_c =
         config->combine_section_size;
 
+    if (M <= kCasDecodeThreshold) {
+    // ============================================================
+    // DECODE PATH: Direct HBM scan, kCasMaxUniqueDecode=5.
+    // Lower smem (70KB) → 2 blocks/SM occupancy on A100.
+    // ============================================================
+
+    // Thread-0 reads dispatch_meta directly from HBM
+    // (no cooperative loading — overhead not worth it
+    // for ~1-2 entries per block at decode batch sizes).
+    if (threadIdx.x == 0) {
+      s_num_valid = 0;
+      s_num_unique = 0;
+      int32_t nv = 0;
+      int32_t nu = 0;
+      for (int32_t s = 0; s < ws; s++) {
+        int32_t section_start = s * ss_d;
+        int32_t count = config->
+            remote_dispatch_offsets[rank][s];
+        if (count > ss_d) count = ss_d;
+        int32_t chunk =
+            (count + kPersistentGrid - 1)
+            / kPersistentGrid;
+        int32_t my_start = blockIdx.x * chunk;
+        int32_t my_end = my_start + chunk;
+        if (my_end > count) my_end = count;
+
+        for (int32_t i = my_start;
+             i < my_end; i++) {
+          int32_t pair_idx = section_start + i;
+          float weight =
+              dispatch_meta[pair_idx].topk_weight;
+          if (weight == 0.0f) continue;
+          int32_t dr =
+              dispatch_meta[pair_idx].source_rank;
+          if (dr < 0 || dr >= ws) continue;
+          if (!config->
+                  remote_combine_offsets[dr] ||
+              !config->
+                  remote_combine_recv[dr] ||
+              !config->
+                  remote_combine_meta[dr])
+            continue;
+
+          int32_t token =
+              dispatch_meta[pair_idx]
+                  .source_token_idx;
+          int32_t ci =
+              compact_reverse[pair_idx];
+
+          // Find or create unique (dr, token).
+          int32_t g = -1;
+          for (int32_t j = 0; j < nu; j++) {
+            if (s_unique_token[j] == token &&
+                s_unique_dr[j] == dr) {
+              g = j;
+              break;
+            }
+          }
+          if (g == -1) {
+            if (nu >= kMaxBatch) continue;
+            g = nu++;
+            s_unique_token[g] = token;
+            s_unique_dr[g] = dr;
+          }
+
+          if (nv < kMaxBatch) {
+            s_batch_ci[nv] = ci;
+            s_batch_weight[nv] = weight;
+            s_batch_uid[nv] = g;
+          }
+          nv++;
+        }
+      }
+      s_num_valid =
+          (nv < kMaxBatch) ? nv : kMaxBatch;
+      s_num_unique = nu;
+
+      // Claim combine buffer positions.
+      int32_t cdr_count[kMaxRanks] = {};
+      for (int32_t g = 0; g < nu; g++)
+        cdr_count[s_unique_dr[g]]++;
+
+      int32_t cdr_start[kMaxRanks];
+      for (int32_t d = 0; d < ws; d++) {
+        cdr_start[d] = (cdr_count[d] > 0)
+            ? atomicAdd(
+                  &config->
+                      local_combine_counters[d],
+                  cdr_count[d])
+            : 0;
+      }
+
+      int32_t pos_arr[kMaxRanks];
+      for (int32_t d = 0; d < ws; d++)
+        pos_arr[d] = cdr_start[d];
+      int32_t max_c = ss_c * ws;
+      for (int32_t g = 0; g < nu; g++) {
+        int32_t dr = s_unique_dr[g];
+        int32_t local_off = pos_arr[dr]++;
+        s_unique_wpos[g] = (local_off < ss_c)
+            ? rank * ss_c + local_off
+            : max_c;
+      }
+    }
+    __syncthreads();
+
+    DC_TIMESTAMP(config, kDarNumSteps + 3);
+    // cas:sw_scan — thread-0 HBM scan done
+
+    int32_t nu = s_num_unique;
+    int32_t nv = s_num_valid;
+
+    if (nu <= kCasMaxUniqueDecode) {
+      // Fast path: nu accumulators in smem.
+      for (int32_t k = threadIdx.x; k < nu * K;
+           k += blockDim.x)
+        s_accum[k] = 0.0f;
+
+      DC_TIMESTAMP(config, kDarNumSteps + 4);
+
+      for (int32_t i = 0; i < nv; i++) {
+        int32_t u = s_batch_uid[i];
+        const T* src =
+            expert_output + s_batch_ci[i] * K;
+        float w = s_batch_weight[i];
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x)
+          s_accum[u * K + k] +=
+              static_cast<float>(src[k]) * w;
+      }
+
+      DC_TIMESTAMP(config, kDarNumSteps + 5);
+
+      int32_t max_c_wr = ss_c * ws;
+      for (int32_t u = 0; u < nu; u++) {
+        int32_t write_pos = s_unique_wpos[u];
+        if (write_pos >= max_c_wr) continue;
+        int32_t dr = s_unique_dr[u];
+        T* dest = reinterpret_cast<T*>(
+            config->remote_combine_recv[dr]);
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x)
+          dest[write_pos * K + k] =
+              static_cast<T>(s_accum[u * K + k]);
+        if (threadIdx.x == 0) {
+          TokenMetadata* meta =
+              reinterpret_cast<TokenMetadata*>(
+                  config->
+                      remote_combine_meta[dr]);
+          meta[write_pos].source_rank = rank;
+          meta[write_pos].source_token_idx =
+              s_unique_token[u];
+          meta[write_pos].expert_id = 0;
+          meta[write_pos].topk_weight = 1.0f;
+        }
+      }
+
+      DC_TIMESTAMP(config, kDarNumSteps + 6);
+      DC_TIMESTAMP(config, kDarNumSteps + 7);
+      DC_TIMESTAMP(config, kDarNumSteps + 8);
+    } else {
+      // Sequential fallback (rare for decode).
+      DC_TIMESTAMP(config, kDarNumSteps + 4);
+      DC_TIMESTAMP(config, kDarNumSteps + 5);
+      int32_t max_c_wr = ss_c * ws;
+      for (int32_t u = 0; u < nu; u++) {
+        for (int32_t k = threadIdx.x; k < K;
+             k += blockDim.x)
+          s_accum[k] = 0.0f;
+        __syncthreads();
+        for (int32_t i = 0; i < nv; i++) {
+          if (s_batch_uid[i] != u) continue;
+          const T* src =
+              expert_output + s_batch_ci[i] * K;
+          float w = s_batch_weight[i];
+          for (int32_t k = threadIdx.x; k < K;
+               k += blockDim.x)
+            s_accum[k] +=
+                static_cast<float>(src[k]) * w;
+        }
+        __syncthreads();
+        int32_t write_pos = s_unique_wpos[u];
+        if (write_pos < max_c_wr) {
+          int32_t dr = s_unique_dr[u];
+          T* dest = reinterpret_cast<T*>(
+              config->remote_combine_recv[dr]);
+          for (int32_t k = threadIdx.x; k < K;
+               k += blockDim.x)
+            dest[write_pos * K + k] =
+                static_cast<T>(s_accum[k]);
+          if (threadIdx.x == 0) {
+            TokenMetadata* meta =
+                reinterpret_cast<TokenMetadata*>(
+                    config->
+                        remote_combine_meta[dr]);
+            meta[write_pos].source_rank = rank;
+            meta[write_pos].source_token_idx =
+                s_unique_token[u];
+            meta[write_pos].expert_id = 0;
+            meta[write_pos].topk_weight = 1.0f;
+          }
+        }
+        __syncthreads();
+      }
+      DC_TIMESTAMP(config, kDarNumSteps + 6);
+      DC_TIMESTAMP(config, kDarNumSteps + 7);
+      DC_TIMESTAMP(config, kDarNumSteps + 8);
+    }
+
+    } else {
+    // ============================================================
+    // PREFILL PATH: Cooperative HBM loading, kCasMaxUnique=11.
+    // Higher smem (154KB) but better throughput for large M.
+    // ============================================================
+
     // Step 1: Thread 0 computes per-section chunk
     // ranges and flat load count.
     if (threadIdx.x == 0) {
@@ -986,9 +1209,8 @@ __global__ void combine_and_scatter_kernel(
             : max_c;
       }
 
-      // Opt 1: Counting-sort entries by uid so
+      // Counting-sort entries by uid so
       // each tile iterates only its own entries.
-      // Compute per-uid prefix sums.
       int32_t uid_count[kMaxBatch] = {};
       for (int32_t i = 0; i < nv_clamped; i++)
         uid_count[s_batch_uid[i]]++;
@@ -1157,6 +1379,8 @@ __global__ void combine_and_scatter_kernel(
         // cas:tile_nvlink
       }
     }
+
+    } // end prefill path
 
     DC_TIMESTAMP(config, kDarNumSteps + 9);
     // cas:tile_done — all tiles / fast path done
