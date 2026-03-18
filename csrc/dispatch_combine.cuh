@@ -1930,8 +1930,11 @@ __global__ void dispatch_and_route_kernel(
         // Cost: O(nm^2 * ws) shared-mem reads;
         // nm<=NL(128), ws<=8 → max ~131K reads (typical
         // ~4.6K for 24 redundant experts). << 1 µs.
-        bool done[NL];
-        for (int32_t k = 0; k < NL; k++) done[k] = false;
+        // kMaxNL covers the max num_logical_experts (128).
+        // Only zero the first nm entries actually used.
+        constexpr int32_t kMaxNL = 128;
+        bool done[kMaxNL];
+        for (int32_t k = 0; k < nm; k++) done[k] = false;
 
         for (int32_t ii = 0; ii < nm; ii++) {
           // Selection sort: find unprocessed expert with
