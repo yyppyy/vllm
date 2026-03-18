@@ -42,7 +42,7 @@ unset VLLM_ROUTING_MODE_THRESHOLD
 if (( NUM_GPUS <= 2 )); then
   GPU_MEM_UTIL="0.9"
 else
-  GPU_MEM_UTIL="0.85"
+  GPU_MEM_UTIL="0.75"
 fi
 
 args=(
@@ -104,11 +104,12 @@ fi
 
 WARMUP_PROMPTS=$((1 * NUM_PROMPTS))
 
+INPUT_LEN=512
+OUTPUT_LEN=128
+
 # Warmup run: EPLB rebalances during these requests (results discarded)
 warmup_args=(
     --model Qwen/Qwen3-30B-A3B
-    --dataset-name hf
-    --dataset-path $DATASET_NAME
     --backend vllm
     --save-result
     --result-filename /dev/null
@@ -119,6 +120,11 @@ warmup_args=(
     --num-prompts $WARMUP_PROMPTS
     --max-concurrency $NUM_PROMPTS
 )
+if [[ "$DATASET_NAME" == "random" ]]; then
+  warmup_args+=( --dataset-name random --input-len $INPUT_LEN --output-len $OUTPUT_LEN )
+else
+  warmup_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" )
+fi
 
 echo "=== Warmup: sending $WARMUP_PROMPTS requests ==="
 vllm bench serve "${warmup_args[@]}"
@@ -126,8 +132,6 @@ vllm bench serve "${warmup_args[@]}"
 # Real benchmark run (EPLB already rebalanced, no interference)
 cli_args=(
     --model Qwen/Qwen3-30B-A3B
-    --dataset-name hf
-    --dataset-path $DATASET_NAME
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result.json
@@ -138,6 +142,11 @@ cli_args=(
     --num-prompts $NUM_PROMPTS
     --max-concurrency $NUM_PROMPTS
 )
+if [[ "$DATASET_NAME" == "random" ]]; then
+  cli_args+=( --dataset-name random --input-len $INPUT_LEN --output-len $OUTPUT_LEN )
+else
+  cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" )
+fi
 
 # if (( USE_PROFILER > 0 )); then
 #   cli_args+=( --profile )
