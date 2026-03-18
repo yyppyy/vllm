@@ -125,7 +125,8 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void silu_and_mul_ep(torch::Tensor& out, torch::Tensor& input,
-                     torch::Tensor topk_ids, int64_t num_local_experts);
+                     torch::Tensor topk_ids, int64_t num_local_experts,
+                     torch::Tensor num_tokens_post_padded);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
                         torch::Tensor& scale);
