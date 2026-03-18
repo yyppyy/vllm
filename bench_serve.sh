@@ -39,6 +39,12 @@ unset VLLM_ROUTING_MODE_THRESHOLD
 # export VLLM_DC_PROFILE=10 # time breakdown debug
 # export VLLM_MOE_LOAD_PROFILE_INTERVAL=10 # print expert activation / token distribution
 
+if (( NUM_GPUS <= 2 )); then
+  GPU_MEM_UTIL="0.9"
+else
+  GPU_MEM_UTIL="0.85"
+fi
+
 args=(
   serve Qwen/Qwen3-30B-A3B
   --port "$PORT"
@@ -50,7 +56,7 @@ args=(
   --max-model-len 4096
   --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
-  --gpu-memory-utilization "0.9"
+  --gpu-memory-utilization "$GPU_MEM_UTIL"
 )
   # --enforce-eager
 
