@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -74,6 +75,11 @@ class Scheduler(SchedulerInterface):
         self.max_num_scheduled_tokens = \
             self.scheduler_config.max_num_batched_tokens
         self.max_model_len = self.scheduler_config.max_model_len
+        # When set, all prefill requests are drained before any decode is
+        # scheduled, and prefill/decode are never mixed in one batch.
+        # Enabled via VLLM_PREFILL_BEFORE_DECODE=1 for experiments.
+        self.prefill_before_decode: bool = (
+            os.environ.get("VLLM_PREFILL_BEFORE_DECODE", "0") == "1")
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events)
@@ -205,10 +211,29 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Precompute once: are there any prefill requests pending?
+        # Used to skip decode requests when prefill_before_decode is set.
+        has_any_prefill = False
+        if self.prefill_before_decode:
+            if self.waiting:
+                has_any_prefill = True
+            else:
+                for req in self.running:
+                    if req.num_computed_tokens < req.num_prompt_tokens:
+                        has_any_prefill = True
+                        break
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # Skip decode-phase requests when prefill must drain first.
+            if (self.prefill_before_decode and has_any_prefill
+                    and request.num_computed_tokens
+                    >= request.num_prompt_tokens):
+                req_index += 1
+                continue
 
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
