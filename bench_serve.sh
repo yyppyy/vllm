@@ -121,7 +121,7 @@ warmup_args=(
     --max-concurrency $NUM_PROMPTS
 )
 if [[ "$DATASET_NAME" == "random" ]]; then
-  warmup_args+=( --dataset-name random --input-len $INPUT_LEN --output-len $OUTPUT_LEN )
+  warmup_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
 else
   warmup_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" )
 fi
@@ -143,7 +143,7 @@ cli_args=(
     --max-concurrency $NUM_PROMPTS
 )
 if [[ "$DATASET_NAME" == "random" ]]; then
-  cli_args+=( --dataset-name random --input-len $INPUT_LEN --output-len $OUTPUT_LEN )
+  cli_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
 else
   cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" )
 fi
