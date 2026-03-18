@@ -1917,35 +1917,84 @@ __global__ void dispatch_and_route_kernel(
           rank_active[best_rank] += 1;
         }
       } else {
-        // Section-level splitting: for each section,
-        // greedily assign to least-loaded replica.
+        // Section-level LPT (Longest Processing Time
+        // First): collect all (expert, section) tasks,
+        // sort by token count descending, then assign
+        // each greedily to the least-loaded replica.
+        //
+        // vs. per-expert-sequential: LPT distributes
+        // large tasks while rank_active is most
+        // symmetric, letting small tasks fill gaps.
+        // Reduces worst-case makespan for skewed
+        // token distributions at ~5 us extra cost.
+        //
+        // nm <= NL (128), ws <= 8 (typical EP config)
+        // → ntasks <= 1024 worst case.
+        constexpr int32_t kMaxTasks = 1024;
+        int32_t t_expert[kMaxTasks];
+        int32_t t_section[kMaxTasks];
+        int32_t t_count[kMaxTasks];
+        int32_t ntasks = 0;
+
+        // Collect all (expert, section) pairs.
         for (int32_t idx = 0; idx < nm; idx++) {
           const int32_t e = s_multi_experts[idx];
-          int32_t rc = s_replica_count[e];
-          if (rc > max_rep) rc = max_rep;
           for (int32_t s = 0; s < ws; s++) {
             int32_t cnt_s =
                 s_section_counts[s * NL + e];
             if (cnt_s == 0) continue;
-            int32_t best_phys = -1;
-            int32_t best_rank = -1;
-            int32_t best_cost = INT_MAX;
-            for (int32_t i = 0; i < rc; i++) {
-              const int32_t phys =
-                  s_l2p_map[e * max_rep + i];
-              const int32_t r = phys / epr;
-              const int32_t c = rank_active[r];
-              if (c < best_cost ||
-                  (c == best_cost
-                   && r < best_rank)) {
-                best_cost = c;
-                best_rank = r;
-                best_phys = phys;
-              }
+            if (ntasks < kMaxTasks) {
+              t_expert[ntasks] = e;
+              t_section[ntasks] = s;
+              t_count[ntasks] = cnt_s;
+              ntasks++;
             }
-            section_routing[s * NL + e] = best_phys;
-            rank_active[best_rank] += cnt_s;
           }
+        }
+
+        // Insertion sort by count descending.
+        // ntasks is small in practice (< 100 typical).
+        for (int32_t i = 1; i < ntasks; i++) {
+          int32_t ke = t_expert[i];
+          int32_t ks = t_section[i];
+          int32_t kc = t_count[i];
+          int32_t j = i - 1;
+          while (j >= 0 && t_count[j] < kc) {
+            t_expert[j + 1] = t_expert[j];
+            t_section[j + 1] = t_section[j];
+            t_count[j + 1] = t_count[j];
+            j--;
+          }
+          t_expert[j + 1] = ke;
+          t_section[j + 1] = ks;
+          t_count[j + 1] = kc;
+        }
+
+        // LPT greedy: largest task → least-loaded replica.
+        for (int32_t i = 0; i < ntasks; i++) {
+          const int32_t e = t_expert[i];
+          const int32_t s = t_section[i];
+          const int32_t cnt_s = t_count[i];
+          int32_t rc = s_replica_count[e];
+          if (rc > max_rep) rc = max_rep;
+          int32_t best_phys = -1;
+          int32_t best_rank = -1;
+          int32_t best_cost = INT_MAX;
+          for (int32_t i2 = 0; i2 < rc; i2++) {
+            const int32_t phys =
+                s_l2p_map[e * max_rep + i2];
+            const int32_t r = phys / epr;
+            const int32_t c = rank_active[r];
+            if (c < best_cost ||
+                (c == best_cost
+                 && r < best_rank)) {
+              best_cost = c;
+              best_rank = r;
+              best_phys = phys;
+            }
+          }
+          section_routing[s * NL + e] = best_phys;
+          rank_active[best_rank] += cnt_s;
         }
       }
     }
