@@ -592,6 +592,19 @@ class EplbState:
                     new_logical_to_physical_map)
             self.logical_replica_count.copy_(new_logical_replica_count)
 
+            # Propagate updated routing tables to all MoE
+            # layers' dispatch_combine buffer managers.
+            # Without this, the routing kernel keeps using
+            # the initial l2p map after rebalance.
+            # Clear expert_weights first to avoid duplicates
+            # (set_eplb_state appends to it each call).
+            model.expert_weights.clear()
+            model.set_eplb_state(
+                self.expert_load_pass,
+                self.logical_to_physical_map,
+                self.logical_replica_count,
+            )
+
         if is_main_rank:
             assert time_start is not None
             torch.cuda.synchronize()
