@@ -871,6 +871,12 @@ class DispatchCombineP2PManager:
                 torch.int32).reshape(-1))
         self._routing_count_tensor.copy_(
             logical_replica_count.to(torch.int64))
+        # Signal debug to re-dump after rebalance.
+        from vllm.model_executor.layers.fused_moe.\
+            dispatch_combine_prepare_finalize import (
+            _ROUTING_DEBUG, routing_debug_reset)
+        if _ROUTING_DEBUG:
+            routing_debug_reset()
 
     # ================================================================
     # Fine-grained profiling

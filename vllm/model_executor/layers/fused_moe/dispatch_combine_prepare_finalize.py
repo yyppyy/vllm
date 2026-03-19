@@ -41,10 +41,19 @@ ROUTING_MODE_THRESHOLD = int(
 PREFILL_ROUTING_MODE = int(
     os.environ.get("VLLM_PREFILL_ROUTING_MODE", "1"))
 
-# Debug: dump routing decisions once per routing_mode.
+# Debug: dump routing decisions once per routing_mode,
+# and again after every EPLB rebalance.
 # Set VLLM_ROUTING_DEBUG=1 to enable.
 _ROUTING_DEBUG = os.environ.get("VLLM_ROUTING_DEBUG", "0") == "1"
 _routing_debug_done: set = set()  # track which modes we've dumped
+_routing_debug_skip = 5  # skip first N calls (warmup/capture)
+
+
+def routing_debug_reset():
+    """Called after EPLB rebalance to re-dump on next call."""
+    global _routing_debug_done, _routing_debug_skip
+    _routing_debug_done.clear()
+    _routing_debug_skip = 0  # don't skip after rebalance
 
 
 class DispatchCombinePrepareAndFinalize(
@@ -216,7 +225,11 @@ class DispatchCombinePrepareAndFinalize(
                 num_experts,
                 routing_mode=routing_mode))
         # Debug: dump l2p map and routing decisions once.
+        global _routing_debug_skip
+        if _ROUTING_DEBUG and _routing_debug_skip > 0:
+            _routing_debug_skip -= 1
         if (_ROUTING_DEBUG
+                and _routing_debug_skip == 0
                 and routing_mode not in _routing_debug_done):
             _routing_debug_done.add(routing_mode)
             torch.cuda.synchronize()
@@ -242,8 +255,12 @@ class DispatchCombinePrepareAndFinalize(
             logger.info(
                 "[Routing Debug] rank=%d M=%d "
                 "routing_mode=%d NL=%d ws=%d mr=%d "
-                "epr=%d", rank, M, routing_mode,
-                NL, ws, mr, epr)
+                "epr=%d threshold=%d "
+                "prefill_mode=%d",
+                rank, M, routing_mode,
+                NL, ws, mr, epr,
+                ROUTING_MODE_THRESHOLD,
+                PREFILL_ROUTING_MODE)
             # Print l2p map for multi-replica experts
             for e in range(NL):
                 if rc[e] > 1:
