@@ -178,46 +178,18 @@ class EplbState:
                 where each integer is the index of the logical expert
                 that the corresponding physical expert maps to.
         """
-        # global_physical_to_logical_map = list(range(num_routed_experts))
-        # global_physical_to_logical_map += [
-        #     i % num_routed_experts for i in range(num_redundant_experts)
-        # ]
-        
-        assert num_redundant_experts <= num_routed_experts, "x1.0+ replication not supported"
-        num_phi_experts = num_routed_experts + num_redundant_experts
-        global_physical_to_logical_map = [-1] * num_phi_experts
-        assert num_routed_experts % num_ranks == 0
-        assert num_phi_experts % num_ranks == 0
-        num_primary_phi_experts_per_rank = num_routed_experts // num_ranks
-        num_phi_experts_per_rank = num_phi_experts // num_ranks
-        
-        for log_expert_id in range(num_routed_experts):
-            # primary replica
-            phi_rank_idx = log_expert_id % num_ranks
-            phi_rank_offset = log_expert_id // num_ranks
-            phi_linear_idx = phi_rank_idx * num_phi_experts_per_rank + phi_rank_offset
-            global_physical_to_logical_map[phi_linear_idx] = log_expert_id
-            # secondary replica
-            if log_expert_id < num_redundant_experts:
-                sec_phi_id = (log_expert_id + 1) if (log_expert_id % 2 == 0) else (log_expert_id - 1)
-                phi_rank_idx = sec_phi_id % num_ranks
-                phi_rank_offset = (sec_phi_id // num_ranks) + num_primary_phi_experts_per_rank
-                phi_linear_idx = phi_rank_idx * num_phi_experts_per_rank + phi_rank_offset
-                global_physical_to_logical_map[phi_linear_idx] = log_expert_id
-        
+        global_physical_to_logical_map = list(range(num_routed_experts))
+        global_physical_to_logical_map += [
+            i % num_routed_experts for i in range(num_redundant_experts)
+        ]
+
         logger.info(
-            'Customized EPLB mapping %d log to %d phi experts with %d ranks'
-            'phiscal to logical map: %s', num_routed_experts, num_redundant_experts, num_ranks,
-            global_physical_to_logical_map
-        )
-        
-        assert any(x > 0 for x in global_physical_to_logical_map), "Some phisical experts are unmapped"
-        mapped_log_expert_ids = set()
-        for log_expert_id in global_physical_to_logical_map:
-            mapped_log_expert_ids.add(log_expert_id)
-        for log_expert_id in range(num_routed_experts):
-            assert log_expert_id in mapped_log_expert_ids, "Some logical experts are unmapped"
-        
+            'Initial EPLB mapping %d log to %d phy experts '
+            'with %d ranks',
+            num_routed_experts,
+            num_routed_experts + num_redundant_experts,
+            num_ranks)
+
         return global_physical_to_logical_map
 
     @classmethod
