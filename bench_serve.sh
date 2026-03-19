@@ -46,7 +46,8 @@ elif (( MEM_BOUND_ROUTING != 0 )); then
   echo "ERROR: MEM_BOUND_ROUTING must be 0, 1, or 2 (got $MEM_BOUND_ROUTING)" >&2
   exit 1
 fi
-unset VLLM_PREFILL_ROUTING_MODE
+# unset VLLM_PREFILL_ROUTING_MODE
+export VLLM_PREFILL_BEFORE_DECODE=1
 # export VLLM_DC_PROFILE=10 # time breakdown debug
 # export VLLM_MOE_LOAD_PROFILE_INTERVAL=1 # print expert activation / token distribution
 
