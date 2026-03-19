@@ -41,6 +41,11 @@ ROUTING_MODE_THRESHOLD = int(
 PREFILL_ROUTING_MODE = int(
     os.environ.get("VLLM_PREFILL_ROUTING_MODE", "1"))
 
+# Debug: dump routing decisions once per routing_mode.
+# Set VLLM_ROUTING_DEBUG=1 to enable.
+_ROUTING_DEBUG = os.environ.get("VLLM_ROUTING_DEBUG", "0") == "1"
+_routing_debug_done: set = set()  # track which modes we've dumped
+
 
 class DispatchCombinePrepareAndFinalize(
         mk.FusedMoEPrepareAndFinalize):
@@ -210,6 +215,70 @@ class DispatchCombinePrepareAndFinalize(
                 mc_full, M, K, topk,
                 num_experts,
                 routing_mode=routing_mode))
+        # Debug: dump l2p map and routing decisions once.
+        if (_ROUTING_DEBUG
+                and routing_mode not in _routing_debug_done):
+            _routing_debug_done.add(routing_mode)
+            torch.cuda.synchronize()
+            rank = mgr.rank
+            ws = mgr.world_size
+            NL = mgr._num_logical_experts
+            mr = mgr._max_replicas
+            l2p = mgr._routing_map_tensor.cpu().tolist()
+            rc = mgr._routing_count_tensor.cpu().tolist()
+            # Read routing_selection from GPU.
+            import ctypes
+            rs_size = ws * NL
+            rs_host = torch.zeros(
+                rs_size, dtype=torch.int32)
+            rs_host_ptr = ctypes.c_void_p(
+                rs_host.data_ptr())
+            mgr._cuda_rt.cudaMemcpy(
+                rs_host_ptr,
+                mgr._raw_routing_selection,
+                rs_size * 4)
+            rs_tensor = rs_host.tolist()
+            epr = mgr._physical_experts_per_rank
+            logger.info(
+                "[Routing Debug] rank=%d M=%d "
+                "routing_mode=%d NL=%d ws=%d mr=%d "
+                "epr=%d", rank, M, routing_mode,
+                NL, ws, mr, epr)
+            # Print l2p map for multi-replica experts
+            for e in range(NL):
+                if rc[e] > 1:
+                    replicas = [
+                        l2p[e * mr + i]
+                        for i in range(int(rc[e]))]
+                    replica_ranks = [
+                        p // epr for p in replicas]
+                    if routing_mode == 0:
+                        sel = rs_tensor[e]
+                        sel_rank = (sel // epr
+                                    if sel >= 0 else -1)
+                        logger.info(
+                            "  expert %d: rc=%d "
+                            "l2p=%s (ranks %s) "
+                            "sel=%d (rank %d)",
+                            e, int(rc[e]),
+                            replicas, replica_ranks,
+                            sel, sel_rank)
+                    else:
+                        sels = [
+                            rs_tensor[s * NL + e]
+                            for s in range(ws)]
+                        sel_ranks = [
+                            p // epr if p >= 0 else -1
+                            for p in sels]
+                        logger.info(
+                            "  expert %d: rc=%d "
+                            "l2p=%s (ranks %s) "
+                            "section_sel=%s "
+                            "(ranks %s)",
+                            e, int(rc[e]),
+                            replicas, replica_ranks,
+                            sels, sel_ranks)
+
         # Compact after fused kernel.
         mgr.gpu_dar_compact(
             mc, num_experts)

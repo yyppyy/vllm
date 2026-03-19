@@ -50,6 +50,7 @@ fi
 export VLLM_PREFILL_BEFORE_DECODE=1
 # export VLLM_DC_PROFILE=10 # time breakdown debug
 # export VLLM_MOE_LOAD_PROFILE_INTERVAL=1 # print expert activation / token distribution
+# export VLLM_ROUTING_DEBUG=1 # print routing decisions
 
 if (( NUM_GPUS <= 2 )); then
   GPU_MEM_UTIL="0.9"
