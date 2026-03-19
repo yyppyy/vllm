@@ -36,6 +36,17 @@ NUM_PROMPTS=$((BATCH_SIZE * NUM_GPUS))
 DCPF_PY="$(VLLM_LOGGING_LEVEL=ERROR python3 -c 'from vllm.model_executor.layers.fused_moe import dispatch_combine_prepare_finalize as m; print(m.__file__)')"
 sed -i 's|"VLLM_ROUTING_MODE_THRESHOLD", "[^"]*"|"VLLM_ROUTING_MODE_THRESHOLD", "256"|' "$DCPF_PY"
 unset VLLM_ROUTING_MODE_THRESHOLD
+# Patch VLLM_PREFILL_ROUTING_MODE: MEM_BOUND_ROUTING=1 → mode 1 (LPT),
+# MEM_BOUND_ROUTING=2 → mode 2 (round-robin).
+if (( MEM_BOUND_ROUTING == 1 )); then
+  sed -i 's|"VLLM_PREFILL_ROUTING_MODE", "[^"]*"|"VLLM_PREFILL_ROUTING_MODE", "1"|' "$DCPF_PY"
+elif (( MEM_BOUND_ROUTING == 2 )); then
+  sed -i 's|"VLLM_PREFILL_ROUTING_MODE", "[^"]*"|"VLLM_PREFILL_ROUTING_MODE", "2"|' "$DCPF_PY"
+elif (( MEM_BOUND_ROUTING != 0 )); then
+  echo "ERROR: MEM_BOUND_ROUTING must be 0, 1, or 2 (got $MEM_BOUND_ROUTING)" >&2
+  exit 1
+fi
+unset VLLM_PREFILL_ROUTING_MODE
 # export VLLM_DC_PROFILE=10 # time breakdown debug
 # export VLLM_MOE_LOAD_PROFILE_INTERVAL=1 # print expert activation / token distribution
 

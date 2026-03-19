@@ -2140,7 +2140,7 @@ __global__ void dispatch_and_route_kernel(
           routing_sel[e] = best_phys;
           rank_active[best_rank] += 1;
         }
-      } else {
+      } else if (routing_mode == 1) {
         // Expert-level LPT: process multi-replica experts
         // in descending order of total token count. Large
         // experts are assigned while rank_active is most
@@ -2203,6 +2203,24 @@ __global__ void dispatch_and_route_kernel(
             }
             section_routing[s * NL + e] = best_phys;
             rank_active[best_rank] += cnt_s;
+          }
+        }
+      } else {
+        // routing_mode == 2: even round-robin across
+        // replicas. Section s assigned to replica
+        // (s % rc). Simple, deterministic, no load
+        // tracking — mirrors EPLB's even splitting.
+        for (int32_t idx = 0; idx < nm; idx++) {
+          const int32_t e = s_multi_experts[idx];
+          int32_t rc = s_replica_count[e];
+          if (rc > max_rep) rc = max_rep;
+          for (int32_t s = 0; s < ws; s++) {
+            const int32_t phys =
+                s_l2p_map[e * max_rep + (s % rc)];
+            section_routing[s * NL + e] = phys;
+            const int32_t cnt_s =
+                s_section_counts[s * NL + e];
+            rank_active[phys / epr] += cnt_s;
           }
         }
       }

@@ -35,6 +35,12 @@ _MOE_LOAD_PROFILE_INTERVAL = int(
 ROUTING_MODE_THRESHOLD = int(
     os.environ.get("VLLM_ROUTING_MODE_THRESHOLD", "256"))
 
+# Which routing mode to use for large M (> threshold):
+# 1 = greedy LPT (balance tokens across replicas),
+# 2 = even round-robin (split sections across replicas).
+PREFILL_ROUTING_MODE = int(
+    os.environ.get("VLLM_PREFILL_ROUTING_MODE", "1"))
+
 
 class DispatchCombinePrepareAndFinalize(
         mk.FusedMoEPrepareAndFinalize):
@@ -128,10 +134,12 @@ class DispatchCombinePrepareAndFinalize(
             mgr.init_prepare_buffers(num_experts)
 
         # routing_mode selects the algorithm:
-        # 0 = minimize experts (decode), 1 = balance
-        # tokens via section-level splitting (prefill).
+        # 0 = minimize experts (decode),
+        # 1 = greedy LPT (balance tokens, prefill),
+        # 2 = even round-robin (prefill).
         routing_mode = (
-            0 if M <= ROUTING_MODE_THRESHOLD else 1)
+            0 if M <= ROUTING_MODE_THRESHOLD
+            else PREFILL_ROUTING_MODE)
         return self._prepare_integrated(
             a1, topk_weights, topk_ids,
             num_experts, expert_map,
