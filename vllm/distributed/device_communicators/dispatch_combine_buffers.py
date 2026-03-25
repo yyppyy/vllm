@@ -1079,10 +1079,20 @@ class DispatchCombineP2PManager:
                 total_tok = rc1_sum + rc2_sum
                 frac = (rc1_sum / total_tok * 100
                         if total_tok > 0 else 0)
+                from collections import Counter
+                rc_dist = Counter(
+                    int(rc[log_e])
+                    for log_e in set(p2l.values())
+                    if 0 <= log_e < NL)
+                n_mapped = sum(
+                    1 for j in range(len(et))
+                    if p2l.get(base + j, -1) >= 0)
                 parts.append(
                     f"  rc_split: rc1_tokens={rc1_sum}"
                     f" rc2_tokens={rc2_sum}"
-                    f" rc1_frac={frac:.1f}%")
+                    f" rc1_frac={frac:.1f}%"
+                    f" rc_dist={dict(sorted(rc_dist.items()))}"
+                    f" mapped={n_mapped}/{len(et)}")
         logger.info(
             "DC profile [rank %d] expert_compute "
             "(total %.1f us, M=%d, "
