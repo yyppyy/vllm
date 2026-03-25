@@ -26,6 +26,11 @@ from vllm.logger import init_logger
 _DC_PROFILE_INTERVAL = int(
     os.environ.get('VLLM_DC_PROFILE', '0'))
 
+# Minimum M to print per-layer expert compute breakdown.
+# Only prefill batches (large M) are printed.
+_EXPERT_PROFILE_M_THRESHOLD = int(
+    os.environ.get('VLLM_DC_EXPERT_PROFILE_M', '256'))
+
 # Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
 # in dispatch_combine.cuh.
 _DAR_NUM_STEPS = 19
@@ -254,6 +259,14 @@ class DispatchCombineP2PManager:
             self._dar_accum = [0.0] * _DAR_NUM_STEPS
             self._cas_accum = [0.0] * _CAS_NUM_STEPS
             self._profile_batch_count = 0
+            # Expert compute profiling (CUDA events).
+            self._expert_step_names = [
+                'recv_start', 'compact_done',
+                'gather_done', 'align_done',
+                'expert_done', 'combine_start',
+            ]
+            self._expert_events: dict[
+                str, torch.cuda.Event] = {}
             logger.info(
                 "DC profiling enabled: print every "
                 "%d batches", self._profiling_interval)
@@ -966,6 +979,59 @@ class DispatchCombineP2PManager:
         # Reset accumulators.
         self._dar_accum = [0.0] * _DAR_NUM_STEPS
         self._cas_accum = [0.0] * _CAS_NUM_STEPS
+
+    def record_expert_event(self, name: str):
+        """Record a CUDA event for expert compute
+        profiling. Only active when DC_PROFILE > 0."""
+        if not self._profiling_enabled:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if name not in self._expert_events:
+            self._expert_events[name] = (
+                torch.cuda.Event(enable_timing=True))
+        self._expert_events[name].record()
+
+    def accumulate_expert_times(
+            self, M: int, local_tokens: int):
+        """Print per-layer expert compute breakdown.
+        Only prints when M > threshold to avoid spam."""
+        if not self._profiling_enabled:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        # Only print for large M (prefill batches).
+        if M < _EXPERT_PROFILE_M_THRESHOLD:
+            return
+        names = self._expert_step_names
+        # Need all events recorded.
+        for name in names:
+            if name not in self._expert_events:
+                return
+        # Synchronize to ensure events completed.
+        torch.cuda.current_stream().synchronize()
+        parts = []
+        total_us = 0.0
+        for i in range(len(names) - 1):
+            e_start = self._expert_events[names[i]]
+            e_end = self._expert_events[names[i + 1]]
+            try:
+                elapsed_us = (
+                    e_start.elapsed_time(e_end)
+                    * 1000.0)
+                total_us += elapsed_us
+                parts.append(
+                    f"  {names[i]}: {elapsed_us:.1f}"
+                    " us")
+            except RuntimeError:
+                parts.append(
+                    f"  {names[i]}: N/A")
+        logger.info(
+            "DC profile [rank %d] expert_compute "
+            "(total %.1f us, M=%d, "
+            "local_tokens=%d):\n%s",
+            self.rank, total_us, M,
+            local_tokens, "\n".join(parts))
 
     def gpu_dispatch_and_route(
         self,

@@ -50,7 +50,10 @@ fi
 SCHED_PY="$(VLLM_LOGGING_LEVEL=ERROR python3 -c 'from vllm.v1.core.sched import scheduler as m; print(m.__file__)')"
 sed -i 's|"VLLM_PREFILL_BEFORE_DECODE", "[^"]*"|"VLLM_PREFILL_BEFORE_DECODE", "1"|' "$SCHED_PY"
 unset VLLM_PREFILL_BEFORE_DECODE
-# export VLLM_DC_PROFILE=10 # time breakdown debug
+
+# export VLLM_DC_PROFILE=1 # time breakdown debug
+# export VLLM_DC_EXPERT_PROFILE_M=256 # threshold
+
 # export VLLM_MOE_LOAD_PROFILE_INTERVAL=1 # print expert activation / token distribution
 # export VLLM_ROUTING_DEBUG=1 # print routing decisions
 

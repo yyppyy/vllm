@@ -333,6 +333,7 @@ class DispatchCombinePrepareAndFinalize(
         mc: int,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
+        mgr.record_expert_event('recv_start')
 
         # Copy int32 remap indices into pre-allocated
         # int64 buffer (index_select requires int64).
@@ -341,11 +342,13 @@ class DispatchCombinePrepareAndFinalize(
         remap_i64 = mgr.remap_i64_buf[:mc]
         remap_i64.copy_(
             mgr.compact_data_remap_buf[:mc])
+        mgr.record_expert_event('compact_done')
         torch.index_select(
             mgr.dispatch_recv_tensor, 0,
             remap_i64,
             out=mgr.expert_x_buf[:mc])
         expert_x = mgr.expert_x_buf[:mc]
+        mgr.record_expert_event('gather_done')
 
         # Post-dispatch quantization.
         # Always call quantize (no numel guard) for
@@ -401,6 +404,10 @@ class DispatchCombinePrepareAndFinalize(
             topk_ids_for_masking=(
                 expert_topk_ids.view(-1)))
 
+        # Store token counts for profiling.
+        mgr._expert_M = a1_orig.shape[0]
+        mgr._expert_local_tokens = mc
+
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,
                 expert_topk_ids,
@@ -451,6 +458,7 @@ class DispatchCombinePrepareAndFinalize(
         # Use mc_full (not mc_compact) because combine
         # reads dispatch_meta at original IPC positions
         # and uses compact_reverse to index expert_output.
+        mgr.record_expert_event('combine_start')
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc_full]
             .contiguous().view(torch.uint8))
@@ -459,6 +467,9 @@ class DispatchCombinePrepareAndFinalize(
             meta_bytes,
             output,
             mc_full)
+        mgr.accumulate_expert_times(
+            getattr(mgr, '_expert_M', 0),
+            getattr(mgr, '_expert_local_tokens', 0))
 
         if do_async:
             return lambda: None
