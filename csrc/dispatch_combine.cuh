@@ -995,6 +995,9 @@ __global__ void combine_and_scatter_kernel(
 
       DC_TIMESTAMP(config, kDarNumSteps + 5);
 
+      constexpr int32_t kVecD =
+          sizeof(int4) / sizeof(T);
+      const int32_t K4d = K / kVecD;
       int32_t max_c_wr = ss_c * ws;
       for (int32_t u = 0; u < nu; u++) {
         int32_t write_pos = s_unique_wpos[u];
@@ -1002,10 +1005,19 @@ __global__ void combine_and_scatter_kernel(
         int32_t dr = s_unique_dr[u];
         T* dest = reinterpret_cast<T*>(
             config->remote_combine_recv[dr]);
-        for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x)
-          dest[write_pos * K + k] =
-              static_cast<T>(s_accum[u * K + k]);
+        int4* dest4 = reinterpret_cast<int4*>(
+            dest + write_pos * K);
+        for (int32_t i = threadIdx.x; i < K4d;
+             i += blockDim.x) {
+          T packed[kVecD];
+          #pragma unroll
+          for (int32_t j = 0; j < kVecD; j++)
+            packed[j] = static_cast<T>(
+                s_accum[u * K + i * kVecD + j]);
+          dest4[i] =
+              *reinterpret_cast<const int4*>(
+                  packed);
+        }
         if (threadIdx.x == 0) {
           TokenMetadata* meta =
               reinterpret_cast<TokenMetadata*>(
@@ -1048,10 +1060,22 @@ __global__ void combine_and_scatter_kernel(
           int32_t dr = s_unique_dr[u];
           T* dest = reinterpret_cast<T*>(
               config->remote_combine_recv[dr]);
-          for (int32_t k = threadIdx.x; k < K;
-               k += blockDim.x)
-            dest[write_pos * K + k] =
-                static_cast<T>(s_accum[k]);
+          constexpr int32_t kVecS =
+              sizeof(int4) / sizeof(T);
+          const int32_t K4s = K / kVecS;
+          int4* dest4 = reinterpret_cast<int4*>(
+              dest + write_pos * K);
+          for (int32_t i = threadIdx.x; i < K4s;
+               i += blockDim.x) {
+            T packed[kVecS];
+            #pragma unroll
+            for (int32_t j = 0; j < kVecS; j++)
+              packed[j] = static_cast<T>(
+                  s_accum[i * kVecS + j]);
+            dest4[i] =
+                *reinterpret_cast<const int4*>(
+                    packed);
+          }
           if (threadIdx.x == 0) {
             TokenMetadata* meta =
                 reinterpret_cast<TokenMetadata*>(
@@ -1211,7 +1235,13 @@ __global__ void combine_and_scatter_kernel(
 
       // Counting-sort entries by uid so
       // each tile iterates only its own entries.
-      int32_t uid_count[kMaxBatch] = {};
+      // Reuse s_entries/s_cr smem (no longer needed
+      // after coop load scan) for sort temporaries
+      // to avoid local memory spill to HBM.
+      int32_t* uid_count =
+          reinterpret_cast<int32_t*>(&s_entries[0]);
+      for (int32_t i = 0; i < nu; i++)
+        uid_count[i] = 0;
       for (int32_t i = 0; i < nv_clamped; i++)
         uid_count[s_batch_uid[i]]++;
 
@@ -1220,14 +1250,24 @@ __global__ void combine_and_scatter_kernel(
         s_uid_start[u + 1] =
             s_uid_start[u] + uid_count[u];
 
-      // Scatter into sorted order.
-      int32_t spos[kMaxBatch];
+      // Scatter into sorted order using smem temps.
+      // Layout in s_entries/s_cr region (2560B total):
+      //   uid_count[128] = s_entries[0..511] (done)
+      //   spos reuses uid_count (overwritten below)
+      //   tmp_ci[128] = s_entries[512..1023]
+      //   tmp_w[128]  = s_entries[1024..1535]
+      //   tmp_uid[128]= s_entries[1536..2047]
+      int32_t* spos = uid_count;  // reuse uid_count
       for (int32_t u = 0; u < nu; u++)
         spos[u] = s_uid_start[u];
 
-      int32_t tmp_ci[kMaxBatch];
-      float tmp_w[kMaxBatch];
-      int32_t tmp_uid[kMaxBatch];
+      int32_t* tmp_ci = uid_count + kMaxBatch;
+      float* tmp_w =
+          reinterpret_cast<float*>(
+              tmp_ci + kMaxBatch);
+      int32_t* tmp_uid =
+          reinterpret_cast<int32_t*>(
+              tmp_w + kMaxBatch);
       for (int32_t i = 0; i < nv_clamped; i++) {
         int32_t u = s_batch_uid[i];
         int32_t p = spos[u]++;
@@ -1253,9 +1293,14 @@ __global__ void combine_and_scatter_kernel(
     if (nu <= kCasMaxUnique) {
       // Fast path: single-pass with nu accumulators
       // in shared memory (nu × K floats).
-      for (int32_t k = threadIdx.x; k < nu * K;
-           k += blockDim.x)
-        s_accum[k] = 0.0f;
+      {
+        int4 z4 = make_int4(0, 0, 0, 0);
+        int4* acc4 = reinterpret_cast<int4*>(s_accum);
+        int32_t n4 = nu * K / 4;  // 4 floats per int4
+        for (int32_t i = threadIdx.x; i < n4;
+             i += blockDim.x)
+          acc4[i] = z4;
+      }
 
       DC_TIMESTAMP(config, kDarNumSteps + 4);
       // cas:sw_zero — accumulators zeroed
@@ -1275,7 +1320,10 @@ __global__ void combine_and_scatter_kernel(
       DC_TIMESTAMP(config, kDarNumSteps + 5);
       // cas:sw_accum — HBM reads + accumulation done
 
-      // Write all reduced vectors to NVLink.
+      // Write all reduced vectors to NVLink (int4).
+      constexpr int32_t kVec =
+          sizeof(int4) / sizeof(T);
+      const int32_t K4 = K / kVec;
       int32_t max_c_wr = ss_c * ws;
       for (int32_t u = 0; u < nu; u++) {
         int32_t write_pos = s_unique_wpos[u];
@@ -1283,10 +1331,19 @@ __global__ void combine_and_scatter_kernel(
         int32_t dr = s_unique_dr[u];
         T* dest = reinterpret_cast<T*>(
             config->remote_combine_recv[dr]);
-        for (int32_t k = threadIdx.x; k < K;
-             k += blockDim.x)
-          dest[write_pos * K + k] =
-              static_cast<T>(s_accum[u * K + k]);
+        int4* dest4 = reinterpret_cast<int4*>(
+            dest + write_pos * K);
+        for (int32_t i = threadIdx.x; i < K4;
+             i += blockDim.x) {
+          T packed[kVec];
+          #pragma unroll
+          for (int32_t j = 0; j < kVec; j++)
+            packed[j] = static_cast<T>(
+                s_accum[u * K + i * kVec + j]);
+          dest4[i] =
+              *reinterpret_cast<const int4*>(
+                  packed);
+        }
         if (threadIdx.x == 0) {
           TokenMetadata* meta =
               reinterpret_cast<TokenMetadata*>(
@@ -1320,10 +1377,16 @@ __global__ void combine_and_scatter_kernel(
         if (tile_end > nu) tile_end = nu;
         int32_t tile_sz = tile_end - tile;
 
-        // Zero tile accumulators.
-        for (int32_t k = threadIdx.x;
-             k < tile_sz * K; k += blockDim.x)
-          s_accum[k] = 0.0f;
+        // Zero tile accumulators (vectorized int4).
+        {
+          int4 z4 = make_int4(0, 0, 0, 0);
+          int4* acc4 = reinterpret_cast<int4*>(
+              s_accum);
+          int32_t n4 = tile_sz * K / 4;
+          for (int32_t i = threadIdx.x; i < n4;
+               i += blockDim.x)
+            acc4[i] = z4;
+        }
         __syncthreads();
 
         DC_TIMESTAMP(config, kDarNumSteps + 6);
@@ -1350,18 +1413,30 @@ __global__ void combine_and_scatter_kernel(
         DC_TIMESTAMP(config, kDarNumSteps + 7);
         // cas:tile_accum
 
-        // Write tile results to NVLink.
+        // Write tile results to NVLink (int4).
+        constexpr int32_t kVecT =
+            sizeof(int4) / sizeof(T);
+        const int32_t K4t = K / kVecT;
         for (int32_t u = tile; u < tile_end; u++) {
           int32_t write_pos = s_unique_wpos[u];
           if (write_pos >= max_c_wr) continue;
           int32_t dr = s_unique_dr[u];
           T* dest = reinterpret_cast<T*>(
               config->remote_combine_recv[dr]);
-          for (int32_t k = threadIdx.x; k < K;
-               k += blockDim.x)
-            dest[write_pos * K + k] =
-                static_cast<T>(
-                    s_accum[(u - tile) * K + k]);
+          int4* dest4 = reinterpret_cast<int4*>(
+              dest + write_pos * K);
+          for (int32_t i = threadIdx.x; i < K4t;
+               i += blockDim.x) {
+            T packed[kVecT];
+            #pragma unroll
+            for (int32_t j = 0; j < kVecT; j++)
+              packed[j] = static_cast<T>(
+                  s_accum[(u - tile) * K
+                      + i * kVecT + j]);
+            dest4[i] =
+                *reinterpret_cast<const int4*>(
+                    packed);
+          }
           if (threadIdx.x == 0) {
             TokenMetadata* meta =
                 reinterpret_cast<TokenMetadata*>(
