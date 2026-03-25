@@ -407,6 +407,7 @@ class DispatchCombinePrepareAndFinalize(
         # Store token counts for profiling.
         mgr._expert_M = a1_orig.shape[0]
         mgr._expert_local_tokens = mc
+        mgr._expert_num_tokens = local_expert_num_tokens
 
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,

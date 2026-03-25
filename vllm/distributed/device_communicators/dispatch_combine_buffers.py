@@ -267,6 +267,8 @@ class DispatchCombineP2PManager:
             ]
             self._expert_events: dict[
                 str, torch.cuda.Event] = {}
+            self._expert_num_tokens: (
+                torch.Tensor | None) = None
             logger.info(
                 "DC profiling enabled: print every "
                 "%d batches", self._profiling_interval)
@@ -1026,6 +1028,21 @@ class DispatchCombineP2PManager:
             except RuntimeError:
                 parts.append(
                     f"  {names[i]}: N/A")
+        # Per-expert token distribution.
+        if (self._expert_num_tokens is not None
+                and self._expert_num_tokens.numel() > 0):
+            et = self._expert_num_tokens.cpu().tolist()
+            mx = max(et)
+            mn = min(et) if min(et) > 0 else 0
+            mean_et = sum(et) / len(et)
+            mx_i = et.index(mx)
+            mn_i = et.index(mn)
+            ratio = (mx / mn) if mn > 0 else float('inf')
+            parts.append(
+                f"  expert_tokens: max={mx}(e{mx_i})"
+                f" min={mn}(e{mn_i})"
+                f" mean={mean_et:.0f}"
+                f" ratio={ratio:.1f}x")
         logger.info(
             "DC profile [rank %d] expert_compute "
             "(total %.1f us, M=%d, "
