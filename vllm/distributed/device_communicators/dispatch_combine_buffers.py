@@ -1043,6 +1043,46 @@ class DispatchCombineP2PManager:
                 f" min={mn}(e{mn_i})"
                 f" mean={mean_et:.0f}"
                 f" ratio={ratio:.1f}x")
+            # rc=1 vs rc>1 token split for imbalance
+            # decomposition.
+            if (self._integrated_routing_enabled
+                    and self._routing_count_tensor
+                    is not None
+                    and self._routing_map_tensor
+                    is not None):
+                rc = self._routing_count_tensor \
+                    .cpu().tolist()
+                l2p = self._routing_map_tensor \
+                    .cpu().tolist()
+                epr = self._physical_experts_per_rank
+                max_rep = (len(l2p) // len(rc)
+                           if len(rc) > 0 else 1)
+                NL = len(rc)
+                # Build phys→logical for local slots.
+                p2l = {}
+                for e in range(NL):
+                    for rep in range(max_rep):
+                        p = l2p[e * max_rep + rep]
+                        if p >= 0:
+                            p2l[p] = e
+                rc1_sum = 0
+                rc2_sum = 0
+                base = self.rank * epr
+                for j in range(len(et)):
+                    phys = base + j
+                    log_e = p2l.get(phys, -1)
+                    if log_e >= 0 and log_e < NL:
+                        if rc[log_e] <= 1:
+                            rc1_sum += et[j]
+                        else:
+                            rc2_sum += et[j]
+                total_tok = rc1_sum + rc2_sum
+                frac = (rc1_sum / total_tok * 100
+                        if total_tok > 0 else 0)
+                parts.append(
+                    f"  rc_split: rc1_tokens={rc1_sum}"
+                    f" rc2_tokens={rc2_sum}"
+                    f" rc1_frac={frac:.1f}%")
         logger.info(
             "DC profile [rank %d] expert_compute "
             "(total %.1f us, M=%d, "
