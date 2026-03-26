@@ -944,6 +944,10 @@ class DispatchCombineP2PManager:
         """Print and reset averages if interval reached."""
         if not self._profiling_enabled:
             return
+        # Only print for large M (prefill batches).
+        M = getattr(self, '_last_M', 0)
+        if M < _EXPERT_PROFILE_M_THRESHOLD:
+            return
         self._profile_batch_count += 1
         if (self._profile_batch_count
                 % self._profiling_interval != 0):
@@ -1147,6 +1151,7 @@ class DispatchCombineP2PManager:
                 routing_mode)
 
         if self._profiling_enabled:
+            self._last_M = M
             self._read_and_accumulate_timestamps('dar')
 
         return (
