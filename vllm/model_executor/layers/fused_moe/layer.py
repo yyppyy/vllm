@@ -1937,23 +1937,42 @@ class FusedMoE(CustomOp):
             NL, max_replicas, epr)
         # Push latest routing tables to GPU.
         mgr.update_routing_tables(ltp, lrc)
-        # Store per-layer copy padded to mgr's max_replicas
-        # so all layers share the same tensor layout.
-        # The config struct has one max_replicas value from
-        # the last init_integrated_routing call; layers with
-        # fewer replicas must be padded to match.
+        # Store per-layer routing tables. Use pre-allocated
+        # buffers (copy into, not clone) so CUDA graph
+        # replays reference stable tensor addresses.
         mgr_max_rep = mgr._max_replicas
-        if ltp.shape[1] < mgr_max_rep:
-            pad = torch.full(
-                (NL, mgr_max_rep - ltp.shape[1]),
-                -1, dtype=ltp.dtype, device=ltp.device)
-            ltp_padded = torch.cat([ltp, pad], dim=1)
+        expected_map_size = NL * mgr_max_rep
+        expected_count_size = NL
+
+        # Pad ltp to mgr_max_rep if this layer has fewer.
+        ltp_flat = ltp.to(torch.int32).reshape(-1)
+        if ltp_flat.numel() < expected_map_size:
+            ltp_padded = torch.full(
+                (expected_map_size,), -1,
+                dtype=torch.int32, device=ltp.device)
+            ltp_padded[:ltp_flat.numel()] = ltp_flat
+            ltp_flat = ltp_padded
+
+        lrc_flat = lrc.to(torch.int64)
+
+        if (pf._layer_routing_map is None
+                or pf._layer_routing_map.numel()
+                != expected_map_size):
+            # First call or size changed: allocate.
+            # Size changes should not happen after CUDA
+            # graph capture (init_integrated_routing
+            # pre-allocates for max replicas). If it does,
+            # this will break graph replay but at least
+            # won't crash with OOB access.
+            pf._layer_routing_map = ltp_flat[
+                :expected_map_size].clone()
+            pf._layer_routing_count = lrc_flat.clone()
         else:
-            ltp_padded = ltp
-        pf._layer_routing_map = (
-            ltp_padded.to(torch.int32).reshape(-1).clone())
-        pf._layer_routing_count = (
-            lrc.to(torch.int64).clone())
+            # EPLB rebalance: copy into existing buffers
+            # to keep addresses stable for graph replay.
+            pf._layer_routing_map.copy_(
+                ltp_flat[:expected_map_size])
+            pf._layer_routing_count.copy_(lrc_flat)
 
         pf.expert_load_view = self.expert_load_view
 

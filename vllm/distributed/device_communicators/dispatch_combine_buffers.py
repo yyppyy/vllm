@@ -775,26 +775,17 @@ class DispatchCombineP2PManager:
         so all ranks can push atomicAdds.
         """
         if self._integrated_routing_enabled:
-            # Already initialized. Grow routing tensors
-            # if a layer needs more replicas.
-            if max_replicas > self._max_replicas:
-                dev = f'cuda:{self._device}'
-                old_map = self._routing_map_tensor
-                new_size = num_logical_experts * max_replicas
-                self._routing_map_tensor = torch.full(
-                    (new_size,), -1,
-                    dtype=torch.int32, device=dev)
-                # Copy old data (smaller) into new tensor.
-                self._routing_map_tensor[
-                    :old_map.numel()].copy_(old_map)
-                self._max_replicas = max_replicas
-                # Rebuild config to update pointer + field.
-                self.config_tensor = (
-                    self._build_config_tensor())
             return
 
         self._num_logical_experts = num_logical_experts
-        self._max_replicas = max_replicas
+        # Allocate routing tensors for max possible
+        # replicas (world_size) so they never need to
+        # grow after EPLB rebalance. This is critical
+        # for CUDA graph compatibility — reallocating
+        # tensors invalidates pointers in the config
+        # struct baked into captured graphs.
+        self._max_replicas = max(max_replicas,
+                                 self.world_size)
         self._physical_experts_per_rank = (
             physical_experts_per_rank)
 
