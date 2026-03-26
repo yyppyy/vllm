@@ -775,6 +775,22 @@ class DispatchCombineP2PManager:
         so all ranks can push atomicAdds.
         """
         if self._integrated_routing_enabled:
+            # Already initialized. Grow routing tensors
+            # if a layer needs more replicas.
+            if max_replicas > self._max_replicas:
+                dev = f'cuda:{self._device}'
+                old_map = self._routing_map_tensor
+                new_size = num_logical_experts * max_replicas
+                self._routing_map_tensor = torch.full(
+                    (new_size,), -1,
+                    dtype=torch.int32, device=dev)
+                # Copy old data (smaller) into new tensor.
+                self._routing_map_tensor[
+                    :old_map.numel()].copy_(old_map)
+                self._max_replicas = max_replicas
+                # Rebuild config to update pointer + field.
+                self.config_tensor = (
+                    self._build_config_tensor())
             return
 
         self._num_logical_experts = num_logical_experts
@@ -898,9 +914,19 @@ class DispatchCombineP2PManager:
         """
         assert self._integrated_routing_enabled
         # logical_to_physical_map: (NL, max_replicas)
+        # Pad to _max_replicas if this layer has fewer.
+        ltp_flat = logical_to_physical_map.to(
+            torch.int32).reshape(-1)
+        expected = (self._num_logical_experts
+                    * self._max_replicas)
+        if ltp_flat.numel() < expected:
+            pad = torch.full(
+                (expected - ltp_flat.numel(),),
+                -1, dtype=torch.int32,
+                device=ltp_flat.device)
+            ltp_flat = torch.cat([ltp_flat, pad])
         self._routing_map_tensor.copy_(
-            logical_to_physical_map.to(
-                torch.int32).reshape(-1))
+            ltp_flat[:expected])
         self._routing_count_tensor.copy_(
             logical_replica_count.to(torch.int64))
         # Signal debug to re-dump after rebalance.

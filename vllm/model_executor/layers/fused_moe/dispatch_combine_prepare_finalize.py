@@ -197,19 +197,12 @@ class DispatchCombinePrepareAndFinalize(
         # Restore this layer's routing tables into the
         # shared buffer manager (all layers share one mgr
         # but each has different EPLB placement).
+        # Per-layer maps are pre-padded to mgr._max_replicas
+        # at store time (in layer.py _maybe_init_integrated_routing).
         if (self._layer_routing_map is not None
                 and mgr._integrated_routing_enabled):
-            src_map = self._layer_routing_map
-            dst_map = mgr._routing_map_tensor
-            # Pad or truncate if max_replicas changed
-            # between layers after EPLB rebalance.
-            if src_map.numel() == dst_map.numel():
-                dst_map.copy_(src_map)
-            elif src_map.numel() < dst_map.numel():
-                dst_map.zero_()
-                dst_map[:src_map.numel()].copy_(src_map)
-            else:
-                dst_map.copy_(src_map[:dst_map.numel()])
+            mgr._routing_map_tensor.copy_(
+                self._layer_routing_map)
             mgr._routing_count_tensor.copy_(
                 self._layer_routing_count)
 

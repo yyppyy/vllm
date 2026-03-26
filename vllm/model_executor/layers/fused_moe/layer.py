@@ -1937,11 +1937,21 @@ class FusedMoE(CustomOp):
             NL, max_replicas, epr)
         # Push latest routing tables to GPU.
         mgr.update_routing_tables(ltp, lrc)
-        # Store per-layer copy so each layer can restore
-        # its own tables into the shared buffer manager
-        # before each forward pass.
+        # Store per-layer copy padded to mgr's max_replicas
+        # so all layers share the same tensor layout.
+        # The config struct has one max_replicas value from
+        # the last init_integrated_routing call; layers with
+        # fewer replicas must be padded to match.
+        mgr_max_rep = mgr._max_replicas
+        if ltp.shape[1] < mgr_max_rep:
+            pad = torch.full(
+                (NL, mgr_max_rep - ltp.shape[1]),
+                -1, dtype=ltp.dtype, device=ltp.device)
+            ltp_padded = torch.cat([ltp, pad], dim=1)
+        else:
+            ltp_padded = ltp
         pf._layer_routing_map = (
-            ltp.to(torch.int32).reshape(-1).clone())
+            ltp_padded.to(torch.int32).reshape(-1).clone())
         pf._layer_routing_count = (
             lrc.to(torch.int64).clone())
 
