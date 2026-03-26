@@ -1937,6 +1937,13 @@ class FusedMoE(CustomOp):
             NL, max_replicas, epr)
         # Push latest routing tables to GPU.
         mgr.update_routing_tables(ltp, lrc)
+        # Store per-layer copy so each layer can restore
+        # its own tables into the shared buffer manager
+        # before each forward pass.
+        pf._layer_routing_map = (
+            ltp.to(torch.int32).reshape(-1).clone())
+        pf._layer_routing_count = (
+            lrc.to(torch.int64).clone())
 
         pf.expert_load_view = self.expert_load_view
 

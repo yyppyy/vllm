@@ -91,6 +91,11 @@ class DispatchCombinePrepareAndFinalize(
         self.rank_expert_offset = rank_expert_offset
         self.experts_per_rank = num_experts // world_size
         self.max_recv = p2p_manager.max_recv
+        # Per-layer routing tables (set by layer.py on
+        # EPLB rebalance, copied to shared buffer manager
+        # at the start of each layer's prepare call).
+        self._layer_routing_map = None
+        self._layer_routing_count = None
         # Set by layer.py when integrated routing is on.
         self.expert_load_view = None
 
@@ -188,6 +193,16 @@ class DispatchCombinePrepareAndFinalize(
           to the least-loaded replica).
         """
         mgr = self.p2p_manager
+
+        # Restore this layer's routing tables into the
+        # shared buffer manager (all layers share one mgr
+        # but each has different EPLB placement).
+        if (self._layer_routing_map is not None
+                and mgr._integrated_routing_enabled):
+            mgr._routing_map_tensor.copy_(
+                self._layer_routing_map)
+            mgr._routing_count_tensor.copy_(
+                self._layer_routing_count)
 
         # Per-batch tight bound: compaction moves valid
         # entries from scattered per-sender sections into
