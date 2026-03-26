@@ -199,8 +199,17 @@ class DispatchCombinePrepareAndFinalize(
         # but each has different EPLB placement).
         if (self._layer_routing_map is not None
                 and mgr._integrated_routing_enabled):
-            mgr._routing_map_tensor.copy_(
-                self._layer_routing_map)
+            src_map = self._layer_routing_map
+            dst_map = mgr._routing_map_tensor
+            # Pad or truncate if max_replicas changed
+            # between layers after EPLB rebalance.
+            if src_map.numel() == dst_map.numel():
+                dst_map.copy_(src_map)
+            elif src_map.numel() < dst_map.numel():
+                dst_map.zero_()
+                dst_map[:src_map.numel()].copy_(src_map)
+            else:
+                dst_map.copy_(src_map[:dst_map.numel()])
             mgr._routing_count_tensor.copy_(
                 self._layer_routing_count)
 
