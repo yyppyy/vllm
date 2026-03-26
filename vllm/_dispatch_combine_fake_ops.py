@@ -191,8 +191,11 @@ def _dar_compact_fake(
     compact_expert_topk_weights: torch.Tensor,
     compact_data_remap: torch.Tensor,
     compact_reverse: torch.Tensor,
+    dispatch_recv: torch.Tensor,
+    expert_x: torch.Tensor,
     config_tensor: torch.Tensor,
     mc_compact: int,
     num_physical_experts: int,
+    K: int,
 ) -> None:
     return

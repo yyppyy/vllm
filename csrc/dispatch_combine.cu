@@ -293,7 +293,6 @@ void combine_and_scatter(
   const int32_t mc32 = static_cast<int32_t>(mc);
   const int32_t K32 = static_cast<int32_t>(K);
   const int32_t M32 = static_cast<int32_t>(M);
-  const int32_t N = M32 * K32;
 
   // No grid-wide sync needed for scatter-add phase —
   // use enough blocks to saturate all SMs.
@@ -339,13 +338,9 @@ void combine_and_scatter(
                   expert_output.data_ptr()),
               meta, cr,
               accum.data_ptr<float>(),
-              config, mc32, K32, M32);
-          fp32_to_half_kernel<__nv_bfloat16>
-              <<<(N + kBlockSize - 1) / kBlockSize,
-                 kBlockSize, 0, stream>>>(
               reinterpret_cast<__nv_bfloat16*>(
                   output.data_ptr()),
-              accum.data_ptr<float>(), N);
+              config, mc32, K32, M32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
@@ -359,13 +354,9 @@ void combine_and_scatter(
                   expert_output.data_ptr()),
               meta, cr,
               accum.data_ptr<float>(),
-              config, mc32, K32, M32);
-          fp32_to_half_kernel<__half>
-              <<<(N + kBlockSize - 1) / kBlockSize,
-                 kBlockSize, 0, stream>>>(
               reinterpret_cast<__half*>(
                   output.data_ptr()),
-              accum.data_ptr<float>(), N);
+              config, mc32, K32, M32);
         })
   );
 }
@@ -528,9 +519,12 @@ void dar_compact(
     torch::Tensor compact_expert_topk_weights,
     torch::Tensor compact_data_remap,
     torch::Tensor compact_reverse,
+    torch::Tensor dispatch_recv,
+    torch::Tensor expert_x,
     torch::Tensor config_tensor,
     int64_t mc_compact,
-    int64_t num_physical_experts) {
+    int64_t num_physical_experts,
+    int64_t K) {
 
   if (mc_compact == 0) return;
 
@@ -543,19 +537,48 @@ void dar_compact(
       static_cast<int32_t>(mc_compact);
   const int32_t ne32 =
       static_cast<int32_t>(num_physical_experts);
+  const int32_t K32 = static_cast<int32_t>(K);
 
   dim3 grid(kPersistentGrid);
   dim3 block(kBlockSize);
-  dar_compact_kernel
-      <<<grid, block, 0, stream>>>(
-      expert_topk_ids.data_ptr<int64_t>(),
-      expert_topk_weights.data_ptr<float>(),
-      data_remap.data_ptr<int32_t>(),
-      compact_expert_topk_ids.data_ptr<int64_t>(),
-      compact_expert_topk_weights.data_ptr<float>(),
-      compact_data_remap.data_ptr<int32_t>(),
-      compact_reverse.data_ptr<int32_t>(),
-      config, mc32, ne32);
+
+  AT_DISPATCH_SWITCH(
+      dispatch_recv.scalar_type(), "dar_compact",
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,
+        [&] {
+          dar_compact_kernel<__nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+              expert_topk_ids.data_ptr<int64_t>(),
+              expert_topk_weights.data_ptr<float>(),
+              data_remap.data_ptr<int32_t>(),
+              compact_expert_topk_ids.data_ptr<int64_t>(),
+              compact_expert_topk_weights.data_ptr<float>(),
+              compact_data_remap.data_ptr<int32_t>(),
+              compact_reverse.data_ptr<int32_t>(),
+              reinterpret_cast<const __nv_bfloat16*>(
+                  dispatch_recv.data_ptr()),
+              reinterpret_cast<__nv_bfloat16*>(
+                  expert_x.data_ptr()),
+              config, mc32, ne32, K32);
+        })
+      AT_DISPATCH_CASE(at::ScalarType::Half,
+        [&] {
+          dar_compact_kernel<__half>
+              <<<grid, block, 0, stream>>>(
+              expert_topk_ids.data_ptr<int64_t>(),
+              expert_topk_weights.data_ptr<float>(),
+              data_remap.data_ptr<int32_t>(),
+              compact_expert_topk_ids.data_ptr<int64_t>(),
+              compact_expert_topk_weights.data_ptr<float>(),
+              compact_data_remap.data_ptr<int32_t>(),
+              compact_reverse.data_ptr<int32_t>(),
+              reinterpret_cast<const __half*>(
+                  dispatch_recv.data_ptr()),
+              reinterpret_cast<__half*>(
+                  expert_x.data_ptr()),
+              config, mc32, ne32, K32);
+        })
+  );
 }
 
 }  // namespace dispatch_combine

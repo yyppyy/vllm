@@ -350,18 +350,9 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
         mgr.record_expert_event('recv_start')
 
-        # Copy int32 remap indices into pre-allocated
-        # int64 buffer (index_select requires int64).
-        # .copy_() is CUDA graph safe; .long() is not
-        # (it allocates a new tensor).
-        remap_i64 = mgr.remap_i64_buf[:mc]
-        remap_i64.copy_(
-            mgr.compact_data_remap_buf[:mc])
-        mgr.record_expert_event('compact_done')
-        torch.index_select(
-            mgr.dispatch_recv_tensor, 0,
-            remap_i64,
-            out=mgr.expert_x_buf[:mc])
+        # Token data gather is now fused into
+        # dar_compact_kernel (vectorized int4 copy).
+        # No separate index_select needed.
         expert_x = mgr.expert_x_buf[:mc]
         mgr.record_expert_event('gather_done')
 

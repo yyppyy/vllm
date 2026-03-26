@@ -167,6 +167,12 @@ struct DispatchCombineConfig {
   // block 0 spins until all done before entering barrier.
   FlagType* combine_done_counter;
 
+  // Grid-wide sync for fused scatter-add → fp32_to_half.
+  // All blocks increment after Phase 3 (scatter-add);
+  // all blocks spin until counter reaches target before
+  // Phase 4 conversion. Monotonic for CUDA graph replay.
+  FlagType* scatter_done_counter;
+
   // ---- Fine-grained profiling support ----
   // When non-null, block 0 writes globaltimer timestamps
   // at each step boundary. Layout:
@@ -179,7 +185,7 @@ struct DispatchCombineConfig {
 
 // Number of timestamp slots per kernel.
 constexpr int kDarNumSteps = 19;
-constexpr int kCasNumSteps = 17;
+constexpr int kCasNumSteps = 18;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
 
@@ -226,8 +232,9 @@ inline const char* cas_step_name(int i) {
     "cas:fence2",            // 12 fence#2 drain
     "cas:p2p_wait",          // 13 P2P flag exchange
     "cas:scatter_add",       // 14 scatter-add
-    "cas:end",               // 15
-    "cas:?",                 // 16 unused
+    "cas:convert",           // 15 fp32→half conversion
+    "cas:end",               // 16
+    "cas:?",                 // 17 unused
   };
   return (i < kCasNumSteps) ? names[i] : "cas:?";
 }
@@ -780,6 +787,7 @@ __global__ void combine_and_scatter_kernel(
     const TokenMetadata* __restrict__ dispatch_meta,
     const int32_t* __restrict__ compact_reverse,
     float* __restrict__ accum,
+    T* __restrict__ output,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc, int32_t K, int32_t M) {
   const int32_t rank = config->rank;
@@ -790,15 +798,19 @@ __global__ void combine_and_scatter_kernel(
   // Read monotonic counter bases BEFORE any phase
   // modifies them (CUDA graph replay compatible).
   __shared__ FlagType s_cd_base;
+  __shared__ FlagType s_sd_base;
   __shared__ FlagType s_barrier_expected;
   if (threadIdx.x == 0) {
     s_cd_base = static_cast<FlagType>(
         *config->combine_done_counter);
+    s_sd_base = static_cast<FlagType>(
+        *config->scatter_done_counter);
     s_barrier_expected =
         config->self_signals->counter + 1;
   }
   __syncthreads();
   FlagType cd_base = s_cd_base;
+  FlagType sd_base = s_sd_base;
   FlagType barrier_expected = s_barrier_expected;
 
   // ---- Phase 0: Zero fp32 accum buffer ----
@@ -1590,7 +1602,39 @@ __global__ void combine_and_scatter_kernel(
     }
   }
 
-  DC_TIMESTAMP(config, kDarNumSteps + 15);  // cas:end
+  // ---- Grid-wide sync: all scatter-add atomics done ----
+  // Each block does threadfence (ensures its atomicAdds
+  // are visible globally) then increments counter.
+  // All blocks spin until all have checked in.
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicAdd(config->scatter_done_counter,
+              static_cast<FlagType>(1));
+  }
+  if (threadIdx.x == 0) {
+    FlagType target = sd_base + gridDim.x;
+    while (dc_ld_flag_acquire(
+               config->scatter_done_counter)
+            < target)
+      __nanosleep(200);
+  }
+  __syncthreads();
+
+  DC_TIMESTAMP(config, kDarNumSteps + 15);  // cas:convert
+
+  // ---- Phase 4: fp32 → output dtype conversion ----
+  // Replaces separate fp32_to_half_kernel launch.
+  {
+    const int32_t N = M * K;
+    for (int32_t i =
+             blockIdx.x * blockDim.x + threadIdx.x;
+         i < N; i += gridDim.x * blockDim.x) {
+      output[i] = static_cast<T>(accum[i]);
+    }
+  }
+
+  DC_TIMESTAMP(config, kDarNumSteps + 16);  // cas:end
 }
 
 // ====================================================================
@@ -1602,6 +1646,7 @@ __global__ void combine_and_scatter_kernel(
 // and compact_reverse (original_idx → compact_idx for
 // combine kernel to read expert output).
 // Grid = kPersistentGrid, block = kBlockSize.
+template <typename T>
 __global__ void dar_compact_kernel(
     const int64_t* __restrict__ expert_topk_ids,
     const float* __restrict__ expert_topk_weights,
@@ -1610,9 +1655,12 @@ __global__ void dar_compact_kernel(
     float* __restrict__ compact_expert_topk_weights,
     int32_t* __restrict__ compact_data_remap,
     int32_t* __restrict__ compact_reverse,
+    const T* __restrict__ dispatch_recv,
+    T* __restrict__ expert_x,
     const DispatchCombineConfig* __restrict__ config,
     int32_t mc_compact,
-    int32_t num_physical_experts) {
+    int32_t num_physical_experts,
+    int32_t K) {
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
   const int32_t ss = config->dispatch_section_size;
@@ -1641,32 +1689,58 @@ __global__ void dar_compact_kernel(
   const int32_t num_valid = s_num_valid;
 
   // Build compact mappings for valid entries.
-  for (int32_t s = 0; s < ws; s++) {
-    const int32_t section_start = s * ss;
-    const int32_t count = s_section_count[s];
-    const int32_t compact_base = s_compact_offset[s];
-    for (int32_t i =
-             blockIdx.x * blockDim.x + threadIdx.x;
-         i < count;
-         i += gridDim.x * blockDim.x) {
-      const int32_t original_idx = section_start + i;
-      const int32_t compact_idx = compact_base + i;
+  // Each block cooperatively handles one entry at a time:
+  // thread 0 writes metadata, all threads copy token data
+  // via int4 vectorized loads/stores.
+  constexpr int32_t kElemsPerI4 =
+      static_cast<int32_t>(sizeof(int4) / sizeof(T));
+  const int32_t K4 = K / kElemsPerI4;
 
-      // Map compact position to compact data position
-      // (sender_rank * M + token_idx). The gather in
-      // _receiver() indexes dispatch_recv_tensor.
+  // Block-strided loop over flattened valid entries.
+  // Use num_valid (sum of all section counts) as total.
+  for (int32_t flat_idx = blockIdx.x;
+       flat_idx < num_valid;
+       flat_idx += gridDim.x) {
+    // Map flat_idx to (section, offset_in_section)
+    // using prefix sums. Linear scan over sections
+    // (ws <= kMaxRanks=64, cheap in registers).
+    int32_t s = 0;
+    int32_t remaining = flat_idx;
+    while (s < ws - 1
+           && remaining >= s_section_count[s]) {
+      remaining -= s_section_count[s];
+      s++;
+    }
+    const int32_t original_idx = s * ss + remaining;
+    const int32_t compact_idx =
+        s_compact_offset[s] + remaining;
+
+    // Thread 0 writes metadata.
+    if (threadIdx.x == 0) {
       compact_data_remap[compact_idx] =
           data_remap[original_idx];
-
-      // Copy expert_topk_ids and weights.
       compact_expert_topk_ids[compact_idx] =
           expert_topk_ids[original_idx];
       compact_expert_topk_weights[compact_idx] =
           expert_topk_weights[original_idx];
-
-      // Reverse mapping for combine kernel.
       compact_reverse[original_idx] = compact_idx;
     }
+
+    // All threads cooperatively copy token data.
+    const int32_t data_pos =
+        data_remap[original_idx];
+    const int4* src =
+        reinterpret_cast<const int4*>(
+            dispatch_recv
+            + static_cast<int64_t>(data_pos) * K);
+    int4* dst = reinterpret_cast<int4*>(
+        expert_x
+        + static_cast<int64_t>(compact_idx) * K);
+    for (int32_t k = threadIdx.x; k < K4;
+         k += blockDim.x) {
+      dst[k] = src[k];
+    }
+    __syncthreads();
   }
 
   // Pad entries [num_valid, mc_compact) with sentinel.

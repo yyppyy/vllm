@@ -34,7 +34,7 @@ _EXPERT_PROFILE_M_THRESHOLD = int(
 # Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
 # in dispatch_combine.cuh.
 _DAR_NUM_STEPS = 19
-_CAS_NUM_STEPS = 17
+_CAS_NUM_STEPS = 18
 _TOTAL_PROFILE_SLOTS = _DAR_NUM_STEPS + _CAS_NUM_STEPS
 
 _DAR_STEP_NAMES = [
@@ -75,8 +75,9 @@ _CAS_STEP_NAMES = [
     "fence2",            # 12 fence#2 drain
     "p2p_wait",          # 13 P2P flag exchange
     "scatter_add",       # 14 scatter-add
-    "end",               # 15
-    "unused",            # 16
+    "convert",           # 15 fp32→half conversion
+    "end",               # 16
+    "unused",            # 17
 ]
 
 logger = init_logger(__name__)
@@ -215,6 +216,13 @@ class DispatchCombineP2PManager:
             self._cuda_rt.cudaMalloc(4))
         self._cuda_rt.cudaMemset(
             self._raw_combine_done_counter, 0, 4)
+
+        # Grid-wide sync counter for scatter-add →
+        # fp32_to_half conversion (fused Phase 4).
+        self._raw_scatter_done_counter = (
+            self._cuda_rt.cudaMalloc(4))
+        self._cuda_rt.cudaMemset(
+            self._raw_scatter_done_counter, 0, 4)
 
         # P2P barrier signal buffer.
         # Layout: alignas(128) flags[64] (256 bytes)
@@ -587,6 +595,10 @@ class DispatchCombineP2PManager:
         data += struct.pack(
             'Q', self._raw_combine_done_counter.value)
 
+        # scatter_done_counter (1 pointer)
+        data += struct.pack(
+            'Q', self._raw_scatter_done_counter.value)
+
         # profiling_timestamps (1 pointer)
         ptr = (self._raw_profiling_timestamps.value
                if self._profiling_enabled
@@ -652,7 +664,9 @@ class DispatchCombineP2PManager:
             self, mc_compact: int,
             num_experts: int):
         """Compact valid entries from scattered sections
-        into contiguous positions."""
+        into contiguous positions. Also performs fused
+        vectorized gather of token data from
+        dispatch_recv into expert_x_buf."""
         torch.ops._C_dispatch_combine\
             .dar_compact(
                 self.expert_topk_ids_buf,
@@ -662,8 +676,11 @@ class DispatchCombineP2PManager:
                 self.compact_expert_topk_weights_buf,
                 self.compact_data_remap_buf,
                 self.compact_reverse_buf,
+                self.dispatch_recv_tensor,
+                self.expert_x_buf,
                 self.config_tensor,
-                mc_compact, num_experts)
+                mc_compact, num_experts,
+                self.hidden_dim)
 
     def init_prepare_buffers(self, num_experts: int):
         """Allocate expert_num_tokens buffer once
@@ -1177,6 +1194,8 @@ class DispatchCombineP2PManager:
             self._raw_local_combine_counters)
         self._cuda_rt.cudaFree(
             self._raw_combine_done_counter)
+        self._cuda_rt.cudaFree(
+            self._raw_scatter_done_counter)
         self._cuda_rt.cudaFree(self._raw_signals)
         if self._raw_expert_counts is not None:
             self._cuda_rt.cudaFree(

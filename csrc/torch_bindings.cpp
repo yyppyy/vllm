@@ -60,9 +60,12 @@ void dar_compact(torch::Tensor expert_topk_ids,
                  torch::Tensor compact_expert_topk_weights,
                  torch::Tensor compact_data_remap,
                  torch::Tensor compact_reverse,
+                 torch::Tensor dispatch_recv,
+                 torch::Tensor expert_x,
                  torch::Tensor config_tensor,
                  int64_t mc_compact,
-                 int64_t num_physical_experts);
+                 int64_t num_physical_experts,
+                 int64_t K);
 }  // namespace dispatch_combine
 }  // namespace vllm
 #include "ops.h"
@@ -953,9 +956,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "Tensor! compact_expert_topk_weights, "
       "Tensor! compact_data_remap, "
       "Tensor! compact_reverse, "
+      "Tensor dispatch_recv, "
+      "Tensor! expert_x, "
       "Tensor config_tensor, "
       "int mc_compact, "
-      "int num_physical_experts) -> ()");
+      "int num_physical_experts, "
+      "int K) -> ()");
   dc.impl("dar_compact", torch::kCUDA,
           &vllm::dispatch_combine::dar_compact);
 }
