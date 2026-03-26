@@ -316,6 +316,7 @@ class DispatchCombinePrepareAndFinalize(
         # Compact after fused kernel.
         mgr.gpu_dar_compact(
             mc, num_experts)
+        mgr.record_expert_event('compact_done')
         expert_topk_ids = (
             mgr.compact_expert_topk_ids_buf[
                 :mc]
