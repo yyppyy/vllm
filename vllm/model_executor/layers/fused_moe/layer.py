@@ -1869,7 +1869,6 @@ class FusedMoE(CustomOp):
         expert_load_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
-        enable_profiling: bool = False,
     ) -> None:
         """
         Register the EPLB state in this layer.
@@ -1884,11 +1883,9 @@ class FusedMoE(CustomOp):
 
         # Init/update integrated routing for
         # dispatch_combine + EPLB.
-        self._maybe_init_integrated_routing(
-            enable_profiling=enable_profiling)
+        self._maybe_init_integrated_routing()
 
-    def _maybe_init_integrated_routing(
-            self, enable_profiling: bool = False):
+    def _maybe_init_integrated_routing(self):
         """Init/update integrated routing on p2p_manager.
 
         Called from set_eplb_state() when dispatch_combine
@@ -1980,8 +1977,6 @@ class FusedMoE(CustomOp):
 
         pf.expert_load_view = self.expert_load_view
         pf._moe_layer_idx = self._moe_layer_idx
-        if enable_profiling:
-            mgr._profiling_after_rebalance = True
 
     @staticmethod
     def _dedup_ltp_by_rank(

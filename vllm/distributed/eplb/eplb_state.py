@@ -603,8 +603,12 @@ class EplbState:
                 self.expert_load_pass,
                 self.logical_to_physical_map,
                 self.logical_replica_count,
-                enable_profiling=True,
             )
+            # Enable DC profiling after first real rebalance.
+            from vllm.model_executor.layers.fused_moe.\
+                dispatch_combine_prepare_finalize import (
+                enable_dc_profiling)
+            enable_dc_profiling()
 
         if is_main_rank:
             assert time_start is not None

@@ -33,6 +33,17 @@ _MOE_LOAD_PROFILE_INTERVAL = int(
 _EXPERT_PROFILE_M_THRESHOLD = int(
     os.environ.get('VLLM_DC_EXPERT_PROFILE_M', '256'))
 
+# Buffer managers registered for profiling.
+_registered_mgrs: list = []
+
+
+def enable_dc_profiling():
+    """Enable DC profiling on all registered buffer
+    managers. Called by eplb_state.py after the first
+    real (non-profile) EPLB rebalance."""
+    for mgr in _registered_mgrs:
+        mgr._profiling_after_rebalance = True
+
 # Routing mode threshold: M <= this uses routing_mode=0
 # (minimize activated experts), M > this uses
 # routing_mode=1 (balance tokens via section-level
@@ -123,6 +134,10 @@ class DispatchCombinePrepareAndFinalize(
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
             self.experts_per_rank)
+        # Register mgr for profiling enable.
+        if (self.p2p_manager not in _registered_mgrs
+                and self.p2p_manager._profiling_enabled):
+            _registered_mgrs.append(self.p2p_manager)
 
     def record_expert_event(self, name: str):
         """Record a CUDA event for expert compute
