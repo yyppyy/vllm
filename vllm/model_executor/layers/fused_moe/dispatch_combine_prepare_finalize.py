@@ -126,9 +126,11 @@ class DispatchCombinePrepareAndFinalize(
 
     def record_expert_event(self, name: str):
         """Record a CUDA event for expert compute
-        profiling. Only active when DC_PROFILE > 0."""
+        profiling. Only active after EPLB rebalance."""
         mgr = self.p2p_manager
         if not mgr._profiling_enabled:
+            return
+        if not mgr._profiling_after_rebalance:
             return
         if torch.cuda.is_current_stream_capturing():
             return
@@ -505,7 +507,8 @@ class DispatchCombinePrepareAndFinalize(
             self.rank_expert_offset
             + self.num_local_experts]
         # Router unique expert count (before dispatch).
-        if mgr._profiling_enabled:
+        if (mgr._profiling_enabled
+                and mgr._profiling_after_rebalance):
             ids = topk_ids.view(-1)
             self._router_unique = int(
                 ids.unique().numel())
