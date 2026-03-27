@@ -91,6 +91,69 @@ import os
 
 logger = init_logger(__name__)
 
+# Zipfian pseudo-random expert selection (for debugging).
+_ZIPFIAN_ROUTING = bool(int(
+    os.environ.get('VLLM_ZIPFIAN_ROUTING', '0')))
+_zipfian_cdf_cache: dict[tuple[int, torch.device],
+                         torch.Tensor] = {}
+_zipfian_primes = [6997, 7307, 7517, 7691,
+                   7877, 7993, 8101, 8209]
+
+
+def _get_zipfian_cdf(
+        num_experts: int,
+        device: torch.device) -> torch.Tensor:
+    key = (num_experts, device)
+    if key not in _zipfian_cdf_cache:
+        harmonic = torch.cumsum(
+            1.0 / torch.arange(
+                1, num_experts + 1,
+                dtype=torch.float32), dim=0)
+        cdf = harmonic / harmonic[-1]
+        _zipfian_cdf_cache[key] = cdf.to(device)
+    return _zipfian_cdf_cache[key]
+
+
+def zipfian_select_experts(
+        hidden_states: torch.Tensor,
+        num_experts: int,
+        topk: int,
+        layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pseudo-random expert selection with Zipfian
+    distribution. Deterministic, CUDA-graph safe."""
+    M = hidden_states.shape[0]
+    device = hidden_states.device
+    cdf = _get_zipfian_cdf(num_experts, device)
+    primes = torch.tensor(
+        _zipfian_primes[:topk],
+        device=device, dtype=torch.float32)
+    token_ids = torch.arange(
+        M, device=device, dtype=torch.float32)
+    # Deterministic pseudo-random uniform values.
+    u = torch.frac(
+        (token_ids.unsqueeze(1) + 1)
+        * primes.unsqueeze(0)
+        + layer_idx * 104729.0)
+    expert_ids = torch.searchsorted(
+        cdf, u.reshape(-1)).reshape(M, topk)
+    expert_ids = expert_ids.clamp(0, num_experts - 1)
+    # Resolve duplicates by shifting collisions.
+    for k in range(1, topk):
+        for prev in range(k):
+            collision = (expert_ids[:, k]
+                         == expert_ids[:, prev])
+            expert_ids[:, k] = torch.where(
+                collision,
+                (expert_ids[:, k] + 1) % num_experts,
+                expert_ids[:, k])
+    # Weights from Zipfian probabilities.
+    probs = 1.0 / (expert_ids.float() + 1)
+    weights = probs / probs.sum(dim=1, keepdim=True)
+    return (weights.to(torch.float32),
+            expert_ids.to(torch.int64))
+
+
 # MoE load profiling: set VLLM_MOE_LOAD_PROFILE_INTERVAL=N
 # to print per-batch-size load stats every N MoE-layer calls.
 _MOE_LOAD_PROFILE_INTERVAL = int(
@@ -750,29 +813,42 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                .mem_bound_aware_routing)
         eplb_for_select = enable_eplb and not _ir
 
-        topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            indices_type=self.topk_indices_dtype,
-            enable_eplb=eplb_for_select,
-            expert_map=expert_map,
-            expert_load_view=expert_load_view,
-            logical_to_physical_map=logical_to_physical_map,
-            logical_replica_count=logical_replica_count,
-            global_num_experts=global_num_experts,
-            zero_expert_num=zero_expert_num,
-            zero_expert_type=zero_expert_type,
-            mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing,
-            router_ws=self.router_ws)
+        if _ZIPFIAN_ROUTING:
+            pf = (self.fused_experts.prepare_finalize
+                  if hasattr(self.fused_experts,
+                             'prepare_finalize')
+                  else None)
+            _layer_idx = (getattr(pf, '_moe_layer_idx', 0)
+                          if pf else 0)
+            topk_weights, topk_ids = (
+                zipfian_select_experts(
+                    x, global_num_experts,
+                    top_k, _layer_idx))
+            zero_expert_result = None
+        else:
+            topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias,
+                indices_type=self.topk_indices_dtype,
+                enable_eplb=eplb_for_select,
+                expert_map=expert_map,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+                global_num_experts=global_num_experts,
+                zero_expert_num=zero_expert_num,
+                zero_expert_type=zero_expert_type,
+                mem_bound_aware_routing=self.moe.moe_parallel_config.mem_bound_aware_routing,
+                router_ws=self.router_ws)
 
         record_topk_for_batch(
             ep_rank=self.moe.moe_parallel_config.ep_rank,
