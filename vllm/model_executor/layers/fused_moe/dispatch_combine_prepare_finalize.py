@@ -341,6 +341,12 @@ class DispatchCombinePrepareAndFinalize(
             self.rank_expert_offset:
             self.rank_expert_offset
             + self.num_local_experts]
+        # Router unique expert count (before dispatch).
+        if mgr._profiling_enabled:
+            ids = topk_ids.view(-1)
+            mgr._router_unique = int(
+                ids.unique().numel())
+            mgr._router_total = int(ids.numel())
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,

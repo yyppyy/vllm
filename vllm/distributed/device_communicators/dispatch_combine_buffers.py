@@ -1081,13 +1081,16 @@ class DispatchCombineP2PManager:
             ratio = (mx / mn) if mn > 0 else float('inf')
             n_active = sum(1 for x in et if x > 0)
             total_tokens = sum(et)
+            ru = getattr(self, '_router_unique', 0)
+            rt = getattr(self, '_router_total', 0)
             parts.append(
                 f"  expert_tokens: max={mx}(e{mx_i})"
                 f" min={mn}(e{mn_i})"
                 f" mean={mean_et:.0f}"
                 f" ratio={ratio:.1f}x"
                 f" activated={n_active}/{len(et)}"
-                f" total={total_tokens}")
+                f" total={total_tokens}"
+                f" router={ru}/{rt}")
             # rc=1 vs rc>1 token split for imbalance
             # decomposition.
             if (self._integrated_routing_enabled
