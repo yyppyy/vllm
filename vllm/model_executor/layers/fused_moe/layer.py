@@ -94,69 +94,66 @@ logger = init_logger(__name__)
 # Zipfian pseudo-random expert selection (for debugging).
 _ZIPFIAN_ROUTING = bool(int(
     os.environ.get('VLLM_ZIPFIAN_ROUTING', '0')))
-_zipfian_cache: dict[tuple[int, int, int,
-                          torch.device],
-                     tuple[torch.Tensor,
-                           torch.Tensor,
-                           torch.Tensor]] = {}
+_zipfian_cdf_cache: dict[
+    tuple[int, torch.device], torch.Tensor] = {}
+
+# Pre-computed per-(M, topk, layer_idx, num_experts)
+# expert_ids and weights. Computed once per unique M
+# during graph capture, reused on replay.
+_zipfian_result_cache: dict[
+    tuple[int, int, int, int, torch.device],
+    tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-def _get_zipfian_tensors(
-        num_experts: int, topk: int,
-        max_tokens: int,
-        device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor,
-           torch.Tensor]:
-    """Get pre-allocated CDF, primes, and token_ids.
-    All allocated once, reused across graph replays."""
-    key = (num_experts, topk, max_tokens, device)
-    if key not in _zipfian_cache:
+def _get_zipfian_cdf(
+        num_experts: int,
+        device: torch.device) -> torch.Tensor:
+    key = (num_experts, device)
+    if key not in _zipfian_cdf_cache:
         harmonic = torch.cumsum(
             1.0 / torch.arange(
                 1, num_experts + 1,
                 dtype=torch.float32), dim=0)
-        cdf = (harmonic / harmonic[-1]).to(device)
-        primes_list = [6997, 7307, 7517, 7691,
-                       7877, 7993, 8101, 8209]
-        primes = torch.tensor(
-            primes_list[:topk],
-            device=device, dtype=torch.float32)
-        token_ids = torch.arange(
-            max_tokens, device=device,
-            dtype=torch.float32)
-        _zipfian_cache[key] = (cdf, primes,
-                               token_ids)
-    return _zipfian_cache[key]
+        _zipfian_cdf_cache[key] = (
+            (harmonic / harmonic[-1]).to(device))
+    return _zipfian_cdf_cache[key]
 
 
+@torch.compiler.disable
 def zipfian_select_experts(
         hidden_states: torch.Tensor,
         num_experts: int,
         topk: int,
         layer_idx: int,
-        max_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pseudo-random expert selection with Zipfian
-    distribution. Deterministic, CUDA-graph safe.
-    Computes for max_tokens then slices to M to
-    avoid shape mismatches during graph replay."""
+    distribution. Results are pre-computed and cached
+    per (M, topk, layer_idx, num_experts) — the
+    forward pass just returns cached tensors.
+    Graph-safe: no allocations after first call."""
     M = hidden_states.shape[0]
     device = hidden_states.device
-    cdf, primes, token_ids = (
-        _get_zipfian_tensors(
-            num_experts, topk,
-            max_tokens, device))
-    # Compute for full max_tokens to keep shapes
-    # fixed across graph captures/replays.
+    key = (M, topk, layer_idx, num_experts, device)
+    if key in _zipfian_result_cache:
+        return _zipfian_result_cache[key]
+
+    cdf = _get_zipfian_cdf(num_experts, device)
+    primes = [6997, 7307, 7517, 7691,
+              7877, 7993, 8101, 8209]
+    # Vectorized: (M, topk) uniform values.
+    token_ids = torch.arange(
+        M, device=device, dtype=torch.float32)
+    p = torch.tensor(
+        primes[:topk], device=device,
+        dtype=torch.float32)
     u = torch.frac(
         (token_ids.unsqueeze(1) + 1)
-        * primes.unsqueeze(0)
+        * p.unsqueeze(0)
         + layer_idx * 104729.0)
     expert_ids = torch.searchsorted(
-        cdf, u.reshape(-1)).reshape(
-            max_tokens, topk)
+        cdf, u.reshape(-1)).reshape(M, topk)
     expert_ids = expert_ids.clamp(0, num_experts - 1)
-    # Resolve duplicates by shifting collisions.
+    # Resolve duplicates.
     for k in range(1, topk):
         for prev in range(k):
             collision = (expert_ids[:, k]
@@ -165,12 +162,12 @@ def zipfian_select_experts(
                 collision,
                 (expert_ids[:, k] + 1) % num_experts,
                 expert_ids[:, k])
-    # Weights from Zipfian probabilities.
     probs = 1.0 / (expert_ids.float() + 1)
     weights = probs / probs.sum(dim=1, keepdim=True)
-    # Slice to actual M.
-    return (weights[:M].to(torch.float32),
-            expert_ids[:M].to(torch.int64))
+    result = (weights.to(torch.float32),
+              expert_ids.to(torch.int64))
+    _zipfian_result_cache[key] = result
+    return result
 
 
 # MoE load profiling: set VLLM_MOE_LOAD_PROFILE_INTERVAL=N
@@ -839,12 +836,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                   else None)
             _layer_idx = (getattr(pf, '_moe_layer_idx', 0)
                           if pf else 0)
-            _max_tok = (self.moe.max_num_tokens
-                        if hasattr(self, 'moe') else 8192)
             topk_weights, topk_ids = (
                 zipfian_select_experts(
                     x, global_num_experts,
-                    top_k, _layer_idx, _max_tok))
+                    top_k, _layer_idx))
             zero_expert_result = None
         else:
             topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
