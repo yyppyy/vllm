@@ -51,6 +51,7 @@ SCHED_PY="$(VLLM_LOGGING_LEVEL=ERROR python3 -c 'from vllm.v1.core.sched import 
 sed -i 's|"VLLM_PREFILL_BEFORE_DECODE", "[^"]*"|"VLLM_PREFILL_BEFORE_DECODE", "1"|' "$SCHED_PY"
 unset VLLM_PREFILL_BEFORE_DECODE
 
+export VLLM_ZIPFIAN_ROUTING=1
 # export VLLM_DC_PROFILE=1 # time breakdown debug
 # export VLLM_DC_EXPERT_PROFILE_M=256 # threshold
 
