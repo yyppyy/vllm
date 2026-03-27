@@ -1047,6 +1047,9 @@ class DispatchCombineP2PManager:
         # Need all events recorded.
         for name in names:
             if name not in self._expert_events:
+                logger.debug(
+                    "expert_compute: missing event "
+                    "'%s' (M=%d), skipping", name, M)
                 return
         # Synchronize to ensure events completed.
         torch.cuda.current_stream().synchronize()

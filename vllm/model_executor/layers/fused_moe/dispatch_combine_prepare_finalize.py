@@ -332,6 +332,16 @@ class DispatchCombinePrepareAndFinalize(
             self.expert_load_view.add_(
                 expert_num_tokens)
 
+        # Store for profiling (must be before _receiver
+        # lambda — accumulate_expert_times in _finalize
+        # reads these after expert compute).
+        mgr._expert_M = M
+        mgr._expert_local_tokens = mc
+        mgr._expert_num_tokens = expert_num_tokens[
+            self.rank_expert_offset:
+            self.rank_expert_offset
+            + self.num_local_experts]
+
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,
             expert_map, expert_topk_ids,
@@ -412,11 +422,6 @@ class DispatchCombinePrepareAndFinalize(
             num_tokens_for_config=a1_orig.shape[0],
             topk_ids_for_masking=(
                 expert_topk_ids.view(-1)))
-
-        # Store token counts for profiling.
-        mgr._expert_M = a1_orig.shape[0]
-        mgr._expert_local_tokens = mc
-        mgr._expert_num_tokens = local_expert_num_tokens
 
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,
