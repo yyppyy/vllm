@@ -917,8 +917,9 @@ class DispatchCombineP2PManager:
             ltp_flat[:expected])
         self._routing_count_tensor.copy_(
             logical_replica_count.to(torch.int64))
-        # Enable profiling after first rebalance.
-        self._profiling_after_rebalance = True
+        # _profiling_after_rebalance is set externally
+        # by eplb_state.py after the real (non-profile)
+        # rebalance.
         # Signal debug to re-dump after rebalance.
         from vllm.model_executor.layers.fused_moe.\
             dispatch_combine_prepare_finalize import (

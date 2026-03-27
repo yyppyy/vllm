@@ -603,6 +603,7 @@ class EplbState:
                 self.expert_load_pass,
                 self.logical_to_physical_map,
                 self.logical_replica_count,
+                enable_profiling=True,
             )
 
         if is_main_rank:
