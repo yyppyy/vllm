@@ -1879,6 +1879,7 @@ class FusedMoE(CustomOp):
         self.expert_load_view = expert_load_view[moe_layer_idx]
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
+        self._moe_layer_idx = moe_layer_idx
 
         # Init/update integrated routing for
         # dispatch_combine + EPLB.
@@ -1975,6 +1976,7 @@ class FusedMoE(CustomOp):
             pf._layer_routing_count.copy_(lrc_flat)
 
         pf.expert_load_view = self.expert_load_view
+        pf._moe_layer_idx = self._moe_layer_idx
 
     @staticmethod
     def _dedup_ltp_by_rank(

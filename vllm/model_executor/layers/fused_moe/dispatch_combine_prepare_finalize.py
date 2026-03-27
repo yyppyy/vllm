@@ -28,6 +28,11 @@ _MOE_LOAD_PROFILE_INTERVAL = int(
     os.environ.get('VLLM_MOE_LOAD_PROFILE_INTERVAL',
                     '0'))
 
+# Minimum M to print per-layer expert compute breakdown.
+# Only prefill batches (large M) are printed.
+_EXPERT_PROFILE_M_THRESHOLD = int(
+    os.environ.get('VLLM_DC_EXPERT_PROFILE_M', '256'))
+
 # Routing mode threshold: M <= this uses routing_mode=0
 # (minimize activated experts), M > this uses
 # routing_mode=1 (balance tokens via section-level
@@ -99,9 +104,164 @@ class DispatchCombinePrepareAndFinalize(
         # Set by layer.py when integrated routing is on.
         self.expert_load_view = None
 
+        # Expert compute profiling (per-layer state).
+        self._expert_step_names = [
+            'recv_start', 'compact_done',
+            'gather_done', 'align_done',
+            'expert_done', 'combine_start',
+        ]
+        self._expert_events: dict[
+            str, torch.cuda.Event] = {}
+        self._expert_M = 0
+        self._expert_local_tokens = 0
+        self._expert_num_tokens: (
+            torch.Tensor | None) = None
+        self._moe_layer_idx = -1
+        self._print_counts: dict[int, int] = {}
+
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
             self.experts_per_rank)
+
+    def record_expert_event(self, name: str):
+        """Record a CUDA event for expert compute
+        profiling. Only active when DC_PROFILE > 0."""
+        mgr = self.p2p_manager
+        if not mgr._profiling_enabled:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if name not in self._expert_events:
+            self._expert_events[name] = (
+                torch.cuda.Event(enable_timing=True))
+        self._expert_events[name].record()
+
+    def accumulate_expert_times(self):
+        """Print per-layer expert compute breakdown.
+        Only prints when M > threshold to avoid spam."""
+        mgr = self.p2p_manager
+        if not mgr._profiling_enabled:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        M = self._expert_M
+        local_tokens = self._expert_local_tokens
+        # Only print for large M (prefill batches).
+        if M < _EXPERT_PROFILE_M_THRESHOLD:
+            return
+        # Per-(layer, M) throttle: max 10 prints.
+        counts = self._print_counts
+        counts[M] = counts.get(M, 0) + 1
+        if counts[M] > 10:
+            return
+        names = self._expert_step_names
+        # Need all events recorded.
+        for name in names:
+            if name not in self._expert_events:
+                logger.debug(
+                    "expert_compute: missing event "
+                    "'%s' (layer %d, M=%d), skipping",
+                    name, self._moe_layer_idx, M)
+                return
+        # Synchronize to ensure events completed.
+        torch.cuda.current_stream().synchronize()
+        parts = []
+        total_us = 0.0
+        for i in range(len(names) - 1):
+            e_start = self._expert_events[names[i]]
+            e_end = self._expert_events[names[i + 1]]
+            try:
+                elapsed_us = (
+                    e_start.elapsed_time(e_end)
+                    * 1000.0)
+                total_us += elapsed_us
+                parts.append(
+                    f"  {names[i]}: {elapsed_us:.1f}"
+                    " us")
+            except RuntimeError:
+                parts.append(
+                    f"  {names[i]}: N/A")
+        # Per-expert token distribution.
+        if (self._expert_num_tokens is not None
+                and self._expert_num_tokens.numel() > 0):
+            et = self._expert_num_tokens.cpu().tolist()
+            mx = max(et)
+            mn = min(et) if min(et) > 0 else 0
+            mean_et = sum(et) / len(et)
+            mx_i = et.index(mx)
+            mn_i = et.index(mn)
+            ratio = (mx / mn) if mn > 0 else float('inf')
+            n_active = sum(1 for x in et if x > 0)
+            total_tokens = sum(et)
+            ru = getattr(self, '_router_unique', 0)
+            rt = getattr(self, '_router_total', 0)
+            parts.append(
+                f"  expert_tokens: max={mx}(e{mx_i})"
+                f" min={mn}(e{mn_i})"
+                f" mean={mean_et:.0f}"
+                f" ratio={ratio:.1f}x"
+                f" activated={n_active}/{len(et)}"
+                f" total={total_tokens}"
+                f" router={ru}/{rt}")
+            # rc=1 vs rc>1 token split for imbalance
+            # decomposition.
+            if (mgr._integrated_routing_enabled
+                    and mgr._routing_count_tensor
+                    is not None
+                    and mgr._routing_map_tensor
+                    is not None):
+                rc = mgr._routing_count_tensor \
+                    .cpu().tolist()
+                l2p = mgr._routing_map_tensor \
+                    .cpu().tolist()
+                epr = mgr._physical_experts_per_rank
+                max_rep = (len(l2p) // len(rc)
+                           if len(rc) > 0 else 1)
+                NL = len(rc)
+                # Build phys->logical for local slots.
+                p2l = {}
+                for e in range(NL):
+                    for rep in range(max_rep):
+                        p = l2p[e * max_rep + rep]
+                        if p >= 0:
+                            p2l[p] = e
+                rc1_sum = 0
+                rc2_sum = 0
+                base = mgr.rank * epr
+                for j in range(len(et)):
+                    phys = base + j
+                    log_e = p2l.get(phys, -1)
+                    if log_e >= 0 and log_e < NL:
+                        if rc[log_e] <= 1:
+                            rc1_sum += et[j]
+                        else:
+                            rc2_sum += et[j]
+                total_tok = rc1_sum + rc2_sum
+                frac = (rc1_sum / total_tok * 100
+                        if total_tok > 0 else 0)
+                from collections import Counter
+                rc_dist = Counter(
+                    int(rc[log_e])
+                    for log_e in set(p2l.values())
+                    if 0 <= log_e < NL)
+                n_mapped = sum(
+                    1 for j in range(len(et))
+                    if p2l.get(base + j, -1) >= 0)
+                parts.append(
+                    f"  rc_split: rc1_tokens={rc1_sum}"
+                    f" rc2_tokens={rc2_sum}"
+                    f" rc1_frac={frac:.1f}%"
+                    f" rc_dist="
+                    f"{dict(sorted(rc_dist.items()))}"
+                    f" mapped={n_mapped}/{len(et)}")
+        logger.info(
+            "DC profile [rank %d] layer %d "
+            "expert_compute "
+            "(total %.1f us, M=%d, "
+            "local_tokens=%d):\n%s",
+            mgr.rank, self._moe_layer_idx,
+            total_us, M,
+            local_tokens, "\n".join(parts))
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -316,7 +476,7 @@ class DispatchCombinePrepareAndFinalize(
         # Compact after fused kernel.
         mgr.gpu_dar_compact(
             mc, num_experts)
-        mgr.record_expert_event('compact_done')
+        self.record_expert_event('compact_done')
         expert_topk_ids = (
             mgr.compact_expert_topk_ids_buf[
                 :mc]
@@ -335,18 +495,18 @@ class DispatchCombinePrepareAndFinalize(
         # Store for profiling (must be before _receiver
         # lambda — accumulate_expert_times in _finalize
         # reads these after expert compute).
-        mgr._expert_M = M
-        mgr._expert_local_tokens = mc
-        mgr._expert_num_tokens = expert_num_tokens[
+        self._expert_M = M
+        self._expert_local_tokens = mc
+        self._expert_num_tokens = expert_num_tokens[
             self.rank_expert_offset:
             self.rank_expert_offset
             + self.num_local_experts]
         # Router unique expert count (before dispatch).
         if mgr._profiling_enabled:
             ids = topk_ids.view(-1)
-            mgr._router_unique = int(
+            self._router_unique = int(
                 ids.unique().numel())
-            mgr._router_total = int(ids.numel())
+            self._router_total = int(ids.numel())
             # Accumulate per-expert selection histogram
             # per layer. Print every 100 calls.
             if not hasattr(self, '_router_hist'):
@@ -394,13 +554,13 @@ class DispatchCombinePrepareAndFinalize(
         mc: int,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
-        mgr.record_expert_event('recv_start')
+        self.record_expert_event('recv_start')
 
         # Token data gather is now fused into
         # dar_compact_kernel (vectorized int4 copy).
         # No separate index_select needed.
         expert_x = mgr.expert_x_buf[:mc]
-        mgr.record_expert_event('gather_done')
+        self.record_expert_event('gather_done')
 
         # Post-dispatch quantization.
         # Always call quantize (no numel guard) for
@@ -506,7 +666,7 @@ class DispatchCombinePrepareAndFinalize(
         # Use mc_full (not mc_compact) because combine
         # reads dispatch_meta at original IPC positions
         # and uses compact_reverse to index expert_output.
-        mgr.record_expert_event('combine_start')
+        self.record_expert_event('combine_start')
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc_full]
             .contiguous().view(torch.uint8))
@@ -515,9 +675,7 @@ class DispatchCombinePrepareAndFinalize(
             meta_bytes,
             output,
             mc_full)
-        mgr.accumulate_expert_times(
-            getattr(mgr, '_expert_M', 0),
-            getattr(mgr, '_expert_local_tokens', 0))
+        self.accumulate_expert_times()
 
         if do_async:
             return lambda: None

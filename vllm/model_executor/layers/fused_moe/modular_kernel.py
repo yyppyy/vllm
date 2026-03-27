@@ -993,8 +993,9 @@ class FusedMoEModularKernel(torch.nn.Module):
             fused_out = torch.empty_like(a1q).to(dtype=a1.dtype)
         else:
             # Record expert compute profiling event.
-            if hasattr(self.prepare_finalize, 'p2p_manager'):
-                self.prepare_finalize.p2p_manager\
+            if hasattr(self.prepare_finalize,
+                       'record_expert_event'):
+                self.prepare_finalize\
                     .record_expert_event('align_done')
             fused_out = self._maybe_chunk_fused_experts(
                 a1=a1,
@@ -1011,8 +1012,9 @@ class FusedMoEModularKernel(torch.nn.Module):
                 expert_tokens_meta=expert_tokens_meta,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
-            if hasattr(self.prepare_finalize, 'p2p_manager'):
-                self.prepare_finalize.p2p_manager\
+            if hasattr(self.prepare_finalize,
+                       'record_expert_event'):
+                self.prepare_finalize\
                     .record_expert_event('expert_done')
 
         shared_output: Optional[torch.Tensor] = None
