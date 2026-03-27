@@ -138,22 +138,23 @@ def zipfian_select_experts(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pseudo-random expert selection with Zipfian
     distribution. Deterministic, CUDA-graph safe.
-    All tensors are pre-allocated (no allocations
-    during graph capture)."""
+    Computes for max_tokens then slices to M to
+    avoid shape mismatches during graph replay."""
     M = hidden_states.shape[0]
     device = hidden_states.device
-    cdf, primes, token_ids_full = (
+    cdf, primes, token_ids = (
         _get_zipfian_tensors(
             num_experts, topk,
             max_tokens, device))
-    token_ids = token_ids_full[:M]
-    # Deterministic pseudo-random uniform values.
+    # Compute for full max_tokens to keep shapes
+    # fixed across graph captures/replays.
     u = torch.frac(
         (token_ids.unsqueeze(1) + 1)
         * primes.unsqueeze(0)
         + layer_idx * 104729.0)
     expert_ids = torch.searchsorted(
-        cdf, u.reshape(-1)).reshape(M, topk)
+        cdf, u.reshape(-1)).reshape(
+            max_tokens, topk)
     expert_ids = expert_ids.clamp(0, num_experts - 1)
     # Resolve duplicates by shifting collisions.
     for k in range(1, topk):
@@ -167,8 +168,9 @@ def zipfian_select_experts(
     # Weights from Zipfian probabilities.
     probs = 1.0 / (expert_ids.float() + 1)
     weights = probs / probs.sum(dim=1, keepdim=True)
-    return (weights.to(torch.float32),
-            expert_ids.to(torch.int64))
+    # Slice to actual M.
+    return (weights[:M].to(torch.float32),
+            expert_ids[:M].to(torch.int64))
 
 
 # MoE load profiling: set VLLM_MOE_LOAD_PROFILE_INTERVAL=N
