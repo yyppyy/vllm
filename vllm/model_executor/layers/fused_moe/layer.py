@@ -779,6 +779,51 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_tensor=topk_ids
         )
 
+        # Router logits repetition diagnostic.
+        pf = (self.fused_experts.prepare_finalize
+              if hasattr(self.fused_experts,
+                         'prepare_finalize')
+              else None)
+        if (pf is not None
+                and hasattr(pf, 'p2p_manager')
+                and pf.p2p_manager._profiling_enabled
+                and pf.p2p_manager._profiling_after_rebalance
+                ):
+            M_cur = x.shape[0]
+            layer_idx = getattr(
+                pf, '_moe_layer_idx', -1)
+            if not hasattr(pf, '_router_diag_counts'):
+                pf._router_diag_counts = {}
+            dc = pf._router_diag_counts
+            dc[M_cur] = dc.get(M_cur, 0) + 1
+            if dc[M_cur] <= 10:
+                rl = router_logits.float()
+                rl_rounded = (rl * 1000).round()
+                unique_logit_rows = int(
+                    rl_rounded.unique(
+                        dim=0).shape[0])
+                unique_topk_rows = int(
+                    topk_ids.unique(
+                        dim=0).shape[0])
+                unique_experts = int(
+                    topk_ids.view(-1
+                        ).unique().numel())
+                logger.info(
+                    "router_diag [rank %d layer %d]"
+                    " M=%d logit_rows: unique=%d/%d"
+                    " topk_rows: unique=%d/%d"
+                    " experts: unique=%d"
+                    " logits: min=%.2f max=%.2f"
+                    " std=%.4f",
+                    pf.p2p_manager.rank,
+                    layer_idx, M_cur,
+                    unique_logit_rows, M_cur,
+                    unique_topk_rows, M_cur,
+                    unique_experts,
+                    rl.min().item(),
+                    rl.max().item(),
+                    rl.std().item())
+
         # MoE load profiling (non-dispatch_combine backends).
         # dispatch_combine logs in _receiver() with accurate
         # post-dispatch expert_num_tokens instead.

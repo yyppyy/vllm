@@ -528,6 +528,20 @@ class DispatchCombinePrepareAndFinalize(
             self._router_unique = int(
                 ids.unique().numel())
             self._router_total = int(ids.numel())
+            # Sanity check: log topk_ids stats once
+            # per layer to verify they are logical IDs.
+            if not hasattr(self, '_topk_sanity_logged'):
+                self._topk_sanity_logged = True
+                logger.info(
+                    "topk_ids_check [rank %d layer %d] "
+                    "shape=%s dtype=%s min=%d max=%d "
+                    "unique=%d/%d M=%d topk=%d",
+                    mgr.rank, self._moe_layer_idx,
+                    list(topk_ids.shape),
+                    topk_ids.dtype,
+                    int(ids.min()), int(ids.max()),
+                    self._router_unique,
+                    self._router_total, M, topk)
             # Accumulate per-expert selection histogram
             # per layer. Print every 100 calls.
             if not hasattr(self, '_router_hist'):
