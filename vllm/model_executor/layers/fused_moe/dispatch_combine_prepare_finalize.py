@@ -348,20 +348,20 @@ class DispatchCombinePrepareAndFinalize(
                 ids.unique().numel())
             mgr._router_total = int(ids.numel())
             # Accumulate per-expert selection histogram
-            # across forward passes. Print every 100 calls.
-            if not hasattr(mgr, '_router_hist'):
-                mgr._router_hist = torch.zeros(
+            # per layer. Print every 100 calls.
+            if not hasattr(self, '_router_hist'):
+                self._router_hist = torch.zeros(
                     num_experts, dtype=torch.int64,
                     device='cpu')
-                mgr._router_hist_count = 0
-            mgr._router_hist.scatter_add_(
+                self._router_hist_count = 0
+            self._router_hist.scatter_add_(
                 0, ids.long().cpu(),
                 torch.ones_like(
                     ids, dtype=torch.int64,
                     device='cpu'))
-            mgr._router_hist_count += 1
-            if mgr._router_hist_count % 100 == 0:
-                h = mgr._router_hist.tolist()
+            self._router_hist_count += 1
+            if self._router_hist_count % 100 == 0:
+                h = self._router_hist.tolist()
                 n_dead = sum(1 for x in h if x == 0)
                 top10 = sorted(
                     enumerate(h), key=lambda x: -x[1]
@@ -372,7 +372,7 @@ class DispatchCombinePrepareAndFinalize(
                     "router_hist [rank %d] "
                     "calls=%d dead=%d/%d top10=[%s]",
                     mgr.rank,
-                    mgr._router_hist_count,
+                    self._router_hist_count,
                     n_dead, num_experts, top10_s)
 
         return lambda: self._receiver(
