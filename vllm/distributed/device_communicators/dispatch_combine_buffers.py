@@ -254,6 +254,8 @@ class DispatchCombineP2PManager:
         # Fine-grained profiling.
         self._profiling_enabled = (_DC_PROFILE_INTERVAL > 0)
         self._profiling_interval = _DC_PROFILE_INTERVAL
+        # Gate: only print after first EPLB rebalance.
+        self._profiling_after_rebalance = False
         self._raw_profiling_timestamps = None
         if self._profiling_enabled:
             # int64[kTotalProfileSlots] on GPU.
@@ -648,7 +650,12 @@ class DispatchCombineP2PManager:
 
         if self._profiling_enabled:
             if self._read_and_accumulate_timestamps('cas'):
-                self._maybe_print_profile()
+                self._maybe_print_profile(
+                    layer_idx=getattr(
+                        self, '_current_layer_idx', -1),
+                    print_counts=getattr(
+                        self, '_current_print_counts',
+                        None))
 
     def gpu_dar_compact(
             self, mc_compact: int,
@@ -910,6 +917,8 @@ class DispatchCombineP2PManager:
             ltp_flat[:expected])
         self._routing_count_tensor.copy_(
             logical_replica_count.to(torch.int64))
+        # Enable profiling after first rebalance.
+        self._profiling_after_rebalance = True
         # Signal debug to re-dump after rebalance.
         from vllm.model_executor.layers.fused_moe.\
             dispatch_combine_prepare_finalize import (
@@ -964,9 +973,15 @@ class DispatchCombineP2PManager:
                     self._cas_accum[i] += delta_ns
         return True
 
-    def _maybe_print_profile(self):
-        """Print and reset averages if interval reached."""
+    def _maybe_print_profile(
+            self, layer_idx: int = -1,
+            print_counts: dict | None = None):
+        """Print and reset averages if interval reached.
+        Only prints after EPLB rebalance. Throttled by
+        print_counts (per-layer, per-M, max 10)."""
         if not self._profiling_enabled:
+            return
+        if not self._profiling_after_rebalance:
             return
         # Only print for large M (prefill batches).
         M = getattr(self, '_last_M', 0)
@@ -976,8 +991,20 @@ class DispatchCombineP2PManager:
         if (self._profile_batch_count
                 % self._profiling_interval != 0):
             return
+        # Per-(layer, M) throttle: max 10 prints.
+        if print_counts is not None:
+            print_counts[M] = (
+                print_counts.get(M, 0) + 1)
+            if print_counts[M] > 10:
+                self._dar_accum = (
+                    [0.0] * _DAR_NUM_STEPS)
+                self._cas_accum = (
+                    [0.0] * _CAS_NUM_STEPS)
+                return
 
         n = self._profiling_interval
+        ly = (f" layer {layer_idx}"
+              if layer_idx >= 0 else "")
         # Print dispatch_and_route steps.
         parts = []
         for i in range(_DAR_NUM_STEPS - 1):
@@ -987,9 +1014,9 @@ class DispatchCombineP2PManager:
             parts.append(f"  {name}: {avg_us:.1f} us")
         total_dar = sum(self._dar_accum) / n / 1000.0
         logger.info(
-            "DC profile [rank %d] dispatch_and_route "
-            "(avg %d batches, total %.1f us):\n%s",
-            self.rank, n, total_dar,
+            "DC profile [rank %d%s] dispatch_and_route"
+            " (avg %d batches, total %.1f us):\n%s",
+            self.rank, ly, n, total_dar,
             "\n".join(parts))
 
         # Print combine_and_scatter steps.
@@ -1001,9 +1028,10 @@ class DispatchCombineP2PManager:
             parts.append(f"  {name}: {avg_us:.1f} us")
         total_cas = sum(self._cas_accum) / n / 1000.0
         logger.info(
-            "DC profile [rank %d] combine_and_scatter "
-            "(avg %d batches, total %.1f us):\n%s",
-            self.rank, n, total_cas,
+            "DC profile [rank %d%s]"
+            " combine_and_scatter"
+            " (avg %d batches, total %.1f us):\n%s",
+            self.rank, ly, n, total_cas,
             "\n".join(parts))
 
         # Reset accumulators.

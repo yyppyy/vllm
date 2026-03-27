@@ -118,6 +118,7 @@ class DispatchCombinePrepareAndFinalize(
             torch.Tensor | None) = None
         self._moe_layer_idx = -1
         self._print_counts: dict[int, int] = {}
+        self._comm_print_counts: dict[int, int] = {}
 
         # Update config tensor with experts_per_rank.
         self.p2p_manager.update_experts_per_rank(
@@ -138,9 +139,11 @@ class DispatchCombinePrepareAndFinalize(
 
     def accumulate_expert_times(self):
         """Print per-layer expert compute breakdown.
-        Only prints when M > threshold to avoid spam."""
+        Only prints after EPLB rebalance, throttled."""
         mgr = self.p2p_manager
         if not mgr._profiling_enabled:
+            return
+        if not mgr._profiling_after_rebalance:
             return
         if torch.cuda.is_current_stream_capturing():
             return
@@ -670,6 +673,10 @@ class DispatchCombinePrepareAndFinalize(
         meta_bytes = (
             mgr.dispatch_meta_tensor[:mc_full]
             .contiguous().view(torch.uint8))
+        # Pass layer context for comm profiling.
+        mgr._current_layer_idx = self._moe_layer_idx
+        mgr._current_print_counts = (
+            self._comm_print_counts)
         mgr.gpu_combine_and_scatter(
             fused_expert_output,
             meta_bytes,
