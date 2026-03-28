@@ -127,37 +127,41 @@ def zipfian_select_experts(
         layer_idx: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pseudo-random expert selection with Zipfian
-    distribution. Each token gets independently sampled
-    experts. Results cached per (M, topk, layer_idx,
-    num_experts). Graph-safe after first call."""
+    distribution using Gumbel-top-k (exact sampling
+    without replacement). Each token independently
+    samples topk experts. Results cached per
+    (M, topk, layer_idx, num_experts).
+    Graph-safe after first call."""
     M = hidden_states.shape[0]
     device = hidden_states.device
     key = (M, topk, layer_idx, num_experts, device)
     if key in _zipfian_result_cache:
         return _zipfian_result_cache[key]
 
-    cdf = _get_zipfian_cdf(num_experts, device)
-    # Use torch.Generator for reproducible per-token
-    # random sampling. Generator is only used during
-    # cache miss (first call per key).
+    # Zipfian log-probabilities: log(1/i) - log(H_N)
+    # = -log(i) - log(H_N). The H_N term cancels in
+    # top-k so we just use -log(i).
+    log_probs = -torch.log(torch.arange(
+        1, num_experts + 1,
+        dtype=torch.float32, device=device))
+
+    # Gumbel-top-k: add iid Gumbel noise to
+    # log_probs, take top-k. This gives exact
+    # samples without replacement from the
+    # categorical distribution.
     gen = torch.Generator(device=device)
     gen.manual_seed(layer_idx * 1000003 + M * 7)
-    # (M, topk) uniform random values in [0, 1).
-    u = torch.rand(M, topk, generator=gen,
+    # Gumbel noise: -log(-log(U)), U ~ Uniform(0,1)
+    u = torch.rand(M, num_experts, generator=gen,
                    device=device, dtype=torch.float32)
-    # Map through Zipfian inverse CDF.
-    expert_ids = torch.searchsorted(
-        cdf, u.reshape(-1)).reshape(M, topk)
-    expert_ids = expert_ids.clamp(0, num_experts - 1)
-    # Resolve duplicates per token.
-    for k in range(1, topk):
-        for prev in range(k):
-            collision = (expert_ids[:, k]
-                         == expert_ids[:, prev])
-            expert_ids[:, k] = torch.where(
-                collision,
-                (expert_ids[:, k] + 1) % num_experts,
-                expert_ids[:, k])
+    u.clamp_(1e-10, 1.0 - 1e-7)
+    gumbel = -torch.log(-torch.log(u))
+    # Perturbed log-probs: (M, num_experts)
+    perturbed = log_probs.unsqueeze(0) + gumbel
+    # Top-k selection (no duplicates by construction)
+    _, expert_ids = perturbed.topk(topk, dim=-1)
+
+    # Weights from Zipfian probabilities.
     probs = 1.0 / (expert_ids.float() + 1)
     weights = probs / probs.sum(dim=1, keepdim=True)
     result = (weights.to(torch.float32),
