@@ -832,9 +832,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                   else None)
             _layer_idx = (getattr(pf, '_moe_layer_idx', 0)
                           if pf else 0)
+            # Use router_logits.shape[-1] for logical
+            # expert count (global_num_experts includes
+            # redundant physical copies).
+            _n_logical = router_logits.shape[-1]
             topk_weights, topk_ids = (
                 zipfian_select_experts(
-                    x, global_num_experts,
+                    x, _n_logical,
                     top_k, _layer_idx))
             zero_expert_result = None
         else:
