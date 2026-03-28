@@ -10,8 +10,9 @@ ALLTOALL_BACKEND=$7
 DATASET=$8
 DATASET_NAME=$9
 USE_PROFILER=${10}
+MEM_BOUND_ROUTING_THRES=${11}
 RES_DIR=./results
-RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}_${MEM_BOUND_ROUTING_THRES}
 mkdir -p "$RES_DIR"/"$RUN_HASH"
 
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
@@ -34,7 +35,7 @@ NUM_PROMPTS=$((BATCH_SIZE * NUM_GPUS))
 # Patch ROUTING_MODE_THRESHOLD directly in source instead of
 # setting env var, which conflicts with nsys profiling.
 DCPF_PY="$(VLLM_LOGGING_LEVEL=ERROR python3 -c 'from vllm.model_executor.layers.fused_moe import dispatch_combine_prepare_finalize as m; print(m.__file__)')"
-sed -i 's|"VLLM_ROUTING_MODE_THRESHOLD", "[^"]*"|"VLLM_ROUTING_MODE_THRESHOLD", "256"|' "$DCPF_PY"
+sed -i "s|\"VLLM_ROUTING_MODE_THRESHOLD\", \"[^\"]*\"|\"VLLM_ROUTING_MODE_THRESHOLD\", \"${MEM_BOUND_ROUTING_THRES}\"|" "$DCPF_PY"
 unset VLLM_ROUTING_MODE_THRESHOLD
 # Patch VLLM_PREFILL_ROUTING_MODE: MEM_BOUND_ROUTING=1 → mode 1 (LPT),
 # MEM_BOUND_ROUTING=2 → mode 2 (round-robin).
