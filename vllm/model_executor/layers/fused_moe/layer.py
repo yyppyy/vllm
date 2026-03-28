@@ -127,10 +127,9 @@ def zipfian_select_experts(
         layer_idx: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pseudo-random expert selection with Zipfian
-    distribution. Results are pre-computed and cached
-    per (M, topk, layer_idx, num_experts) — the
-    forward pass just returns cached tensors.
-    Graph-safe: no allocations after first call."""
+    distribution. Each token gets independently sampled
+    experts. Results cached per (M, topk, layer_idx,
+    num_experts). Graph-safe after first call."""
     M = hidden_states.shape[0]
     device = hidden_states.device
     key = (M, topk, layer_idx, num_experts, device)
@@ -138,22 +137,19 @@ def zipfian_select_experts(
         return _zipfian_result_cache[key]
 
     cdf = _get_zipfian_cdf(num_experts, device)
-    primes = [6997, 7307, 7517, 7691,
-              7877, 7993, 8101, 8209]
-    # Vectorized: (M, topk) uniform values.
-    token_ids = torch.arange(
-        M, device=device, dtype=torch.float32)
-    p = torch.tensor(
-        primes[:topk], device=device,
-        dtype=torch.float32)
-    u = torch.frac(
-        (token_ids.unsqueeze(1) + 1)
-        * p.unsqueeze(0)
-        + layer_idx * 104729.0)
+    # Use torch.Generator for reproducible per-token
+    # random sampling. Generator is only used during
+    # cache miss (first call per key).
+    gen = torch.Generator(device=device)
+    gen.manual_seed(layer_idx * 1000003 + M * 7)
+    # (M, topk) uniform random values in [0, 1).
+    u = torch.rand(M, topk, generator=gen,
+                   device=device, dtype=torch.float32)
+    # Map through Zipfian inverse CDF.
     expert_ids = torch.searchsorted(
         cdf, u.reshape(-1)).reshape(M, topk)
     expert_ids = expert_ids.clamp(0, num_experts - 1)
-    # Resolve duplicates.
+    # Resolve duplicates per token.
     for k in range(1, topk):
         for prev in range(k):
             collision = (expert_ids[:, k]
