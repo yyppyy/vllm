@@ -9,3 +9,5 @@
 !routing_solver.csv
 !all2all.csv
 !.gitignore
+!vllm_results_final*
+!vllm_results_final*/**
