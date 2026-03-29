@@ -141,7 +141,7 @@ def zipfian_select_experts(
     # Zipfian log-probabilities: log(1/i) - log(H_N)
     # = -log(i) - log(H_N). The H_N term cancels in
     # top-k so we just use -log(i).
-    log_probs = -torch.log(torch.arange(
+    log_probs = -0.5 * torch.log(torch.arange(
         1, num_experts + 1,
         dtype=torch.float32, device=device))
 
