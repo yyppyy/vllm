@@ -129,7 +129,7 @@ OUTPUT_LEN=128
 
 # Warmup run: EPLB rebalances during these requests (results discarded)
 warmup_args=(
-    --model Qwen/Qwen3-30B-A3B
+    --model ./models/Qwen3-30B-A3B
     --backend vllm
     --save-result
     --result-filename /dev/null
@@ -151,7 +151,7 @@ vllm bench serve "${warmup_args[@]}"
 
 # Real benchmark run (EPLB already rebalanced, no interference)
 cli_args=(
-    --model Qwen/Qwen3-30B-A3B
+    --model ./models/Qwen3-30B-A3B
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result.json
