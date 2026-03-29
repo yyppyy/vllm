@@ -66,7 +66,7 @@ else
 fi
 
 args=(
-  serve Qwen/Qwen3-30B-A3B
+  serve ./models/Qwen3-30B-A3B
   --port "$PORT"
   --data-parallel-size "$EP_DEGREE"
   --tensor-parallel-size 1
