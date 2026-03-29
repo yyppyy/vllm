@@ -1888,25 +1888,53 @@ __global__ void dispatch_and_route_kernel(
         float wt = topk_weights[t * topk + slot];
         int32_t rc = s_replica_count[lid];
         if (rc > max_rep) rc = max_rep;
-        for (int32_t rep = 0; rep < rc; rep++) {
+        if (routing_mode == 2 && rc > 1) {
+          // Mode 2: per-token round-robin replica
+          // selection. Only send to the selected
+          // replica, not all replicas. Deterministic
+          // for Phase D2 reconstruction via
+          // source_token_idx % rc.
+          int32_t sel_rep = t % rc;
           int32_t phys =
-              s_l2p_map[lid * max_rep + rep];
+              s_l2p_map[lid * max_rep + sel_rep];
           int32_t dr = phys / epr;
-          if (dr < 0 || dr >= ws) continue;
-          if (!config->
-                  remote_dispatch_offsets[dr] ||
-              !config->
-                  remote_dispatch_recv[dr] ||
-              !config->
-                  remote_dispatch_meta[dr])
-            continue;
-          int32_t ei =
-              atomicAdd(&s_total_entries, 1);
-          if (ei < kMaxEntries) {
-            s_ent_lid[ei] = lid;
-            s_ent_wt[ei] = wt;
-            s_ent_grp[ei] = dr;
-            atomicAdd(&s_grp_count[dr], 1);
+          if (dr >= 0 && dr < ws
+              && config->
+                  remote_dispatch_offsets[dr]
+              && config->
+                  remote_dispatch_recv[dr]
+              && config->
+                  remote_dispatch_meta[dr]) {
+            int32_t ei =
+                atomicAdd(&s_total_entries, 1);
+            if (ei < kMaxEntries) {
+              s_ent_lid[ei] = lid;
+              s_ent_wt[ei] = wt;
+              s_ent_grp[ei] = dr;
+              atomicAdd(&s_grp_count[dr], 1);
+            }
+          }
+        } else {
+          for (int32_t rep = 0; rep < rc; rep++) {
+            int32_t phys =
+                s_l2p_map[lid * max_rep + rep];
+            int32_t dr = phys / epr;
+            if (dr < 0 || dr >= ws) continue;
+            if (!config->
+                    remote_dispatch_offsets[dr] ||
+                !config->
+                    remote_dispatch_recv[dr] ||
+                !config->
+                    remote_dispatch_meta[dr])
+              continue;
+            int32_t ei =
+                atomicAdd(&s_total_entries, 1);
+            if (ei < kMaxEntries) {
+              s_ent_lid[ei] = lid;
+              s_ent_wt[ei] = wt;
+              s_ent_grp[ei] = dr;
+              atomicAdd(&s_grp_count[dr], 1);
+            }
           }
         }
       }
@@ -2133,6 +2161,28 @@ __global__ void dispatch_and_route_kernel(
   DC_TIMESTAMP(config, 12);  // dar:phase_c_preload
 
   if (blockIdx.x == 0) {
+    if (routing_mode == 2) {
+      // Mode 2: routing decided in Phase A per-token
+      // (t % rc). No routing_selection needed. Just
+      // zero expert_num_tokens and signal readiness.
+      DC_TIMESTAMP(config, 13);  // dar:phase_c_route
+      DC_TIMESTAMP(config, 14);  // dar:route_pass1
+      DC_TIMESTAMP(config, 15);  // dar:route_pass2
+
+      for (int32_t i = threadIdx.x;
+           i < num_physical_experts;
+           i += blockDim.x) {
+        expert_num_tokens[i] = 0;
+      }
+      __threadfence();
+      __syncthreads();
+
+      if (threadIdx.x == 0) {
+        dc_st_flag_release(
+            config->routing_ready_flag, rf_expected);
+      }
+      DC_TIMESTAMP(config, 16);  // dar:route_writeback
+    } else {
     // Reuse shared[] for Phase C preload layout.
     // routing_mode=0 (minimize experts):
     //   routing_sel[NL], rank_active[ws],
@@ -2407,6 +2457,7 @@ __global__ void dispatch_and_route_kernel(
           config->routing_ready_flag, rf_expected);
     }
     DC_TIMESTAMP(config, 16);  // dar:route_writeback
+    } // end else (routing_mode != 2)
   } else {
     // Wait for routing to complete (blocks 1-31).
     if (threadIdx.x == 0) {
@@ -2467,6 +2518,38 @@ __global__ void dispatch_and_route_kernel(
           if (logical_id < 0
               || logical_id >= NL) {
             meta_w[idx].topk_weight = 0.0f;
+          } else if (routing_mode == 2) {
+            // Mode 2: reconstruct Phase A's per-token
+            // round-robin decision. No routing_selection
+            // lookup needed.
+            int32_t rc2 = static_cast<int32_t>(
+                config->logical_replica_count[
+                    logical_id]);
+            if (rc2 > max_rep) rc2 = max_rep;
+            int32_t sel;
+            if (rc2 <= 1) {
+              sel = config->logical_to_physical_map[
+                  logical_id * max_rep];
+            } else {
+              int32_t sel_rep =
+                  meta_r[idx].source_token_idx % rc2;
+              sel = config->logical_to_physical_map[
+                  logical_id * max_rep + sel_rep];
+            }
+            if (sel >= 0
+                && sel < num_physical_experts
+                && sel / epr == rank) {
+              // KEEP: selected replica on our rank.
+              expert_topk_ids[idx] =
+                  static_cast<int64_t>(sel);
+              expert_topk_weights[idx] =
+                  meta_r[idx].topk_weight;
+              atomicAdd(
+                  &expert_num_tokens[sel], 1);
+            } else {
+              // FILTER: not our replica.
+              meta_w[idx].topk_weight = 0.0f;
+            }
           } else {
             // routing_mode=0: one selection per expert.
             // routing_mode=1: per-section selection

@@ -452,7 +452,11 @@ void dispatch_and_route(
        + NL * mr)
       * sizeof(int32_t));
   size_t phase_c_bytes;
-  if (routing_mode == 0) {
+  if (routing_mode == 2) {
+    // Mode 2: Phase C only zeros expert_num_tokens
+    // and signals flag. No shared memory arrays.
+    phase_c_bytes = 0;
+  } else if (routing_mode == 0) {
     phase_c_bytes = static_cast<size_t>(
         (3 * NL + NL * mr + ws + NL + 1)
         * sizeof(int32_t));
