@@ -161,6 +161,7 @@ cli_args=(
     --port "$PORT"
     --num-prompts $NUM_PROMPTS
     --max-concurrency $NUM_PROMPTS
+    --hf-output-len 32
 )
 if [[ "$DATASET_NAME" == "random" ]]; then
   cli_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
