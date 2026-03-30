@@ -1189,8 +1189,10 @@ def determine_expert_map(
     else:
         local_num_experts = base_experts
 
-    # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full((global_num_experts, ), -1, dtype=torch.int32)
+    # Create a tensor of size num_experts+1 filled with -1.
+    # The +1 accommodates the sentinel value (= global_num_experts)
+    # that moe_align_block_size uses for padding entries.
+    expert_map = torch.full((global_num_experts + 1, ), -1, dtype=torch.int32)
     # Create an expert map for the local experts
     if expert_placement_strategy == "linear":
         start_idx = ep_rank * base_experts + min(ep_rank, remainder)
