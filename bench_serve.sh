@@ -13,6 +13,23 @@ USE_PROFILER=${10}
 MEM_BOUND_ROUTING_THRES=${11}
 MODEL_NAME=${12:-Qwen3-30B-A3B}
 MODEL_DIR=./models/${MODEL_NAME}
+
+# If MODEL_NAME matches Qwen3-30B-A3B-{topk}-{num_experts},
+# use the base model and patch config at runtime.
+if [[ "$MODEL_NAME" =~ ^Qwen3-30B-A3B-([0-9]+)-([0-9]+)$ ]]; then
+  QWEN_TOPK="${BASH_REMATCH[1]}"
+  QWEN_NUM_EXPERTS="${BASH_REMATCH[2]}"
+  MODEL_DIR="./models/Qwen3-30B-A3B"
+  python3 -c "
+import json
+cfg = json.load(open('${MODEL_DIR}/config.json'))
+cfg['num_experts_per_tok'] = ${QWEN_TOPK}
+cfg['num_experts'] = ${QWEN_NUM_EXPERTS}
+json.dump(cfg, open('${MODEL_DIR}/config.json', 'w'), indent=2)
+print(f'Patched Qwen3 config: topk=${QWEN_TOPK}, num_experts=${QWEN_NUM_EXPERTS}')
+"
+fi
+
 RES_DIR=./results
 RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}_${MEM_BOUND_ROUTING_THRES}_${MODEL_NAME}
 mkdir -p "$RES_DIR"/"$RUN_HASH"
@@ -127,7 +144,7 @@ fi
 WARMUP_PROMPTS=$((1 * NUM_PROMPTS))
 
 INPUT_LEN=512
-OUTPUT_LEN=128
+OUTPUT_LEN=32
 
 # Warmup run: EPLB rebalances during these requests (results discarded)
 warmup_args=(

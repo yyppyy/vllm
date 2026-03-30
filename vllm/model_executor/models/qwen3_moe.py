@@ -490,6 +490,22 @@ class Qwen3MoeModel(nn.Module):
                     continue
 
                 param = params_dict[name]
+                # Handle gate weight shape mismatch when
+                # num_experts was changed via config patch.
+                if ("gate.weight" in name
+                        and loaded_weight.shape[0]
+                        != param.data.shape[0]):
+                    tgt = param.data.shape[0]
+                    if loaded_weight.shape[0] > tgt:
+                        loaded_weight = (
+                            loaded_weight[:tgt])
+                    else:
+                        padded = torch.zeros_like(
+                            param.data)
+                        padded[:loaded_weight.shape[0]] = (
+                            loaded_weight)
+                        loaded_weight = padded
+
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 if weight_loader == default_weight_loader:
@@ -519,6 +535,8 @@ class Qwen3MoeModel(nn.Module):
                     if name_mapped.endswith(
                             ignore_suffixes
                     ) and name_mapped not in params_dict:
+                        continue
+                    if name_mapped not in params_dict:
                         continue
 
                     param = params_dict[name_mapped]
@@ -563,6 +581,8 @@ class Qwen3MoeModel(nn.Module):
                             continue
                         else:
                             name = remapped_kv_scale_name
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
@@ -689,7 +709,66 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        # Fill uninitialized expert weights when
+        # num_experts was increased via config patch
+        # (e.g., Qwen3-30B-A3B-2-256 with checkpoint
+        # having only 128 experts).
+        filled = self._fill_missing_expert_weights(loaded)
+        if loaded is not None and filled:
+            loaded.update(filled)
+        return loaded
+
+    def _fill_missing_expert_weights(
+        self, loaded: set[str],
+    ) -> set[str]:
+        """Fill expert weights not in checkpoint by
+        copying from the first loaded expert layer.
+        Needed when num_experts > checkpoint experts."""
+        filled: set[str] = set()
+        # Build (decoder_layer_idx, FusedMoE) pairs.
+        moe_pairs: list[tuple[int, object]] = []
+        for li, layer in enumerate(self.model.layers):
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if isinstance(layer.mlp,
+                          Qwen3MoeSparseMoeBlock):
+                moe_pairs.append(
+                    (li, layer.mlp.experts))
+        if not moe_pairs:
+            return filled
+        # Find a donor with loaded weights.
+        donor = None
+        donor_li = -1
+        for li, fmoe in moe_pairs:
+            key = (f"model.layers.{li}"
+                   f".mlp.experts.w13_weight")
+            if loaded is not None and key in loaded:
+                donor = fmoe
+                donor_li = li
+                break
+        if donor is None:
+            return filled
+        donor_params = dict(
+            donor.named_parameters())
+        # Fill layers not loaded from checkpoint.
+        for li, fmoe in moe_pairs:
+            if li == donor_li:
+                continue
+            key = (f"model.layers.{li}"
+                   f".mlp.experts.w13_weight")
+            if loaded is not None and key in loaded:
+                continue
+            for pname, param in (
+                    fmoe.named_parameters()):
+                if pname in donor_params:
+                    param.data.copy_(
+                        donor_params[pname].data)
+            prefix = f"model.layers.{li}.mlp.experts."
+            for pname, _ in (
+                    fmoe.named_parameters()):
+                filled.add(prefix + pname)
+        return filled
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
