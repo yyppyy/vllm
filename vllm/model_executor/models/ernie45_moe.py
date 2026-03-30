@@ -697,16 +697,21 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         # Copy expert weights from last loaded MoE layer
         # to any MoE layers that were originally dense
         # (their expert weights are uninitialized).
-        self._fill_missing_moe_weights()
+        filled = self._fill_missing_moe_weights()
+        if loaded is not None and filled:
+            loaded.update(filled)
         return loaded
 
-    def _fill_missing_moe_weights(self):
+    def _fill_missing_moe_weights(self) -> set[str]:
         """Copy expert weights from last real MoE layer
         to layers that were converted from dense to MoE
-        (e.g. via config patch for benchmarking)."""
+        (e.g. via config patch for benchmarking).
+        Returns set of filled parameter names."""
+        filled: set[str] = set()
         # Find the last layer with loaded expert weights
         # (non-zero norm indicates loaded weights).
         donor = None
+        donor_layer = None
         for layer in reversed(list(self.model.layers)):
             if isinstance(layer, PPMissingLayer):
                 continue
@@ -716,24 +721,35 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
             if hasattr(w, 'w13_weight') and \
                     w.w13_weight.data.abs().sum() > 0:
                 donor = w
+                donor_layer = layer
                 break
         if donor is None:
-            return
+            return filled
+        # Build donor param lookup once.
+        donor_params = dict(donor.named_parameters())
         # Fill uninitialized MoE layers.
-        for layer in self.model.layers:
+        for i, layer in enumerate(self.model.layers):
             if isinstance(layer, PPMissingLayer):
                 continue
             if not isinstance(layer.mlp, Ernie4_5_MoeMoE):
                 continue
-            w = layer.mlp.experts
-            if w is donor:
+            if layer is donor_layer:
                 continue
+            moe_block = layer.mlp
+            # Check if experts are uninitialized.
+            w = moe_block.experts
             if hasattr(w, 'w13_weight') and \
                     w.w13_weight.data.abs().sum() == 0:
+                # Copy all expert weights.
                 for pname, param in w.named_parameters():
-                    donor_param = dict(
-                        donor.named_parameters())[pname]
-                    param.data.copy_(donor_param.data)
+                    if pname in donor_params:
+                        param.data.copy_(
+                            donor_params[pname].data)
+                # Mark all MoE block params as filled.
+                prefix = f"model.layers.{i}.mlp."
+                for pname, _ in moe_block.named_parameters():
+                    filled.add(prefix + pname)
+        return filled
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
