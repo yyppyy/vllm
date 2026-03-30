@@ -17,16 +17,17 @@ download_model() {
 patch_topk() {
     local local_dir="$1"
     local new_topk="$2"
+    local key_name="${3:-num_experts_per_tok}"
     python3 -c "
 import json, sys
 cfg_path = '${local_dir}/config.json'
 with open(cfg_path, 'r') as f:
     cfg = json.load(f)
-orig = cfg.get('num_experts_per_tok', '?')
-cfg['num_experts_per_tok'] = ${new_topk}
+orig = cfg.get('${key_name}', '?')
+cfg['${key_name}'] = ${new_topk}
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)
-print(f'Patched num_experts_per_tok: {orig} -> ${new_topk}')
+print(f'Patched ${key_name}: {orig} -> ${new_topk}')
 "
 }
 
@@ -36,4 +37,4 @@ patch_topk "./models/Qwen3-30B-A3B" 4
 
 # ERNIE-4.5-21B-A3B-PT
 download_model "baidu/ERNIE-4.5-21B-A3B-PT" "./models/ERNIE-4.5-21B-A3B-PT"
-patch_topk "./models/Qwen3-30B-A3B" 3
+patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 3 moe_k
