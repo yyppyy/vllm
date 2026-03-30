@@ -473,6 +473,13 @@ class Ernie4_5_MoeModel(nn.Module):
             # MTP will be supported soon.
             if "mtp" in name:
                 continue
+            # Skip weights for layers beyond num_hidden_layers
+            # (e.g. when truncating the model via config patch).
+            if name not in params_dict and "layers." in name:
+                import re
+                m = re.search(r"layers\.(\d+)\.", name)
+                if m and int(m.group(1)) >= self.config.num_hidden_layers:
+                    continue
 
             if "e_score_correction_bias" in name:
                 name = name.replace("moe_statics", "gate")
@@ -514,6 +521,8 @@ class Ernie4_5_MoeModel(nn.Module):
                     if ((name.endswith(".bias") or name.endswith("_bias"))
                             and name not in params_dict):
                         continue
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
 
                     weight_loader = param.weight_loader
@@ -534,6 +543,8 @@ class Ernie4_5_MoeModel(nn.Module):
                     # Remapping the name of FP8 kv-scale.
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
+                        continue
+                    if name not in params_dict:
                         continue
 
                     param = params_dict[name]
