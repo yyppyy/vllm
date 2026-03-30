@@ -433,12 +433,16 @@ class Qwen3MoeModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        ckpt_ne = getattr(
+            self.config, '_checkpoint_num_experts',
+            None)
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
-            num_redundant_experts=self.num_redundant_experts)
+            num_redundant_experts=self.num_redundant_experts,
+            checkpoint_num_experts=ckpt_ne)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:

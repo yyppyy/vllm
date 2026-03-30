@@ -2609,7 +2609,9 @@ class FusedMoE(CustomOp):
             ckpt_down_proj_name: str,
             ckpt_up_proj_name: str,
             num_experts: int,
-            num_redundant_experts: int = 0) -> list[tuple[str, str, int, str]]:
+            num_redundant_experts: int = 0,
+            checkpoint_num_experts: Optional[int] = None,
+    ) -> list[tuple[str, str, int, str]]:
 
         num_physical_experts = num_experts + num_redundant_experts
 
@@ -2621,18 +2623,38 @@ class FusedMoE(CustomOp):
             EplbState.build_initial_global_physical_to_logical_map(
             num_experts, num_redundant_experts, get_ep_group().device_group.size())
 
-        return [
-            # (param_name, weight_name, expert_id, shard_id)
-            ("experts.w13_" if weight_name
-             in [ckpt_gate_proj_name, ckpt_up_proj_name] else "experts.w2_",
-             f"experts.{physical_to_logical_map[expert_id]}.{weight_name}.",
-             expert_id, shard_id) for expert_id in range(num_physical_experts)
+        # When model has more experts than checkpoint
+        # (e.g., config patched to 256 but ckpt has 128),
+        # remap to checkpoint expert via modulo so expert
+        # 130 loads from checkpoint expert 2 (130 % 128).
+        ckpt_ne = checkpoint_num_experts
+
+        result = []
+        for expert_id in range(num_physical_experts):
+            logical_id = physical_to_logical_map[
+                expert_id]
+            ckpt_id = logical_id
+            if (ckpt_ne is not None
+                    and ckpt_ne < num_experts
+                    and logical_id >= ckpt_ne):
+                ckpt_id = logical_id % ckpt_ne
             for shard_id, weight_name in [
                 ("w1", ckpt_gate_proj_name),
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
-            ]
-        ]
+            ]:
+                param_name = (
+                    "experts.w13_"
+                    if weight_name in [
+                        ckpt_gate_proj_name,
+                        ckpt_up_proj_name]
+                    else "experts.w2_")
+                result.append((
+                    param_name,
+                    f"experts.{ckpt_id}.{weight_name}.",
+                    expert_id,
+                    shard_id))
+        return result
 
     def extra_repr(self) -> str:
 

@@ -23,10 +23,13 @@ if [[ "$MODEL_NAME" =~ ^Qwen3-30B-A3B-([0-9]+)-([0-9]+)$ ]]; then
   python3 -c "
 import json
 cfg = json.load(open('${MODEL_DIR}/config.json'))
+# Preserve original checkpoint expert count (idempotent).
+cfg['_checkpoint_num_experts'] = cfg.get(
+    '_checkpoint_num_experts', cfg.get('num_experts'))
 cfg['num_experts_per_tok'] = ${QWEN_TOPK}
 cfg['num_experts'] = ${QWEN_NUM_EXPERTS}
 json.dump(cfg, open('${MODEL_DIR}/config.json', 'w'), indent=2)
-print(f'Patched Qwen3 config: topk=${QWEN_TOPK}, num_experts=${QWEN_NUM_EXPERTS}')
+print(f'Patched Qwen3 config: topk=${QWEN_TOPK}, num_experts=${QWEN_NUM_EXPERTS}, ckpt_experts={cfg[\"_checkpoint_num_experts\"]}')
 "
 fi
 
