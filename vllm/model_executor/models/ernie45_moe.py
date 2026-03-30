@@ -694,41 +694,42 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
                            if self.config.tie_word_embeddings else None),
         )
         loaded = loader.load_weights(weights)
-        # Copy expert weights from last loaded MoE layer
-        # to any MoE layers that were originally dense
-        # (their expert weights are uninitialized).
-        filled = self._fill_missing_moe_weights()
+        # Copy MoE block weights from a loaded MoE layer
+        # to layers that were originally dense (converted
+        # to MoE via config patch for benchmarking).
+        filled = self._fill_missing_moe_weights(loaded)
         if loaded is not None and filled:
             loaded.update(filled)
         return loaded
 
-    def _fill_missing_moe_weights(self) -> set[str]:
-        """Copy entire MoE block weights from last real
-        MoE layer to layers that were converted from
-        dense to MoE (e.g. via config patch).
+    def _fill_missing_moe_weights(
+        self, loaded: set[str],
+    ) -> set[str]:
+        """Copy entire MoE block weights from a loaded
+        MoE layer to layers whose MoE params were NOT
+        in the checkpoint (originally dense layers
+        converted to MoE via config patch).
         Returns set of filled parameter names."""
         filled: set[str] = set()
-        # Find the last layer with loaded expert weights.
+        # Find a donor: any MoE layer whose expert
+        # weight WAS loaded from checkpoint.
         donor_block = None
         donor_layer = None
-        for layer in reversed(list(self.model.layers)):
+        for i, layer in enumerate(self.model.layers):
             if isinstance(layer, PPMissingLayer):
                 continue
             if not isinstance(layer.mlp, Ernie4_5_MoeMoE):
                 continue
-            w = layer.mlp.experts
-            if hasattr(w, 'w13_weight') and \
-                    w.w13_weight.data.abs().sum() > 0:
+            key = f"model.layers.{i}.mlp.experts.w13_weight"
+            if loaded is not None and key in loaded:
                 donor_block = layer.mlp
                 donor_layer = layer
                 break
         if donor_block is None:
             return filled
-        # Build donor param lookup from entire MoE
-        # block (gate + experts + shared_experts).
         donor_params = dict(
             donor_block.named_parameters())
-        # Fill uninitialized MoE layers.
+        # Fill layers whose MoE params were not loaded.
         for i, layer in enumerate(self.model.layers):
             if isinstance(layer, PPMissingLayer):
                 continue
@@ -736,22 +737,19 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
                 continue
             if layer is donor_layer:
                 continue
+            key = f"model.layers.{i}.mlp.experts.w13_weight"
+            if loaded is not None and key in loaded:
+                continue  # already loaded from checkpoint
             moe_block = layer.mlp
-            w = moe_block.experts
-            if hasattr(w, 'w13_weight') and \
-                    w.w13_weight.data.abs().sum() == 0:
-                # Copy all MoE block params (gate,
-                # experts, shared_experts).
-                for pname, param in \
-                        moe_block.named_parameters():
-                    if pname in donor_params:
-                        param.data.copy_(
-                            donor_params[pname].data)
-                # Mark all as filled.
-                prefix = f"model.layers.{i}.mlp."
-                for pname, _ in \
-                        moe_block.named_parameters():
-                    filled.add(prefix + pname)
+            for pname, param in \
+                    moe_block.named_parameters():
+                if pname in donor_params:
+                    param.data.copy_(
+                        donor_params[pname].data)
+            prefix = f"model.layers.{i}.mlp."
+            for pname, _ in \
+                    moe_block.named_parameters():
+                filled.add(prefix + pname)
         return filled
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
