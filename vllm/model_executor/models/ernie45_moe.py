@@ -32,7 +32,7 @@ from transformers import PretrainedConfig
 
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -51,7 +51,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsLoRA, SupportsPP
+from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
@@ -126,6 +126,14 @@ class Ernie4_5_MoeMoE(nn.Module):
         self.gate.e_score_correction_bias = nn.Parameter(
             torch.empty(config.moe_num_experts))
 
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
+        enable_eplb = (parallel_config.enable_eplb
+                       if parallel_config else False)
+        num_redundant = (
+            parallel_config.eplb_config.num_redundant_experts
+            if (enable_eplb and parallel_config.eplb_config)
+            else 0)
         self.experts = FusedMoE(
             num_experts=config.moe_num_experts,
             top_k=config.moe_k,
@@ -135,7 +143,9 @@ class Ernie4_5_MoeMoE(nn.Module):
             renormalize=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
-            e_score_correction_bias=self.gate.e_score_correction_bias)
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+            enable_eplb=enable_eplb,
+            num_redundant_experts=num_redundant)
 
         if self.has_shared_experts:
             intermediate_size = (config.moe_intermediate_size *
@@ -534,7 +544,8 @@ class Ernie4_5_MoeModel(nn.Module):
         return loaded_params
 
 
-class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
+                               MixtureOfExperts):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -572,6 +583,74 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+
+        # MixtureOfExperts: collect MoE layers for EPLB.
+        self.expert_weights: list = []
+        self.moe_layers: list[FusedMoE] = []
+        example_fmoe = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if (hasattr(layer, "mlp")
+                    and isinstance(layer.mlp,
+                                   Ernie4_5_MoeMoE)):
+                example_fmoe = layer.mlp.experts
+                self.moe_layers.append(
+                    layer.mlp.experts)
+        self.num_moe_layers = len(self.moe_layers)
+        if example_fmoe is not None:
+            self.num_logical_experts = (
+                config.moe_num_experts)
+            self.num_routed_experts = (
+                config.moe_num_experts)
+            self.num_physical_experts = (
+                example_fmoe.global_num_experts)
+            self.num_redundant_experts = (
+                self.num_physical_experts
+                - self.num_logical_experts)
+            self.num_local_physical_experts = (
+                example_fmoe.local_num_experts)
+        else:
+            self.num_logical_experts = 0
+            self.num_routed_experts = 0
+            self.num_physical_experts = 0
+            self.num_redundant_experts = 0
+            self.num_local_physical_experts = 0
+        self.num_expert_groups = 1
+        self.num_shared_experts = getattr(
+            config, "moe_num_shared_experts", 0)
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        for layer_idx, layer in enumerate(
+                self.moe_layers):
+            self.expert_weights.append(
+                layer.get_expert_weights())
+            layer.set_eplb_state(
+                moe_layer_idx=layer_idx,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=(
+                    logical_to_physical_map),
+                logical_replica_count=(
+                    logical_replica_count),
+            )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        self.num_physical_experts = (
+            num_physical_experts)
+        self.num_local_physical_experts = (
+            num_local_physical_experts)
+        self.num_redundant_experts = (
+            num_physical_experts
+            - self.num_logical_experts)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
