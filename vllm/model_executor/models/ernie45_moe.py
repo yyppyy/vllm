@@ -693,7 +693,47 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        # Copy expert weights from last loaded MoE layer
+        # to any MoE layers that were originally dense
+        # (their expert weights are uninitialized).
+        self._fill_missing_moe_weights()
+        return loaded
+
+    def _fill_missing_moe_weights(self):
+        """Copy expert weights from last real MoE layer
+        to layers that were converted from dense to MoE
+        (e.g. via config patch for benchmarking)."""
+        # Find the last layer with loaded expert weights
+        # (non-zero norm indicates loaded weights).
+        donor = None
+        for layer in reversed(list(self.model.layers)):
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if not isinstance(layer.mlp, Ernie4_5_MoeMoE):
+                continue
+            w = layer.mlp.experts
+            if hasattr(w, 'w13_weight') and \
+                    w.w13_weight.data.abs().sum() > 0:
+                donor = w
+                break
+        if donor is None:
+            return
+        # Fill uninitialized MoE layers.
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if not isinstance(layer.mlp, Ernie4_5_MoeMoE):
+                continue
+            w = layer.mlp.experts
+            if w is donor:
+                continue
+            if hasattr(w, 'w13_weight') and \
+                    w.w13_weight.data.abs().sum() == 0:
+                for pname, param in w.named_parameters():
+                    donor_param = dict(
+                        donor.named_parameters())[pname]
+                    param.data.copy_(donor_param.data)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
