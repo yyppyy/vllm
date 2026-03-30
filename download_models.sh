@@ -34,6 +34,6 @@ print(f'Patched num_experts_per_tok: {orig} -> ${new_topk}')
 download_model "Qwen/Qwen3-30B-A3B" "./models/Qwen3-30B-A3B"
 patch_topk "./models/Qwen3-30B-A3B" 4
 
-# ERNIE-4.5-21B-A3B
-download_model "baidu/ERNIE-4.5-21B-A3B" "./models/ERNIE-4.5-21B-A3B"
+# ERNIE-4.5-21B-A3B-PT
+download_model "baidu/ERNIE-4.5-21B-A3B-PT" "./models/ERNIE-4.5-21B-A3B-PT"
 patch_topk "./models/Qwen3-30B-A3B" 3
