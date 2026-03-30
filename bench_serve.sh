@@ -144,8 +144,10 @@ warmup_args=(
 )
 if [[ "$DATASET_NAME" == "random" ]]; then
   warmup_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
+elif [[ "$DATASET_NAME" == "sharegpt" ]]; then
+  warmup_args+=( --dataset-name sharegpt --dataset-path ./datasets/ShareGPT_V3_unfiltered_cleaned_split.json )
 else
-  warmup_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" )
+  warmup_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" --hf-output-len $OUTPUT_LEN )
 fi
 
 echo "=== Warmup: sending $WARMUP_PROMPTS requests ==="
@@ -163,12 +165,13 @@ cli_args=(
     --port "$PORT"
     --num-prompts $NUM_PROMPTS
     --max-concurrency $NUM_PROMPTS
-    --hf-output-len 32
 )
 if [[ "$DATASET_NAME" == "random" ]]; then
   cli_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
+elif [[ "$DATASET_NAME" == "sharegpt" ]]; then
+  cli_args+=( --dataset-name sharegpt --dataset-path ./datasets/ShareGPT_V3_unfiltered_cleaned_split.json )
 else
-  cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" )
+  cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" --hf-output-len $OUTPUT_LEN )
 fi
 
 # if (( USE_PROFILER > 0 )); then
