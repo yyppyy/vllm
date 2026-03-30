@@ -75,7 +75,7 @@ args=(
   --max-num-seqs $MAX_REQ_PER_BATCH
   --no-enable-chunked-prefill
   --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]}"
-  --max-model-len 4096
+  --max-model-len 8192
   --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
   --gpu-memory-utilization "$GPU_MEM_UTIL"
