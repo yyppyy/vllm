@@ -740,12 +740,15 @@ class DispatchCombineP2PManager:
             device=dev)
         # Pre-allocated dtype conversion buffers.
         # Avoids .to() allocations during CUDA
-        # graph capture.
+        # graph capture. Use 16384 to cover large
+        # prefill batches (max_num_batched_tokens may
+        # exceed the manager's max_num_tokens).
+        _buf_tokens = max(self.max_num_tokens, 16384)
         self.topk_ids_i32_buf = torch.empty(
-            self.max_num_tokens, self.topk,
+            _buf_tokens, self.topk,
             dtype=torch.int32, device=dev)
         self.topk_weights_f32_buf = torch.empty(
-            self.max_num_tokens, self.topk,
+            _buf_tokens, self.topk,
             dtype=torch.float32, device=dev)
         # Pre-allocated fp32 accumulation buffer for
         # combine_and_scatter kernel. Avoids
