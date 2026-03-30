@@ -11,8 +11,10 @@ DATASET=$8
 DATASET_NAME=$9
 USE_PROFILER=${10}
 MEM_BOUND_ROUTING_THRES=${11}
+MODEL_NAME=${12:-Qwen3-30B-A3B}
+MODEL_DIR=./models/${MODEL_NAME}
 RES_DIR=./results
-RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}_${MEM_BOUND_ROUTING_THRES}
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}_${MEM_BOUND_ROUTING_THRES}_${MODEL_NAME}
 mkdir -p "$RES_DIR"/"$RUN_HASH"
 
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
@@ -66,7 +68,7 @@ else
 fi
 
 args=(
-  serve ./models/Qwen3-30B-A3B
+  serve "$MODEL_DIR"
   --port "$PORT"
   --data-parallel-size "$EP_DEGREE"
   --tensor-parallel-size 1
@@ -129,7 +131,7 @@ OUTPUT_LEN=128
 
 # Warmup run: EPLB rebalances during these requests (results discarded)
 warmup_args=(
-    --model ./models/Qwen3-30B-A3B
+    --model "$MODEL_DIR"
     --backend vllm
     --save-result
     --result-filename /dev/null
@@ -151,7 +153,7 @@ vllm bench serve "${warmup_args[@]}"
 
 # Real benchmark run (EPLB already rebalanced, no interference)
 cli_args=(
-    --model ./models/Qwen3-30B-A3B
+    --model "$MODEL_DIR"
     --backend vllm
     --save-result
     --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result.json

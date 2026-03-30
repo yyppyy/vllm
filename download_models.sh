@@ -1,28 +1,39 @@
 #!/bin/bash
 set -euo pipefail
 
-MODEL_NAME="Qwen/Qwen3-30B-A3B"
-LOCAL_DIR="./models/Qwen3-30B-A3B"
+pip install -q huggingface_hub
 
-if [ -d "$LOCAL_DIR" ] && [ -f "$LOCAL_DIR/config.json" ]; then
-    echo "Model already exists at $LOCAL_DIR, skipping download."
-else
-    echo "Downloading $MODEL_NAME to $LOCAL_DIR ..."
-    pip install -q huggingface_hub
-    huggingface-cli download "$MODEL_NAME" --local-dir "$LOCAL_DIR"
-fi
+download_model() {
+    local model_name="$1"
+    local local_dir="$2"
+    if [ -d "$local_dir" ] && [ -f "$local_dir/config.json" ]; then
+        echo "Model already exists at $local_dir, skipping download."
+    else
+        echo "Downloading $model_name to $local_dir ..."
+        huggingface-cli download "$model_name" --local-dir "$local_dir"
+    fi
+}
 
-# Patch num_experts_per_tok from 8 to 4
-python3 -c "
+patch_topk() {
+    local local_dir="$1"
+    local new_topk="$2"
+    python3 -c "
 import json, sys
-cfg_path = '${LOCAL_DIR}/config.json'
+cfg_path = '${local_dir}/config.json'
 with open(cfg_path, 'r') as f:
     cfg = json.load(f)
 orig = cfg.get('num_experts_per_tok', '?')
-cfg['num_experts_per_tok'] = 4
+cfg['num_experts_per_tok'] = ${new_topk}
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)
-print(f'Patched num_experts_per_tok: {orig} -> 4')
+print(f'Patched num_experts_per_tok: {orig} -> ${new_topk}')
 "
+}
 
-# echo "Done. Use '$LOCAL_DIR' as the model path in bench_serve.sh."
+# Qwen3-30B-A3B
+download_model "Qwen/Qwen3-30B-A3B" "./models/Qwen3-30B-A3B"
+patch_topk "./models/Qwen3-30B-A3B" 4
+
+# ERNIE-4.5-21B-A3B
+download_model "baidu/ERNIE-4.5-21B-A3B" "./models/ERNIE-4.5-21B-A3B"
+patch_topk "./models/Qwen3-30B-A3B" 3
