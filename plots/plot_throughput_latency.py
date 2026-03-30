@@ -135,7 +135,7 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
         y = [r[metric] for r in pts]
         batches = [r["batch"] for r in pts]
 
-        ax.plot(x, y,
+        ax.plot(y, x,
                 label=style["label"],
                 color=style["color"],
                 marker=style["marker"],
@@ -145,22 +145,22 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
         # Annotate batch sizes
         for xi, yi, b in zip(x, y, batches):
             ax.annotate(f"B={b}",
-                        (xi, yi),
+                        (yi, xi),
                         textcoords="offset points",
                         xytext=(5, 5),
                         fontsize=7,
                         color=style["color"])
 
     dataset_name = DATASET_NAMES.get(dataset_id, f"Dataset {dataset_id}")
-    ax.set_xlabel("Total Token Throughput (tok/s)", fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(f"{dataset_name}: Throughput vs {ylabel}", fontsize=13)
+    ax.set_xlabel(ylabel, fontsize=12)
+    ax.set_ylabel("Total Token Throughput (tok/s)", fontsize=12)
+    ax.set_title(f"{dataset_name}: {ylabel} vs Throughput", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
     out_path = OUTPUT_DIR / filename
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved: {out_path}")
     plt.close(fig)
 
@@ -186,10 +186,10 @@ def main():
         ds_name = DATASET_NAMES.get(ds, str(ds)).lower()
         plot_dataset(results, ds, "p99_tpot",
                      "P99 TPOT (ms)",
-                     f"throughput_vs_p99tpot_{ds_name}.png")
+                     f"throughput_vs_p99tpot_{ds_name}.pdf")
         plot_dataset(results, ds, "p99_ttft",
                      "P99 TTFT (ms)",
-                     f"throughput_vs_p99ttft_{ds_name}.png")
+                     f"throughput_vs_p99ttft_{ds_name}.pdf")
 
     print("Done!")
 
