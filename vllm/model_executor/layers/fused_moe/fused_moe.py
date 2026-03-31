@@ -1953,7 +1953,9 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             _flat = topk_ids.flatten()
             _valid = _flat[_flat < global_num_experts]
             _bincount = torch.bincount(_valid, minlength=global_num_experts)
-            _nonzero_experts = (_bincount > 0).sum().item()
+            # Count only local experts (0..local_E-1)
+            _local_E_count = w1.size(0)
+            _nonzero_experts = (_bincount[:_local_E_count] > 0).sum().item()
             _per_expert_blocks = torch.ceil(_bincount.float() / _bsm).int()
             _total_real_blocks = _per_expert_blocks.sum().item()
             # Grid that will actually be launched
@@ -1965,20 +1967,24 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             _grid_total = _grid_m * _grid_n
             import logging
             _log = logging.getLogger("vllm.moe_debug")
+            _M_recv = hidden_states.size(0)
+            _local_E = w1.size(0)
             _log.info(
-                f"MOE_DEBUG M={num_tokens} topk={top_k_num} "
+                f"MOE_DEBUG M_recv={_M_recv} "
+                f"M_pairs={num_tokens} topk={top_k_num} "
+                f"local_E={_local_E} "
                 f"global_E={global_num_experts} "
                 f"BLOCK_SIZE_M={_bsm} "
                 f"num_tokens_post_padded={_ntp} "
                 f"max_alloc={sorted_token_ids.size(0)} "
-                f"activated_experts={_nonzero_experts}/{global_num_experts} "
+                f"activated_local={_nonzero_experts}/{_local_E} "
                 f"total_real_blocks={_total_real_blocks} "
                 f"real_blocks={_real_blocks} "
                 f"skip_blocks={_skip_blocks} "
                 f"grid={_grid_total}({_grid_m}x{_grid_n}) "
                 f"N={_N} "
-                f"capturing={_capturing} "
-                f"top5_experts={_bincount.topk(min(5,_bincount.numel())).values.tolist()}"
+                f"top5_experts="
+                f"{_bincount[:_local_E].topk(min(5,_local_E)).values.tolist()}"
             )
         if _moe_debug and not torch.cuda.is_current_stream_capturing():
             _ev_w1_start = torch.cuda.Event(enable_timing=True)
@@ -2078,7 +2084,8 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             import logging
             _log = logging.getLogger("vllm.moe_debug")
             _log.info(
-                f"MOE_DEBUG timing M={num_tokens} "
+                f"MOE_DEBUG timing M_recv={hidden_states.size(0)} "
+                f"M_pairs={num_tokens} "
                 f"w1={_ev_w1_start.elapsed_time(_ev_w1_end):.3f}ms "
                 f"act={_ev_act_start.elapsed_time(_ev_act_end):.3f}ms "
                 f"w2={_ev_w2_start.elapsed_time(_ev_w2_end):.3f}ms "
