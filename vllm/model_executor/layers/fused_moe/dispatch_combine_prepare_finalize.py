@@ -386,14 +386,13 @@ class DispatchCombinePrepareAndFinalize(
             mgr._routing_count_tensor.copy_(
                 self._layer_routing_count)
 
-        # Per-batch tight bound: compaction moves valid
-        # entries from scattered per-sender sections into
-        # contiguous positions, so mc can be tight.
-        # Worst case: all ws source ranks send M*topk
-        # entries, with max_rep=2 replicas each.
+        # Per-batch tight bound: this rank's M tokens
+        # each select topk experts, with at most 2
+        # replicas per expert (after EPLB). No * ws
+        # factor — dispatch routes each token-expert
+        # pair to one destination rank.
         mc = min(
-            M * self.experts_per_token
-            * self.world_size_ * 2,
+            M * self.experts_per_token * 2,
             self.max_recv)
 
         # Pre-allocated dtype conversion buffers
