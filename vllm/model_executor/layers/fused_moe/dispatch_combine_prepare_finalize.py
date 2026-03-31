@@ -497,13 +497,21 @@ class DispatchCombinePrepareAndFinalize(
         mgr.gpu_dar_compact(
             mc, num_experts)
         self.record_expert_event('compact_done')
+        # Actual compact count from per-expert token
+        # counts (Phase D2 atomicAdd). DC pipeline runs
+        # in eager mode (not CUDA graph captured), so
+        # .item() sync is safe and avoids worst-case mc
+        # inflating fused_moe grid by ~10x.
+        mc_actual = int(expert_num_tokens.sum().item())
+        if mc_actual <= 0:
+            mc_actual = mc  # fallback
         expert_topk_ids = (
             mgr.compact_expert_topk_ids_buf[
-                :mc]
+                :mc_actual]
             .unsqueeze(1))
         expert_topk_weights = (
             mgr.compact_expert_topk_weights_buf[
-                :mc]
+                :mc_actual]
             .unsqueeze(1))
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
@@ -516,7 +524,7 @@ class DispatchCombinePrepareAndFinalize(
         # lambda — accumulate_expert_times in _finalize
         # reads these after expert compute).
         self._expert_M = M
-        self._expert_local_tokens = mc
+        self._expert_local_tokens = mc_actual
         self._expert_num_tokens = expert_num_tokens[
             self.rank_expert_offset:
             self.rank_expert_offset
@@ -574,7 +582,7 @@ class DispatchCombinePrepareAndFinalize(
             a1, K, num_experts, quant_config,
             expert_map, expert_topk_ids,
             expert_topk_weights, expert_num_tokens,
-            mc)
+            mc_actual)
 
     def _receiver(
         self,
