@@ -985,7 +985,7 @@ def get_default_config(
             config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1}
     elif M <= E:
         config = {
-            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 32,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 1,
