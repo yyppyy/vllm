@@ -610,14 +610,16 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
     M = A.size(0)
     num_tokens = M * top_k
 
-    EM = sorted_token_ids.size(0)
-    if A.size(0) < config["BLOCK_SIZE_M"]:
-        # optimize for small batch_size.
-        # We assume that top_ids of each token is unique,
-        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
-        # and we can skip some invalid blocks.
-        EM = min(sorted_token_ids.size(0),
-                 A.size(0) * top_k * config['BLOCK_SIZE_M'])
+    # Use actual padded token count for a tight grid
+    # when not capturing CUDA graphs.
+    if not torch.cuda.is_current_stream_capturing():
+        EM = num_tokens_post_padded.item()
+    else:
+        EM = sorted_token_ids.size(0)
+        if A.size(0) < config["BLOCK_SIZE_M"]:
+            EM = min(EM,
+                     A.size(0) * top_k
+                     * config['BLOCK_SIZE_M'])
     grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
         B.size(1), META['BLOCK_SIZE_N']), )
     HAS_BIAS = B_bias is not None
@@ -1938,6 +1940,52 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'],
                                  global_num_experts, expert_map))
 
+        # --- MOE DEBUG ---
+        _moe_debug = os.environ.get('VLLM_MOE_DEBUG', '0') == '1'
+        if _moe_debug and not torch.cuda.is_current_stream_capturing():
+            _bsm = config['BLOCK_SIZE_M']
+            _bsn = config.get('BLOCK_SIZE_N', 64)
+            _ntp = num_tokens_post_padded.item()
+            _total_blocks = expert_ids.numel()
+            _real_blocks = (expert_ids[:_ntp // _bsm] != -1).sum().item() if _ntp > 0 else 0
+            _skip_blocks = (expert_ids[:_ntp // _bsm] == -1).sum().item() if _ntp > 0 else 0
+            # Per-expert token counts
+            _flat = topk_ids.flatten()
+            _valid = _flat[_flat < global_num_experts]
+            _bincount = torch.bincount(_valid, minlength=global_num_experts)
+            _nonzero_experts = (_bincount > 0).sum().item()
+            _per_expert_blocks = torch.ceil(_bincount.float() / _bsm).int()
+            _total_real_blocks = _per_expert_blocks.sum().item()
+            # Grid that will actually be launched
+            _capturing = torch.cuda.is_current_stream_capturing()
+            _N = w1.size(1)
+            _em_used = _ntp  # eager path
+            _grid_m = (_em_used + _bsm - 1) // _bsm
+            _grid_n = (_N + _bsn - 1) // _bsn
+            _grid_total = _grid_m * _grid_n
+            import logging
+            _log = logging.getLogger("vllm.moe_debug")
+            _log.info(
+                f"MOE_DEBUG M={num_tokens} topk={top_k_num} "
+                f"global_E={global_num_experts} "
+                f"BLOCK_SIZE_M={_bsm} "
+                f"num_tokens_post_padded={_ntp} "
+                f"max_alloc={sorted_token_ids.size(0)} "
+                f"activated_experts={_nonzero_experts}/{global_num_experts} "
+                f"total_real_blocks={_total_real_blocks} "
+                f"real_blocks={_real_blocks} "
+                f"skip_blocks={_skip_blocks} "
+                f"grid={_grid_total}({_grid_m}x{_grid_n}) "
+                f"N={_N} "
+                f"capturing={_capturing} "
+                f"top5_experts={_bincount.topk(min(5,_bincount.numel())).values.tolist()}"
+            )
+        if _moe_debug and not torch.cuda.is_current_stream_capturing():
+            _ev_w1_start = torch.cuda.Event(enable_timing=True)
+            _ev_w1_end = torch.cuda.Event(enable_timing=True)
+            _ev_w1_start.record()
+        # --- END MOE DEBUG ---
+
         invoke_fused_moe_kernel(
             hidden_states,
             w1,
@@ -1962,6 +2010,14 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             B_bias=self.w1_bias,
         )
 
+        # --- MOE DEBUG ---
+        if _moe_debug and not torch.cuda.is_current_stream_capturing():
+            _ev_w1_end.record()
+            _ev_act_start = torch.cuda.Event(enable_timing=True)
+            _ev_act_end = torch.cuda.Event(enable_timing=True)
+            _ev_act_start.record()
+        # --- END MOE DEBUG ---
+
         if (expert_tokens_meta is not None
                 and expert_tokens_meta.topk_ids_for_masking
                 is not None):
@@ -1976,6 +2032,14 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             self.activation(
                 activation, intermediate_cache2,
                 intermediate_cache1.view(-1, N))
+
+        # --- MOE DEBUG ---
+        if _moe_debug and not torch.cuda.is_current_stream_capturing():
+            _ev_act_end.record()
+            _ev_w2_start = torch.cuda.Event(enable_timing=True)
+            _ev_w2_end = torch.cuda.Event(enable_timing=True)
+            _ev_w2_start.record()
+        # --- END MOE DEBUG ---
 
         a2q_scale: Optional[torch.Tensor] = None
 
@@ -2006,6 +2070,21 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             block_shape=self.block_shape,
             B_bias=self.w2_bias,
         )
+
+        # --- MOE DEBUG ---
+        if _moe_debug and not torch.cuda.is_current_stream_capturing():
+            _ev_w2_end.record()
+            torch.cuda.synchronize()
+            import logging
+            _log = logging.getLogger("vllm.moe_debug")
+            _log.info(
+                f"MOE_DEBUG timing M={num_tokens} "
+                f"w1={_ev_w1_start.elapsed_time(_ev_w1_end):.3f}ms "
+                f"act={_ev_act_start.elapsed_time(_ev_act_end):.3f}ms "
+                f"w2={_ev_w2_start.elapsed_time(_ev_w2_end):.3f}ms "
+                f"total={_ev_w1_start.elapsed_time(_ev_w2_end):.3f}ms"
+            )
+        # --- END MOE DEBUG ---
 
         if top_k_num == 1:
             # topk=1: sum across topk dim is identity.
