@@ -1955,45 +1955,45 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             _bsm = config['BLOCK_SIZE_M']
             _bsn = config.get('BLOCK_SIZE_N', 64)
             _ntp = num_tokens_post_padded.item()
-            _total_blocks = expert_ids.numel()
-            _real_blocks = (expert_ids[:_ntp // _bsm] != -1).sum().item() if _ntp > 0 else 0
-            _skip_blocks = (expert_ids[:_ntp // _bsm] == -1).sum().item() if _ntp > 0 else 0
-            # Per-expert token counts
-            _flat = topk_ids.flatten()
-            _valid = _flat[_flat < global_num_experts]
-            _bincount = torch.bincount(_valid, minlength=global_num_experts)
-            # Count only local experts (0..local_E-1)
-            _local_E_count = w1.size(0)
-            _nonzero_experts = (_bincount[:_local_E_count] > 0).sum().item()
-            _per_expert_blocks = torch.ceil(_bincount.float() / _bsm).int()
-            _total_real_blocks = _per_expert_blocks.sum().item()
-            # Grid that will actually be launched
-            _capturing = torch.cuda.is_current_stream_capturing()
+            _local_E = w1.size(0)
             _N = w1.size(1)
-            _em_used = _ntp  # eager path
-            _grid_m = (_em_used + _bsm - 1) // _bsm
+            _M_recv = hidden_states.size(0)
+            # Blocks within num_tokens_post_padded
+            _ntp_blocks = _ntp // _bsm if _ntp > 0 else 0
+            _real_blocks = int((expert_ids[:_ntp_blocks] != -1).sum().item()) if _ntp_blocks > 0 else 0
+            _skip_blocks = int((expert_ids[:_ntp_blocks] == -1).sum().item()) if _ntp_blocks > 0 else 0
+            # Per-local-expert token counts
+            _flat = topk_ids.flatten()
+            _valid = _flat[(_flat >= 0) & (_flat < _local_E)]
+            _bincount = torch.bincount(
+                _valid, minlength=_local_E)
+            _activated = int((_bincount > 0).sum().item())
+            _per_expert_blocks = torch.ceil(
+                _bincount.float() / _bsm).int()
+            _sum_real_blocks = int(
+                _per_expert_blocks.sum().item())
+            # Grid
+            _em = sorted_token_ids.size(0)
+            _grid_m = (_em + _bsm - 1) // _bsm
             _grid_n = (_N + _bsn - 1) // _bsn
-            _grid_total = _grid_m * _grid_n
             import logging
             _log = logging.getLogger("vllm.moe_debug")
-            _M_recv = hidden_states.size(0)
-            _local_E = w1.size(0)
             _log.info(
                 f"MOE_DEBUG M_recv={_M_recv} "
                 f"M_pairs={num_tokens} topk={top_k_num} "
                 f"local_E={_local_E} "
+                f"align_E={align_num_experts} "
                 f"global_E={global_num_experts} "
-                f"BLOCK_SIZE_M={_bsm} "
-                f"num_tokens_post_padded={_ntp} "
-                f"max_alloc={sorted_token_ids.size(0)} "
-                f"activated_local={_nonzero_experts}/{_local_E} "
-                f"total_real_blocks={_total_real_blocks} "
-                f"real_blocks={_real_blocks} "
-                f"skip_blocks={_skip_blocks} "
-                f"grid={_grid_total}({_grid_m}x{_grid_n}) "
-                f"N={_N} "
-                f"top5_experts="
-                f"{_bincount[:_local_E].topk(min(5,_local_E)).values.tolist()}"
+                f"BSM={_bsm} "
+                f"ntp={_ntp} "
+                f"sorted_sz={_em} "
+                f"activated={_activated}/{_local_E} "
+                f"real_blks={_real_blocks} "
+                f"skip_blks={_skip_blocks} "
+                f"sum_expert_blks={_sum_real_blocks} "
+                f"grid={_grid_m * _grid_n}"
+                f"({_grid_m}x{_grid_n}) "
+                f"top5={_bincount.topk(min(5, _local_E)).values.tolist()}"
             )
         if _moe_debug and not torch.cuda.is_current_stream_capturing():
             _ev_w1_start = torch.cuda.Event(enable_timing=True)
