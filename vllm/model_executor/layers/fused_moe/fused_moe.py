@@ -1936,9 +1936,18 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         intermediate_cache3 = _resize_cache(workspace2,
                                             (num_tokens, top_k_num, K))
 
+        # Use local expert count for padding when EP is
+        # active (expert_map present). Non-local experts
+        # are already sentinel in topk_ids, so padding
+        # for 192 global experts wastes grid blocks.
+        # local_num_experts (w1.size(0)) gives tight
+        # padding. CUDA graph safe — no GPU→CPU sync.
+        align_num_experts = (
+            w1.size(0) if expert_map is not None
+            else global_num_experts)
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'],
-                                 global_num_experts, expert_map))
+                                 align_num_experts, expert_map))
 
         # --- MOE DEBUG ---
         _moe_debug = os.environ.get('VLLM_MOE_DEBUG', '0') == '1'
