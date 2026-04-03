@@ -499,7 +499,8 @@ class DispatchCombinePrepareAndFinalize(
         expert_topk_ids = (
             mgr.compact_expert_topk_ids_buf[
                 :mc]
-            .unsqueeze(1))
+            .unsqueeze(1)
+            - self.rank_expert_offset)
         expert_topk_weights = (
             mgr.compact_expert_topk_weights_buf[
                 :mc]
