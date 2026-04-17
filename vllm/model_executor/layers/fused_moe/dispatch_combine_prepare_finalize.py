@@ -73,12 +73,18 @@ _HANG_LOCALIZE = os.environ.get(
 
 def _hang_probe(tag: str, rank: int, layer_idx: int,
                 extra: str = ""):
-    if _HANG_LOCALIZE:
-        import sys
-        torch.cuda.current_stream().synchronize()
-        print(f"DC[r={rank} L{layer_idx}] {tag}{extra}",
-              flush=True)
-        sys.stdout.flush()
+    if not _HANG_LOCALIZE:
+        return
+    # synchronize() is illegal during CUDA graph capture
+    # (profile_run, capture phase) — skip the probe in that
+    # window; the hang we're hunting is post-capture anyway.
+    if torch.cuda.is_current_stream_capturing():
+        return
+    import sys
+    torch.cuda.current_stream().synchronize()
+    print(f"DC[r={rank} L{layer_idx}] {tag}{extra}",
+          flush=True)
+    sys.stdout.flush()
 _routing_debug_done: set = set()  # track which modes we've dumped
 _routing_debug_skip = 5  # skip first N calls (warmup/capture)
 
