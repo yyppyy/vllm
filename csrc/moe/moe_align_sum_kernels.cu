@@ -173,6 +173,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
+    // Skip padding / out-of-range IDs (e.g. sentinel values from
+    // EP dispatch compactions). Without this bound the indexing
+    // below OOBs the fixed-size tokens_cnts shared buffer.
+    if (topk_ids[i] >= num_experts) {
+      continue;
+    }
     ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
   }
 
@@ -217,6 +223,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
+    // Matches the first-pass skip. Sentinel entries leave
+    // sorted_token_ids[...] at its `numel` initializer, which
+    // downstream kernels mask via offs_token < num_valid_tokens.
+    if (expert_id >= num_experts) {
+      continue;
+    }
     int32_t rank_post_pad =
         tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
