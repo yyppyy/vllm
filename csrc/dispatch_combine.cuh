@@ -2584,10 +2584,22 @@ __global__ void dispatch_and_route_kernel(
   } else {
     // Wait for routing to complete (blocks 1-31).
     if (threadIdx.x == 0) {
-      while (dc_ld_flag_acquire(
-              config->routing_ready_flag)
-              != rf_expected)
+      uint64_t rf_spin = 0;
+      FlagType rf_cur = 0;
+      while ((rf_cur = dc_ld_flag_acquire(
+              config->routing_ready_flag))
+              != rf_expected) {
         __nanosleep(200);
+        ++rf_spin;
+        if (rf_spin == 5'000'000ull && blockIdx.x == 1) {
+          printf("[DC DAR routing_ready stuck] rank=%d "
+                 "routing_mode=%d expected=%u "
+                 "observed=%u\n",
+                 rank, routing_mode,
+                 static_cast<uint32_t>(rf_expected),
+                 static_cast<uint32_t>(rf_cur));
+        }
+      }
     }
     __syncthreads();
     __threadfence();
