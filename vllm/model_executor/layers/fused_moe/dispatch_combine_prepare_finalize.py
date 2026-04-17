@@ -61,6 +61,24 @@ PREFILL_ROUTING_MODE = int(
 # and again after every EPLB rebalance.
 # Set VLLM_ROUTING_DEBUG=1 to enable.
 _ROUTING_DEBUG = os.environ.get("VLLM_ROUTING_DEBUG", "0") == "1"
+
+# Hang localizer: when enabled, wrap each DC phase entry/exit
+# with torch.cuda.current_stream().synchronize() + a flushed
+# print. The last printed "in" without a matching "out"
+# pinpoints the hanging phase. Breaks CUDA-graph replay for
+# DC (forces eager) — use only for one-off diagnostic runs.
+_HANG_LOCALIZE = os.environ.get(
+    "VLLM_DC_HANG_LOCALIZE", "0") == "1"
+
+
+def _hang_probe(tag: str, rank: int, layer_idx: int,
+                extra: str = ""):
+    if _HANG_LOCALIZE:
+        import sys
+        torch.cuda.current_stream().synchronize()
+        print(f"DC[r={rank} L{layer_idx}] {tag}{extra}",
+              flush=True)
+        sys.stdout.flush()
 _routing_debug_done: set = set()  # track which modes we've dumped
 _routing_debug_skip = 5  # skip first N calls (warmup/capture)
 
@@ -373,6 +391,9 @@ class DispatchCombinePrepareAndFinalize(
           to the least-loaded replica).
         """
         mgr = self.p2p_manager
+        _hang_probe("prep:in", self.rank_,
+                    self._moe_layer_idx,
+                    extra=f" M={M}")
 
         # Restore this layer's routing tables into the
         # shared buffer manager (all layers share one mgr
@@ -588,6 +609,8 @@ class DispatchCombinePrepareAndFinalize(
         mc: int,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
+        _hang_probe("recv:in", self.rank_,
+                    self._moe_layer_idx)
         self.record_expert_event('recv_start')
 
         # Token data gather is now fused into
@@ -650,6 +673,8 @@ class DispatchCombinePrepareAndFinalize(
             topk_ids_for_masking=(
                 expert_topk_ids.view(-1)))
 
+        _hang_probe("recv:out", self.rank_,
+                    self._moe_layer_idx)
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,
                 expert_topk_ids,
@@ -686,6 +711,8 @@ class DispatchCombinePrepareAndFinalize(
         # section layout (unchanged by compaction).
         mc_full = self.max_recv
         mgr = self.p2p_manager
+        _hang_probe("fin:in", self.rank_,
+                    self._moe_layer_idx)
 
         # Weight multiplication is handled by
         # combine_and_scatter kernel: dispatch_meta stores
@@ -714,6 +741,8 @@ class DispatchCombinePrepareAndFinalize(
             output,
             mc_full)
         self.accumulate_expert_times()
+        _hang_probe("fin:out", self.rank_,
+                    self._moe_layer_idx)
 
         if do_async:
             return lambda: None
