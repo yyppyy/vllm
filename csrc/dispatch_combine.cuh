@@ -407,13 +407,22 @@ __global__ void dispatch_p2p_kernel(
     const int32_t K4 = K *
         static_cast<int32_t>(sizeof(T)) /
         static_cast<int32_t>(sizeof(int4));
+    const int32_t ss_a = config->dispatch_section_size;
     for (int32_t g = 0; g < ws; g++) {
       if (s_grp_count[g] == 0) continue;
       int32_t base = s_grp_base[g];
       int32_t n = s_grp_count[g];
       if (base >= config->max_recv) continue;
-      if (base + n > config->max_recv)
-        n = config->max_recv - base;
+      // Clamp against THIS sender's section end, not the
+      // global buffer end. An overflow past rank*ss + ss
+      // would spill into the adjacent sender's section,
+      // producing metadata with mismatched source_rank.
+      // On ws=2 the adjacent section is the only other
+      // section, so the peer's Phase D2 reads
+      // inconsistent entries and the P2P barrier
+      // deadlocks.
+      const int32_t section_end = rank * ss_a + ss_a;
+      if (base + n > section_end) n = section_end - base;
 
       // Vectorized data copy (int4).
       // Data position: deterministic from (rank, t).
@@ -1965,13 +1974,22 @@ __global__ void dispatch_and_route_kernel(
     const int32_t K4 = K *
         static_cast<int32_t>(sizeof(T)) /
         static_cast<int32_t>(sizeof(int4));
+    const int32_t ss_a = config->dispatch_section_size;
     for (int32_t g = 0; g < ws; g++) {
       if (s_grp_count[g] == 0) continue;
       int32_t base = s_grp_base[g];
       int32_t n = s_grp_count[g];
       if (base >= config->max_recv) continue;
-      if (base + n > config->max_recv)
-        n = config->max_recv - base;
+      // Clamp against THIS sender's section end, not the
+      // global buffer end. An overflow past rank*ss + ss
+      // would spill into the adjacent sender's section,
+      // producing metadata with mismatched source_rank.
+      // On ws=2 the adjacent section is the only other
+      // section, so the peer's Phase D2 reads
+      // inconsistent entries and the P2P barrier
+      // deadlocks.
+      const int32_t section_end = rank * ss_a + ss_a;
+      if (base + n > section_end) n = section_end - base;
 
       // All threads: vectorized data copy (int4).
       // Data position: deterministic from (rank, t).
@@ -2069,8 +2087,17 @@ __global__ void dispatch_and_route_kernel(
     if (threadIdx.x >= NL &&
         threadIdx.x < NL + ws) {
       int32_t dr = threadIdx.x - NL;
-      config->remote_dispatch_offsets[dr][rank] =
-          config->local_dispatch_counters[dr];
+      // Clamp to section size so peers' Phase D2 sees
+      // a count consistent with the section-end clamp
+      // applied during Step 4 above. Defense-in-depth:
+      // the reader at remote_dispatch_offsets lookup
+      // also clamps to ss, but keeping the writer
+      // honest avoids misleading count values sitting
+      // in the IPC buffer.
+      const int32_t ss_b = config->dispatch_section_size;
+      int32_t local_n = config->local_dispatch_counters[dr];
+      if (local_n > ss_b) local_n = ss_b;
+      config->remote_dispatch_offsets[dr][rank] = local_n;
     }
 
     // Push expert counts to all remote ranks
