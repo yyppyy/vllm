@@ -1503,10 +1503,22 @@ __global__ void combine_and_scatter_kernel(
     if (threadIdx.x == 0) {
       FlagType target =
           cd_base + kPersistentGrid;
-      while (dc_ld_flag_acquire(
-                 config->combine_done_counter)
-              < target)
+      uint64_t cd_spin = 0;
+      FlagType cd_cur = 0;
+      while ((cd_cur = dc_ld_flag_acquire(
+                 config->combine_done_counter))
+              < target) {
         __nanosleep(200);
+        ++cd_spin;
+        if (cd_spin == 5'000'000ull) {
+          printf("[DC CAS combine_done stuck] rank=%d "
+                 "cd_base=%u target=%u observed=%u\n",
+                 rank,
+                 static_cast<uint32_t>(cd_base),
+                 static_cast<uint32_t>(target),
+                 static_cast<uint32_t>(cd_cur));
+        }
+      }
     }
     __syncthreads();
 
@@ -1540,10 +1552,24 @@ __global__ void combine_and_scatter_kernel(
       dc_st_flag_release(
           &config->peer_signals[tid]->flags[rank],
           barrier_expected);
-      while (dc_ld_flag_acquire(
-          &config->self_signals->flags[tid])
-              != barrier_expected)
+      uint64_t cas_p2p_spin = 0;
+      FlagType cas_p2p_cur = 0;
+      while ((cas_p2p_cur = dc_ld_flag_acquire(
+          &config->self_signals->flags[tid]))
+              != barrier_expected) {
         __nanosleep(100);
+        ++cas_p2p_spin;
+        if (cas_p2p_spin == 10'000'000ull) {
+          printf("[DC CAS p2p_barrier stuck] rank=%d "
+                 "tid=%d expected=%u observed=%u "
+                 "counter=%u\n",
+                 rank, tid,
+                 static_cast<uint32_t>(barrier_expected),
+                 static_cast<uint32_t>(cas_p2p_cur),
+                 static_cast<uint32_t>(
+                     config->self_signals->counter));
+        }
+      }
     }
 
     __syncthreads();
@@ -1563,10 +1589,21 @@ __global__ void combine_and_scatter_kernel(
       __threadfence();
     }
     if (threadIdx.x == 0) {
-      while (dc_ld_flag_acquire(
-          &config->self_signals->counter)
-              != barrier_expected)
+      uint64_t cas_blk_spin = 0;
+      FlagType cas_blk_cur = 0;
+      while ((cas_blk_cur = dc_ld_flag_acquire(
+          &config->self_signals->counter))
+              != barrier_expected) {
         __nanosleep(200);
+        ++cas_blk_spin;
+        if (cas_blk_spin == 5'000'000ull && blockIdx.x == 1) {
+          printf("[DC CAS blk_wait stuck] rank=%d "
+                 "expected=%u observed=%u\n",
+                 rank,
+                 static_cast<uint32_t>(barrier_expected),
+                 static_cast<uint32_t>(cas_blk_cur));
+        }
+      }
     }
     __syncthreads();
   }
@@ -1623,10 +1660,22 @@ __global__ void combine_and_scatter_kernel(
   }
   if (threadIdx.x == 0) {
     FlagType target = sd_base + gridDim.x;
-    while (dc_ld_flag_acquire(
-               config->scatter_done_counter)
-            < target)
+    uint64_t sd_spin = 0;
+    FlagType sd_cur = 0;
+    while ((sd_cur = dc_ld_flag_acquire(
+               config->scatter_done_counter))
+            < target) {
       __nanosleep(200);
+      ++sd_spin;
+      if (sd_spin == 5'000'000ull && blockIdx.x == 0) {
+        printf("[DC CAS scatter_done stuck] rank=%d "
+               "sd_base=%u target=%u observed=%u\n",
+               rank,
+               static_cast<uint32_t>(sd_base),
+               static_cast<uint32_t>(target),
+               static_cast<uint32_t>(sd_cur));
+      }
+    }
   }
   __syncthreads();
 
@@ -2072,10 +2121,22 @@ __global__ void dispatch_and_route_kernel(
     // Wait for all blocks to finish scan+write.
     if (threadIdx.x == 0) {
       FlagType target = pa_base + gridDim.x;
-      while (dc_ld_flag_acquire(
-                 config->phase_a_done_counter)
-              < target)
+      uint64_t pa_spin = 0;
+      FlagType pa_cur = 0;
+      while ((pa_cur = dc_ld_flag_acquire(
+                 config->phase_a_done_counter))
+              < target) {
         __nanosleep(200);
+        ++pa_spin;
+        if (pa_spin == 5'000'000ull) {
+          printf("[DC DAR phase_a stuck] rank=%d "
+                 "pa_base=%u target=%u observed=%u\n",
+                 rank,
+                 static_cast<uint32_t>(pa_base),
+                 static_cast<uint32_t>(target),
+                 static_cast<uint32_t>(pa_cur));
+        }
+      }
     }
     __syncthreads();
 
@@ -2180,10 +2241,21 @@ __global__ void dispatch_and_route_kernel(
     __threadfence_system();
 
     if (threadIdx.x == 0) {
-      while (dc_ld_flag_acquire(
-          &config->self_signals->counter)
-              != barrier_expected)
+      uint64_t blk_spin = 0;
+      FlagType blk_cur = 0;
+      while ((blk_cur = dc_ld_flag_acquire(
+          &config->self_signals->counter))
+              != barrier_expected) {
         __nanosleep(200);
+        ++blk_spin;
+        if (blk_spin == 5'000'000ull && blockIdx.x == 1) {
+          printf("[DC DAR blk_wait stuck] rank=%d "
+                 "expected=%u observed=%u\n",
+                 rank,
+                 static_cast<uint32_t>(barrier_expected),
+                 static_cast<uint32_t>(blk_cur));
+        }
+      }
     }
     __syncthreads();
   }
