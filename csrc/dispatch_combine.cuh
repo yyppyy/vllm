@@ -2132,14 +2132,38 @@ __global__ void dispatch_and_route_kernel(
     DC_TIMESTAMP(config, 10);  // dar:fence2
 
     // P2P barrier exchange.
+    // __nanosleep in the spin avoids saturating NVLink
+    // with polling reads (108 SMs × 2 threads at GHz),
+    // which can crowd out the peer's flag store.
+    // Kept intentionally short so low-latency decode
+    // paths aren't penalized.
     if (tid < ws) {
       dc_st_flag_release(
           &config->peer_signals[tid]->flags[rank],
           barrier_expected);
-      while (dc_ld_flag_acquire(
-          &config->self_signals->flags[tid])
-              != barrier_expected)
-        ;
+      uint64_t dar_spin = 0;
+      FlagType last_observed = 0;
+      while ((last_observed = dc_ld_flag_acquire(
+          &config->self_signals->flags[tid]))
+              != barrier_expected) {
+        __nanosleep(100);
+        ++dar_spin;
+        // One-shot printf after ~1s of spinning to
+        // diagnose potential deadlocks. Emits each
+        // spinning thread's rank/tid and the observed
+        // vs expected flag value so we can tell if
+        // barrier_expected values drifted across ranks.
+        if (dar_spin == 10'000'000ull) {
+          printf("[DC DAR barrier stuck] rank=%d tid=%d "
+                 "layer_cnt_self=%u expected=%u "
+                 "observed_flag=%u\n",
+                 rank, tid,
+                 static_cast<uint32_t>(
+                     config->self_signals->counter),
+                 static_cast<uint32_t>(barrier_expected),
+                 static_cast<uint32_t>(last_observed));
+        }
+      }
     }
 
     __syncthreads();
