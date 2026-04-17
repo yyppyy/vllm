@@ -31,6 +31,14 @@ _DC_PROFILE_INTERVAL = int(
 _EXPERT_PROFILE_M_THRESHOLD = int(
     os.environ.get('VLLM_DC_EXPERT_PROFILE_M', '256'))
 
+# Batched expert_x sizing. Each expert row has
+# max_m_per_expert = ceil(max_recv / experts_per_rank) *
+# safety_factor slots. Default safety_factor=2 gives ~2x
+# the memory of the old flat compact buffer while still
+# handling moderately skewed routing.
+_DC_EXPERT_SAFETY_FACTOR = int(
+    os.environ.get('VLLM_DC_EXPERT_SAFETY_FACTOR', '2'))
+
 # Must match kDarNumSteps, kCasNumSteps, kTotalProfileSlots
 # in dispatch_combine.cuh.
 _DAR_NUM_STEPS = 19
@@ -223,6 +231,14 @@ class DispatchCombineP2PManager:
             self._cuda_rt.cudaMalloc(4))
         self._cuda_rt.cudaMemset(
             self._raw_scatter_done_counter, 0, 4)
+
+        # Sticky overflow flag for dar_compact. Set when a
+        # token would be written past max_m_per_expert.
+        # Checked by host after each forward.
+        self._raw_overflow_flag = (
+            self._cuda_rt.cudaMalloc(4))
+        self._cuda_rt.cudaMemset(
+            self._raw_overflow_flag, 0, 4)
 
         # P2P barrier signal buffer.
         # Layout: alignas(128) flags[64] (256 bytes)
@@ -597,6 +613,26 @@ class DispatchCombineP2PManager:
                else 0)
         data += struct.pack('Q', ptr)
 
+        # ---- Batched expert layout ----
+        # max_m_per_expert / num_local_experts (int32 each).
+        # Lazily set: init_prepare_buffers() calls
+        # _build_config_tensor again once these are known.
+        max_m = getattr(self, 'max_m_per_expert', 0)
+        n_local = getattr(self, 'num_local_experts', 0)
+        data += struct.pack('i', int(max_m))
+        data += struct.pack('i', int(n_local))
+        # expert_write_counters ptr (may be unset pre-init)
+        ewc = getattr(self, 'expert_write_counters_buf',
+                      None)
+        ewc_ptr = (ewc.data_ptr() if ewc is not None
+                   else 0)
+        data += struct.pack('Q', ewc_ptr)
+        # overflow_flag ptr
+        of_ptr = (self._raw_overflow_flag.value
+                  if self._raw_overflow_flag is not None
+                  else 0)
+        data += struct.pack('Q', of_ptr)
+
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
             bytearray(config_bytes), dtype=torch.uint8
@@ -604,20 +640,30 @@ class DispatchCombineP2PManager:
         return config_tensor
 
     def update_experts_per_rank(self, experts_per_rank: int):
-        """Update experts_per_rank in the config tensor."""
-        import struct
+        """Set experts_per_rank and (re)size the batched
+        expert buffer layout. Rebuilds the config tensor
+        so the new max_m_per_expert / num_local_experts /
+        expert_write_counters pointers are visible to the
+        CUDA kernels."""
+        import math
         self._experts_per_rank = experts_per_rank
-        max_ranks = 64
-        # 6 ptr arrays + self_signals(1) + peer_signals(64)
-        # + rank(4) + world_size(4) = offset to experts_per_rank
-        offset = (6 * max_ranks * 8
-                  + 8 + max_ranks * 8
-                  + 2 * 4)
-        packed = struct.pack('i', experts_per_rank)
-        cpu_config = self.config_tensor.cpu()
-        for i, b in enumerate(packed):
-            cpu_config[offset + i] = b
-        self.config_tensor.copy_(cpu_config)
+        epr = max(experts_per_rank, 1)
+        avg_per_expert = math.ceil(self.max_recv / epr)
+        self.max_m_per_expert = (
+            avg_per_expert * _DC_EXPERT_SAFETY_FACTOR)
+        self.num_local_experts = epr
+
+        # Allocate (or re-allocate) the per-expert atomic
+        # write cursor. Lives for the lifetime of the
+        # manager; zeroed by dar_compact launcher each call.
+        dev = f'cuda:{self._device}'
+        self.expert_write_counters_buf = torch.zeros(
+            epr, dtype=torch.int32, device=dev)
+
+        # Rebuild so the config struct carries the new
+        # batched-layout fields. Must happen before
+        # select_gemm_impl is called on the P&F.
+        self.config_tensor = self._build_config_tensor()
 
     # ================================================================
     # GPU-side ops (CUDA-graph compatible)
@@ -660,77 +706,100 @@ class DispatchCombineP2PManager:
     def gpu_dar_compact(
             self, mc_compact: int,
             num_experts: int):
-        """Compact valid entries from scattered sections
-        into contiguous positions. Also performs fused
-        vectorized gather of token data from
-        dispatch_recv into expert_x_buf."""
+        """Bucket valid pairs into batched expert_x layout
+        [num_local_experts, max_m_per_expert, hidden_dim]
+        and record compact_reverse[original_idx] = flat
+        batched index for the combine kernel.
+
+        `mc_compact` and `num_experts` are preserved in the
+        signature for call-site compatibility with the old
+        compaction op but are no longer consumed — the
+        kernel derives bounds from the config struct.
+        """
         torch.ops._C_dispatch_combine\
             .dar_compact(
                 self.expert_topk_ids_buf,
-                self.expert_topk_weights_buf,
                 self.data_remap_buf,
-                self.compact_expert_topk_ids_buf,
-                self.compact_expert_topk_weights_buf,
-                self.compact_data_remap_buf,
                 self.compact_reverse_buf,
                 self.dispatch_recv_tensor,
                 self.expert_x_buf,
+                self.expert_write_counters_buf,
                 self.config_tensor,
-                mc_compact, num_experts,
                 self.hidden_dim)
 
+    def check_overflow(self) -> bool:
+        """Host-side read of the dar_compact overflow flag.
+
+        Returns True if any token was dropped because an
+        expert's count exceeded max_m_per_expert since the
+        last check. Safe to call outside CUDA-graph capture;
+        do not call during capture (implicit D2H sync).
+        Callers should bump VLLM_DC_EXPERT_SAFETY_FACTOR
+        and restart if this returns True.
+        """
+        import ctypes
+        flag = ctypes.c_int32(0)
+        self._cuda_rt.cudaMemcpy(
+            ctypes.cast(ctypes.byref(flag),
+                        ctypes.c_void_p),
+            self._raw_overflow_flag,
+            4)
+        if flag.value:
+            # Clear after reading so repeated polls only
+            # surface new overflows. Non-stream memset is
+            # fine here because we're outside graph capture.
+            self._cuda_rt.cudaMemset(
+                self._raw_overflow_flag, 0, 4)
+            return True
+        return False
+
     def init_prepare_buffers(self, num_experts: int):
-        """Allocate expert_num_tokens buffer once
+        """Allocate per-num_experts buffers once
         num_experts is known (set by PrepareAndFinalize
-        constructor via update_experts_per_rank)."""
+        constructor via update_experts_per_rank).
+
+        Batched layout: expert_x_buf is sized as
+        [num_local_experts * max_m_per_expert, hidden_dim]
+        where max_m_per_expert is derived from max_recv /
+        experts_per_rank with a safety factor. Batched
+        operand is the flat view reshaped to
+        [num_local_experts, max_m_per_expert, hidden_dim].
+        """
         if (self.expert_num_tokens_buf is not None
                 and self._num_experts == num_experts):
             return
         self._num_experts = num_experts
+        dev = f'cuda:{self._device}'
         self.expert_num_tokens_buf = torch.zeros(
             num_experts, dtype=torch.int32,
-            device=f'cuda:{self._device}')
+            device=dev)
         # data_remap: maps dispatch_recv entries to
         # group leaders for co-located expert dedup.
         # Identity by default (each entry maps to self).
         self.data_remap_buf = torch.arange(
             self.max_recv, dtype=torch.int32,
-            device=f'cuda:{self._device}')
-        # Compact buffers for section compaction.
-        # After dispatch receive, valid entries are
-        # scattered across per-sender sections.
-        # Compaction gathers them into contiguous
-        # positions so downstream element-wise kernels
-        # operate on mc_compact instead of max_recv.
-        dev = f'cuda:{self._device}'
-        self.compact_expert_topk_ids_buf = (
-            torch.full((self.max_recv,),
-                       num_experts,
-                       dtype=torch.int64,
-                       device=dev))
-        self.compact_expert_topk_weights_buf = (
-            torch.zeros(self.max_recv,
-                        dtype=torch.float32,
-                        device=dev))
-        self.compact_data_remap_buf = (
+            device=dev)
+        # compact_reverse[original_idx] holds the flat
+        # batched slot (e_local * max_m + pos) that the
+        # combine kernel reads from. Initialized to 0 as
+        # harmless default; dar_compact_kernel overwrites
+        # for each valid pair.
+        self.compact_reverse_buf = (
             torch.zeros(self.max_recv,
                         dtype=torch.int32,
                         device=dev))
-        # Identity default: compact_reverse[i] = i.
-        # dar_compact_kernel overwrites with actual
-        # compact mapping when compaction runs.
-        self.compact_reverse_buf = (
-            torch.arange(self.max_recv,
-                         dtype=torch.int32,
-                         device=dev))
-        # Pre-allocated gather result buffer.
-        # Avoids per-call allocation from fancy indexing
-        # in _receiver(). Size: max_recv * hidden_dim
-        # (worst case mc entries).
+
+        # max_m_per_expert / num_local_experts /
+        # expert_write_counters_buf are set by
+        # update_experts_per_rank (called from the
+        # PrepareAndFinalize constructor). Flat storage
+        # is viewed as [E_local, max_m_per_expert, K].
+        epr = self.num_local_experts
+        max_m = self.max_m_per_expert
         self.expert_x_buf = torch.empty(
-            self.max_recv, self.hidden_dim,
-            dtype=self.dtype,
-            device=dev)
+            epr * max_m, self.hidden_dim,
+            dtype=self.dtype, device=dev)
+
         # Pre-allocated int64 remap buffer for
         # index_select (requires int64 indices).
         # Avoids .long() allocation during CUDA
@@ -757,6 +826,11 @@ class DispatchCombineP2PManager:
         self.accum_buf = torch.empty(
             self.max_num_tokens, self.hidden_dim,
             dtype=torch.float32, device=dev)
+
+        # Rebuild config with max_m_per_expert,
+        # num_local_experts, expert_write_counters,
+        # overflow_flag fields populated.
+        self.config_tensor = self._build_config_tensor()
 
     # ================================================================
     # Integrated routing (EPLB) support
@@ -1117,6 +1191,8 @@ class DispatchCombineP2PManager:
             self._raw_combine_done_counter)
         self._cuda_rt.cudaFree(
             self._raw_scatter_done_counter)
+        self._cuda_rt.cudaFree(
+            self._raw_overflow_flag)
         self._cuda_rt.cudaFree(self._raw_signals)
         if self._raw_expert_counts is not None:
             self._cuda_rt.cudaFree(

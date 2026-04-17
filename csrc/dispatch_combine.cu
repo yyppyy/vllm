@@ -517,31 +517,30 @@ void dispatch_and_route(
 
 void dar_compact(
     torch::Tensor expert_topk_ids,
-    torch::Tensor expert_topk_weights,
     torch::Tensor data_remap,
-    torch::Tensor compact_expert_topk_ids,
-    torch::Tensor compact_expert_topk_weights,
-    torch::Tensor compact_data_remap,
     torch::Tensor compact_reverse,
     torch::Tensor dispatch_recv,
     torch::Tensor expert_x,
+    torch::Tensor expert_write_counters,
     torch::Tensor config_tensor,
-    int64_t mc_compact,
-    int64_t num_physical_experts,
     int64_t K) {
-
-  if (mc_compact == 0) return;
 
   const auto stream = at::cuda::getCurrentCUDAStream();
   const DispatchCombineConfig* config =
       reinterpret_cast<const DispatchCombineConfig*>(
           config_tensor.data_ptr());
 
-  const int32_t mc32 =
-      static_cast<int32_t>(mc_compact);
-  const int32_t ne32 =
-      static_cast<int32_t>(num_physical_experts);
   const int32_t K32 = static_cast<int32_t>(K);
+
+  // Zero the per-expert write counters on the stream
+  // (CUDA-graph safe) before launching. expert_x slots
+  // beyond expert_num_tokens[e] are left untouched; the
+  // batched MoE kernel skips them via expert_num_tokens.
+  AT_CUDA_CHECK(cudaMemsetAsync(
+      expert_write_counters.data_ptr<int32_t>(),
+      0,
+      expert_write_counters.numel() * sizeof(int32_t),
+      stream));
 
   dim3 grid(kPersistentGrid);
   dim3 block(kBlockSize);
@@ -553,34 +552,26 @@ void dar_compact(
           dar_compact_kernel<__nv_bfloat16>
               <<<grid, block, 0, stream>>>(
               expert_topk_ids.data_ptr<int64_t>(),
-              expert_topk_weights.data_ptr<float>(),
               data_remap.data_ptr<int32_t>(),
-              compact_expert_topk_ids.data_ptr<int64_t>(),
-              compact_expert_topk_weights.data_ptr<float>(),
-              compact_data_remap.data_ptr<int32_t>(),
               compact_reverse.data_ptr<int32_t>(),
               reinterpret_cast<const __nv_bfloat16*>(
                   dispatch_recv.data_ptr()),
               reinterpret_cast<__nv_bfloat16*>(
                   expert_x.data_ptr()),
-              config, mc32, ne32, K32);
+              config, K32);
         })
       AT_DISPATCH_CASE(at::ScalarType::Half,
         [&] {
           dar_compact_kernel<__half>
               <<<grid, block, 0, stream>>>(
               expert_topk_ids.data_ptr<int64_t>(),
-              expert_topk_weights.data_ptr<float>(),
               data_remap.data_ptr<int32_t>(),
-              compact_expert_topk_ids.data_ptr<int64_t>(),
-              compact_expert_topk_weights.data_ptr<float>(),
-              compact_data_remap.data_ptr<int32_t>(),
               compact_reverse.data_ptr<int32_t>(),
               reinterpret_cast<const __half*>(
                   dispatch_recv.data_ptr()),
               reinterpret_cast<__half*>(
                   expert_x.data_ptr()),
-              config, mc32, ne32, K32);
+              config, K32);
         })
   );
 }

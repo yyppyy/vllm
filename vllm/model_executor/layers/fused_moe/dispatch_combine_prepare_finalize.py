@@ -285,10 +285,14 @@ class DispatchCombinePrepareAndFinalize(
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
-        return mk.FusedMoEActivationFormat.Standard
+        return mk.FusedMoEActivationFormat.BatchedExperts
 
     def max_num_tokens_per_rank(self) -> Optional[int]:
-        return None
+        # Sized by the buffer manager in
+        # update_experts_per_rank(). Returned here so
+        # select_gemm_impl can construct BatchedTriton
+        # with max_num_tokens = max_m_per_expert.
+        return self.p2p_manager.max_m_per_expert
 
     @property
     def skip_expert_chunking(self) -> bool:
@@ -302,7 +306,13 @@ class DispatchCombinePrepareAndFinalize(
         return torch.int64
 
     def num_dispatchers(self) -> int:
-        return self.world_size_
+        # DC's expert_x_buf already holds the final batched
+        # layout for this rank (rows packed per local
+        # expert). BatchedTritonExperts sizes its workspace
+        # as max_num_tokens * num_dispatchers, so pass 1
+        # here to avoid double-counting: max_num_tokens is
+        # already max_m_per_expert.
+        return 1
 
     def supports_async(self) -> bool:
         return True
@@ -493,18 +503,14 @@ class DispatchCombinePrepareAndFinalize(
                             replicas, replica_ranks,
                             sels, sel_ranks)
 
-        # Compact after fused kernel.
+        # Bucket after fused kernel. dar_compact writes
+        # tokens into the batched expert_x layout
+        # [num_local_experts, max_m_per_expert, hidden_dim]
+        # and records compact_reverse[pair_idx] =
+        # e_local*max_m+pos for the combine kernel.
         mgr.gpu_dar_compact(
             mc, num_experts)
         self.record_expert_event('compact_done')
-        expert_topk_ids = (
-            mgr.compact_expert_topk_ids_buf[
-                :mc]
-            .unsqueeze(1))
-        expert_topk_weights = (
-            mgr.compact_expert_topk_weights_buf[
-                :mc]
-            .unsqueeze(1))
         # Record per-physical-expert load for EPLB
         # rebalancing. expert_num_tokens already has
         # physical expert counts from the fused kernel.
@@ -517,10 +523,11 @@ class DispatchCombinePrepareAndFinalize(
         # reads these after expert compute).
         self._expert_M = M
         self._expert_local_tokens = mc
-        self._expert_num_tokens = expert_num_tokens[
+        local_expert_num_tokens = expert_num_tokens[
             self.rank_expert_offset:
             self.rank_expert_offset
             + self.num_local_experts]
+        self._expert_num_tokens = local_expert_num_tokens
         # Router unique expert count (before dispatch).
         if (mgr._profiling_enabled
                 and mgr._profiling_after_rebalance):
@@ -572,9 +579,8 @@ class DispatchCombinePrepareAndFinalize(
 
         return lambda: self._receiver(
             a1, K, num_experts, quant_config,
-            expert_map, expert_topk_ids,
-            expert_topk_weights, expert_num_tokens,
-            mc)
+            expert_map, expert_num_tokens,
+            local_expert_num_tokens)
 
     def _receiver(
         self,
@@ -583,51 +589,28 @@ class DispatchCombinePrepareAndFinalize(
         num_experts: int,
         quant_config: FusedMoEQuantConfig,
         expert_map: Optional[torch.Tensor],
-        expert_topk_ids: torch.Tensor,
-        expert_topk_weights: torch.Tensor,
         expert_num_tokens: torch.Tensor,
-        mc: int,
+        local_expert_num_tokens: torch.Tensor,
     ) -> mk.PrepareResultType:
         mgr = self.p2p_manager
         self.record_expert_event('recv_start')
 
-        # Token data gather is now fused into
-        # dar_compact_kernel (vectorized int4 copy).
-        # No separate index_select needed.
-        expert_x = mgr.expert_x_buf[:mc]
+        # Batched layout: view the flat expert_x storage
+        # as [E_local, max_m_per_expert, K] so the
+        # BatchedTritonExperts kernel treats it as
+        # expert-row-major. Tokens were placed into their
+        # expert's row by dar_compact_kernel.
+        E_local = mgr.num_local_experts
+        max_m = mgr.max_m_per_expert
+        expert_x = mgr.expert_x_buf.view(
+            E_local, max_m, mgr.hidden_dim)
         self.record_expert_event('gather_done')
 
-        # Post-dispatch quantization.
-        # Always call quantize (no numel guard) for
-        # CUDA graph compatibility.
+        # Quantization note: bf16/fp16 path passes through
+        # unquantized (expert_x_scale=None). Adapting the
+        # block-quant path to batched [E, M, K] input is
+        # deferred; use bf16 for now.
         expert_x_scale = None
-        if not quant_config.is_block_quantized:
-            expert_x, expert_x_scale = (
-                moe_kernel_quantize_input(
-                    expert_x,
-                    quant_config.a1_scale,
-                    quant_dtype=(
-                        quant_config.quant_dtype),
-                    per_act_token_quant=False,
-                    block_shape=(
-                        quant_config.block_shape)))
-        else:
-            expert_x, expert_x_scale = (
-                moe_kernel_quantize_input(
-                    expert_x,
-                    quant_config.a1_scale,
-                    quant_dtype=(
-                        quant_config.quant_dtype),
-                    per_act_token_quant=(
-                        quant_config.per_act_token_quant),
-                    block_shape=(
-                        quant_config.block_shape)))
-
-        # Slice to local experts only.
-        local_expert_num_tokens = expert_num_tokens[
-            self.rank_expert_offset:
-            self.rank_expert_offset
-            + self.num_local_experts]
 
         # MoE load profiling (dispatch_combine path).
         if _MOE_LOAD_PROFILE_INTERVAL > 0:
@@ -642,19 +625,23 @@ class DispatchCombinePrepareAndFinalize(
                 num_local_experts=self.num_local_experts,
             )
 
-        # expert_num_tokens_cpu=None for CUDA graph
-        # compat (no D2H during graph capture).
+        # BatchedTritonExperts reads only expert_num_tokens
+        # from the metadata; topk_ids_for_masking is unused
+        # in the batched path.
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=local_expert_num_tokens,
             expert_num_tokens_cpu=None,
             num_tokens_for_config=a1_orig.shape[0],
-            topk_ids_for_masking=(
-                expert_topk_ids.view(-1)))
+            topk_ids_for_masking=None)
 
+        # Return None for topk_ids/topk_weights so the
+        # modular kernel falls back to the original router
+        # tensors (PPLX pattern). BatchedTritonExperts
+        # routes by row (hidden_states[e, m]) rather than
+        # by topk_ids lookup.
         return (expert_x, expert_x_scale,
                 expert_tokens_meta,
-                expert_topk_ids,
-                expert_topk_weights)
+                None, None)
 
     def prepare(
         self,

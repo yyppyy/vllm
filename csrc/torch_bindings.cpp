@@ -54,17 +54,12 @@ void dispatch_and_route(torch::Tensor input,
                         int64_t max_replicas,
                         int64_t routing_mode);
 void dar_compact(torch::Tensor expert_topk_ids,
-                 torch::Tensor expert_topk_weights,
                  torch::Tensor data_remap,
-                 torch::Tensor compact_expert_topk_ids,
-                 torch::Tensor compact_expert_topk_weights,
-                 torch::Tensor compact_data_remap,
                  torch::Tensor compact_reverse,
                  torch::Tensor dispatch_recv,
                  torch::Tensor expert_x,
+                 torch::Tensor expert_write_counters,
                  torch::Tensor config_tensor,
-                 int64_t mc_compact,
-                 int64_t num_physical_experts,
                  int64_t K);
 }  // namespace dispatch_combine
 }  // namespace vllm
@@ -945,22 +940,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
           &vllm::dispatch_combine::
               dispatch_and_route);
 
-  // Section compaction: gather valid entries into
-  // contiguous buffer, build reverse mapping for combine.
+  // Bucket valid entries into batched [E_local, max_m, K]
+  // layout. compact_reverse[original_idx] = e_local*max_m+pos
+  // so the combine kernel can read post-compute output.
   dc.def(
       "dar_compact("
       "Tensor expert_topk_ids, "
-      "Tensor expert_topk_weights, "
       "Tensor data_remap, "
-      "Tensor! compact_expert_topk_ids, "
-      "Tensor! compact_expert_topk_weights, "
-      "Tensor! compact_data_remap, "
       "Tensor! compact_reverse, "
       "Tensor dispatch_recv, "
       "Tensor! expert_x, "
+      "Tensor! expert_write_counters, "
       "Tensor config_tensor, "
-      "int mc_compact, "
-      "int num_physical_experts, "
       "int K) -> ()");
   dc.impl("dar_compact", torch::kCUDA,
           &vllm::dispatch_combine::dar_compact);

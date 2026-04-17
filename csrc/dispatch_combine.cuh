@@ -181,6 +181,18 @@ struct DispatchCombineConfig {
   //     combine_and_scatter_kernel
   // Host reads back and accumulates averages.
   int64_t* profiling_timestamps;  // null = disabled
+
+  // ---- Batched expert layout (BatchedTritonExperts) ----
+  // expert_x is laid out as [num_local_experts, max_m_per_expert, K].
+  // dar_compact writes each valid token to an atomically-claimed
+  // slot within its expert's row; combine reads via the flat index
+  // e_local * max_m_per_expert + pos stored in compact_reverse.
+  // expert_write_counters is zeroed by the host launcher on the
+  // stream (CUDA-graph safe) before each dar_compact invocation.
+  int32_t max_m_per_expert;
+  int32_t num_local_experts;
+  int32_t* expert_write_counters;  // [num_local_experts]
+  int32_t* overflow_flag;          // [1] sticky, set on overflow
 };
 
 // Number of timestamp slots per kernel.
@@ -1638,37 +1650,31 @@ __global__ void combine_and_scatter_kernel(
 }
 
 // ====================================================================
-// ---- Section compaction ----
-// Gathers valid entries from scattered per-sender sections
-// into contiguous positions. Builds compact_data_remap
-// (compact_idx → compact data position for gather),
-// compact_expert_topk_ids, compact_expert_topk_weights,
-// and compact_reverse (original_idx → compact_idx for
-// combine kernel to read expert output).
+// ---- Batched bucketing (dar_compact) ----
+// For each valid pair in per-sender sections, atomically claim a slot
+// in its local expert's row of the batched expert_x buffer
+// (shape [num_local_experts, max_m_per_expert, K]), and record the
+// flat batched index in compact_reverse[original_idx] so that the
+// combine kernel can read the post-compute output at the same slot.
+// Host zeroes config->expert_write_counters before launch.
 // Grid = kPersistentGrid, block = kBlockSize.
 template <typename T>
 __global__ void dar_compact_kernel(
     const int64_t* __restrict__ expert_topk_ids,
-    const float* __restrict__ expert_topk_weights,
     const int32_t* __restrict__ data_remap,
-    int64_t* __restrict__ compact_expert_topk_ids,
-    float* __restrict__ compact_expert_topk_weights,
-    int32_t* __restrict__ compact_data_remap,
     int32_t* __restrict__ compact_reverse,
     const T* __restrict__ dispatch_recv,
     T* __restrict__ expert_x,
     const DispatchCombineConfig* __restrict__ config,
-    int32_t mc_compact,
-    int32_t num_physical_experts,
     int32_t K) {
   const int32_t rank = config->rank;
   const int32_t ws = config->world_size;
   const int32_t ss = config->dispatch_section_size;
-  const int64_t sentinel =
-      static_cast<int64_t>(num_physical_experts);
+  const int32_t E_local = config->num_local_experts;
+  const int32_t max_m = config->max_m_per_expert;
+  const int32_t rank_expert_offset = rank * E_local;
 
-  // Compute per-section prefix sums (thread 0 only).
-  __shared__ int32_t s_compact_offset[kMaxRanks];
+  // Compute per-section counts (thread 0 only).
   __shared__ int32_t s_section_count[kMaxRanks];
   __shared__ int32_t s_num_valid;
 
@@ -1679,7 +1685,6 @@ __global__ void dar_compact_kernel(
           remote_dispatch_offsets[rank][s];
       if (count > ss) count = ss;
       s_section_count[s] = count;
-      s_compact_offset[s] = running;
       running += count;
     }
     s_num_valid = running;
@@ -1688,22 +1693,21 @@ __global__ void dar_compact_kernel(
 
   const int32_t num_valid = s_num_valid;
 
-  // Build compact mappings for valid entries.
-  // Each block cooperatively handles one entry at a time:
-  // thread 0 writes metadata, all threads copy token data
-  // via int4 vectorized loads/stores.
+  // Each block handles one entry per iteration: thread 0
+  // resolves the token's local expert + atomically claims
+  // a write slot; all threads then cooperatively copy the
+  // token data via int4 vectorized loads/stores.
   constexpr int32_t kElemsPerI4 =
       static_cast<int32_t>(sizeof(int4) / sizeof(T));
   const int32_t K4 = K / kElemsPerI4;
 
-  // Block-strided loop over flattened valid entries.
-  // Use num_valid (sum of all section counts) as total.
+  __shared__ int32_t s_batched_idx;
+  __shared__ int32_t s_data_pos;
+
   for (int32_t flat_idx = blockIdx.x;
        flat_idx < num_valid;
        flat_idx += gridDim.x) {
-    // Map flat_idx to (section, offset_in_section)
-    // using prefix sums. Linear scan over sections
-    // (ws <= kMaxRanks=64, cheap in registers).
+    // Map flat_idx → (section s, offset remaining).
     int32_t s = 0;
     int32_t remaining = flat_idx;
     while (s < ws - 1
@@ -1712,45 +1716,59 @@ __global__ void dar_compact_kernel(
       s++;
     }
     const int32_t original_idx = s * ss + remaining;
-    const int32_t compact_idx =
-        s_compact_offset[s] + remaining;
 
-    // Thread 0 writes metadata.
     if (threadIdx.x == 0) {
-      compact_data_remap[compact_idx] =
-          data_remap[original_idx];
-      compact_expert_topk_ids[compact_idx] =
-          expert_topk_ids[original_idx];
-      compact_expert_topk_weights[compact_idx] =
-          expert_topk_weights[original_idx];
-      compact_reverse[original_idx] = compact_idx;
+      const int32_t e_global =
+          static_cast<int32_t>(
+              expert_topk_ids[original_idx]);
+      const int32_t e_local =
+          e_global - rank_expert_offset;
+      int32_t batched_idx = -1;
+      // Filtered entries carry the sentinel expert id
+      // (num_physical_experts) from Phase D2; their
+      // dispatch_meta weight is 0 so combine ignores
+      // them via its weight==0 fast-skip. Just skip
+      // here without touching the write counters.
+      if (e_local >= 0 && e_local < E_local) {
+        int32_t pos = atomicAdd(
+            &config->expert_write_counters[e_local],
+            1);
+        if (pos < max_m) {
+          batched_idx = e_local * max_m + pos;
+        } else {
+          // True overflow: per-expert count exceeded
+          // max_m_per_expert. Surface to host via
+          // sticky flag so the user can bump the
+          // safety factor.
+          atomicExch(config->overflow_flag, 1);
+        }
+      }
+      s_batched_idx = batched_idx;
+      s_data_pos = data_remap[original_idx];
+      compact_reverse[original_idx] =
+          (batched_idx >= 0) ? batched_idx : 0;
     }
+    __syncthreads();
 
-    // All threads cooperatively copy token data.
-    const int32_t data_pos =
-        data_remap[original_idx];
+    const int32_t batched_idx = s_batched_idx;
+    if (batched_idx < 0) {
+      __syncthreads();
+      continue;
+    }
+    const int32_t data_pos = s_data_pos;
+
     const int4* src =
         reinterpret_cast<const int4*>(
             dispatch_recv
             + static_cast<int64_t>(data_pos) * K);
     int4* dst = reinterpret_cast<int4*>(
         expert_x
-        + static_cast<int64_t>(compact_idx) * K);
+        + static_cast<int64_t>(batched_idx) * K);
     for (int32_t k = threadIdx.x; k < K4;
          k += blockDim.x) {
       dst[k] = src[k];
     }
     __syncthreads();
-  }
-
-  // Pad entries [num_valid, mc_compact) with sentinel.
-  for (int32_t i = num_valid
-           + blockIdx.x * blockDim.x + threadIdx.x;
-       i < mc_compact;
-       i += gridDim.x * blockDim.x) {
-    compact_expert_topk_ids[i] = sentinel;
-    compact_expert_topk_weights[i] = 0.0f;
-    compact_data_remap[i] = 0;  // harmless index
   }
 }
 

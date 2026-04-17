@@ -608,8 +608,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if (prepare_finalize.activation_format ==
                 FusedMoEActivationFormat.BatchedExperts):
             logger.debug("BatchedTritonExperts %s", self.moe)
+            # Prefer the P&F's own sizing when it overrides
+            # max_num_tokens_per_rank (e.g. dispatch_combine
+            # sizes per-expert slots from max_recv/E_local).
+            pf_max = prepare_finalize.max_num_tokens_per_rank()
+            max_num_tokens = (
+                pf_max if pf_max is not None
+                else self.moe.max_num_tokens)
             return BatchedTritonExperts(
-                max_num_tokens=self.moe.max_num_tokens,
+                max_num_tokens=max_num_tokens,
                 num_dispatchers=prepare_finalize.num_dispatchers(),
                 quant_config=self.moe_quant_config,
             )

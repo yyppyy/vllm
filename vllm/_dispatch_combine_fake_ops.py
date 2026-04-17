@@ -185,17 +185,12 @@ def _p2p_barrier_reset_dispatch_fake(
 @register_fake("_C_dispatch_combine::dar_compact")
 def _dar_compact_fake(
     expert_topk_ids: torch.Tensor,
-    expert_topk_weights: torch.Tensor,
     data_remap: torch.Tensor,
-    compact_expert_topk_ids: torch.Tensor,
-    compact_expert_topk_weights: torch.Tensor,
-    compact_data_remap: torch.Tensor,
     compact_reverse: torch.Tensor,
     dispatch_recv: torch.Tensor,
     expert_x: torch.Tensor,
+    expert_write_counters: torch.Tensor,
     config_tensor: torch.Tensor,
-    mc_compact: int,
-    num_physical_experts: int,
     K: int,
 ) -> None:
     return
