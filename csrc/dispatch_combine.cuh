@@ -235,6 +235,27 @@ constexpr int32_t kHbPhaseCasBlkWait   = 6;  // slot 5
 constexpr int32_t kHbPhaseCasP2pBar    = 7;  // slot 6
 constexpr int32_t kHbPhaseCasScatDn    = 8;  // slot 7
 
+// Phase marker: block 0 thread 0 writes phase_id to slot.
+// Used to track "last phase reached" through non-spin sync
+// points (entry, __syncthreads, __threadfence_system etc.)
+// so we can tell whether a DC kernel is hung mid-compute.
+// Two dumps spaced several seconds apart: if the value is
+// stable for the same slot across dumps, the kernel is stuck
+// at that phase. If value advances, kernel is progressing.
+#define DC_HB_PHASE(cfg, slot, phase_id)                      \
+    do {                                                      \
+        if ((cfg)->heartbeat && threadIdx.x == 0 &&           \
+            blockIdx.x == 0) {                                \
+            (cfg)->heartbeat[(slot)] = (phase_id);            \
+        }                                                     \
+    } while (0)
+
+// Dedicated slots for phase markers (separate from 0-7 which
+// are per-spin-loop heartbeats).
+constexpr int32_t kHbSlotDarPhase  = 8;   // dispatch_and_route
+constexpr int32_t kHbSlotCasPhase  = 9;   // combine_and_scatter
+constexpr int32_t kHbSlotDarcPhase = 10;  // dar_compact
+
 // Step names (host-side, for printing).
 inline const char* dar_step_name(int i) {
   static const char* names[] = {
@@ -849,6 +870,7 @@ __global__ void combine_and_scatter_kernel(
   const int32_t ws = config->world_size;
 
   DC_TIMESTAMP(config, kDarNumSteps + 0);  // cas:read_counters
+  DC_HB_PHASE(config, kHbSlotCasPhase, 1);  // cas:entry
 
   // Read monotonic counter bases BEFORE any phase
   // modifies them (CUDA graph replay compatible).
@@ -892,6 +914,7 @@ __global__ void combine_and_scatter_kernel(
   // Cooperative HBM loading + thread-0 dedup/sort +
   // tiled accumulation with sorted entry ranges.
   DC_TIMESTAMP(config, kDarNumSteps + 2);  // cas:coop_load
+  DC_HB_PHASE(config, kHbSlotCasPhase, 2);  // cas:zero_accum_done
 
   // Dynamic shared memory: fp32 accumulator [K].
   extern __shared__ char dyn_shared_raw[];
@@ -1541,6 +1564,7 @@ __global__ void combine_and_scatter_kernel(
   // ---- Grid sync + P2P barrier ----
   DC_TIMESTAMP(config, kDarNumSteps + 10);
   // cas:grid_sync
+  DC_HB_PHASE(config, kHbSlotCasPhase, 3);  // cas:combine_p2p_done
 
   // Block 0 waits for kPersistentGrid (one increment
   // per block), does P2P barrier. Others wait for
@@ -1572,6 +1596,7 @@ __global__ void combine_and_scatter_kernel(
 
     DC_TIMESTAMP(config, kDarNumSteps + 11);
     // cas:offset_push
+    DC_HB_PHASE(config, kHbSlotCasPhase, 4);  // cas:grid_sync_done
 
     const int32_t tid = threadIdx.x;
     if (tid < ws) {
@@ -1671,6 +1696,7 @@ __global__ void combine_and_scatter_kernel(
   // ---- Phase 3: Scatter-add to fp32 accum ----
   DC_TIMESTAMP(config, kDarNumSteps + 14);  // cas:scatter_add
   // (timestamp after barrier, before scatter-add)
+  DC_HB_PHASE(config, kHbSlotCasPhase, 5);  // cas:p2p_done
 
   // Native fp32 atomicAdd: no CAS loop, no adjacent-
   // element contention from packed 32-bit words.
@@ -1744,6 +1770,7 @@ __global__ void combine_and_scatter_kernel(
   __syncthreads();
 
   DC_TIMESTAMP(config, kDarNumSteps + 15);  // cas:convert
+  DC_HB_PHASE(config, kHbSlotCasPhase, 6);  // cas:scatter_done
 
   // ---- Phase 4: fp32 → output dtype conversion ----
   // Replaces separate fp32_to_half_kernel launch.
@@ -1757,6 +1784,7 @@ __global__ void combine_and_scatter_kernel(
   }
 
   DC_TIMESTAMP(config, kDarNumSteps + 16);  // cas:end
+  DC_HB_PHASE(config, kHbSlotCasPhase, 7);  // cas:exit
 }
 
 // ====================================================================
@@ -1788,6 +1816,8 @@ __global__ void dar_compact_kernel(
   const int32_t ss = config->dispatch_section_size;
   const int64_t sentinel =
       static_cast<int64_t>(num_physical_experts);
+
+  DC_HB_PHASE(config, kHbSlotDarcPhase, 1);  // darc:entry
 
   // Compute per-section prefix sums (thread 0 only).
   __shared__ int32_t s_compact_offset[kMaxRanks];
@@ -1874,6 +1904,8 @@ __global__ void dar_compact_kernel(
     compact_expert_topk_weights[i] = 0.0f;
     compact_data_remap[i] = 0;  // harmless index
   }
+
+  DC_HB_PHASE(config, kHbSlotDarcPhase, 2);  // darc:exit
 }
 
 // ====================================================================
@@ -1925,6 +1957,7 @@ __global__ void dispatch_and_route_kernel(
   extern __shared__ int32_t shared[];
 
   DC_TIMESTAMP(config, 0);  // dar:read_counters
+  DC_HB_PHASE(config, kHbSlotDarPhase, 1);  // dar:entry
 
   // Read monotonic counter base values BEFORE any phase
   // (for CUDA graph replay compatibility).
@@ -2155,6 +2188,7 @@ __global__ void dispatch_and_route_kernel(
 
   // Flush expert counts to device buffer.
   DC_TIMESTAMP(config, 6);  // dar:expert_flush
+  DC_HB_PHASE(config, kHbSlotDarPhase, 2);  // dar:scan_write_done
   for (int32_t e = threadIdx.x; e < NL;
        e += blockDim.x) {
     int32_t count = s_expert_counts[e];
@@ -2207,6 +2241,7 @@ __global__ void dispatch_and_route_kernel(
     __syncthreads();
 
     DC_TIMESTAMP(config, 8);  // dar:grid_sync
+    DC_HB_PHASE(config, kHbSlotDarPhase, 3);  // dar:grid_sync_done
 
     // Push dispatch offsets on threads NL..NL+ws-1
     // (warp 4), concurrent with expert count push on
@@ -2335,6 +2370,7 @@ __global__ void dispatch_and_route_kernel(
   }
 
   DC_TIMESTAMP(config, 11);  // dar:p2p_wait
+  DC_HB_PHASE(config, kHbSlotDarPhase, 4);  // dar:p2p_done
 
   // Sum per-sender dispatch counts (available after
   // barrier). Each sender pushed its section count
@@ -2685,6 +2721,7 @@ __global__ void dispatch_and_route_kernel(
 
   // ---- Phase D2: Single-pass fill + routing filter ----
   DC_TIMESTAMP(config, 17);  // dar:phase_d2_filter
+  DC_HB_PHASE(config, kHbSlotDarPhase, 5);  // dar:phase_c_done
 
   // For each entry: write sentinel defaults, then check
   // if real and overwrite. Single pass ensures no cross-
@@ -2792,6 +2829,8 @@ __global__ void dispatch_and_route_kernel(
     }
   }
 
+  DC_HB_PHASE(config, kHbSlotDarPhase, 6);  // dar:phase_d2_done
+
   // ---- Phase E: Zero counts for next invocation ----
   // Zero this rank's allgather section + local counts
   // + local dispatch counters. Other ranks' sections
@@ -2820,6 +2859,7 @@ __global__ void dispatch_and_route_kernel(
   }
 
   DC_TIMESTAMP(config, 18);  // dar:end
+  DC_HB_PHASE(config, kHbSlotDarPhase, 7);  // dar:exit
 }
 
 }  // namespace dispatch_combine

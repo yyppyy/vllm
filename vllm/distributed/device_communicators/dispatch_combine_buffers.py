@@ -659,12 +659,20 @@ class DispatchCombineP2PManager:
     def dump_heartbeat(self) -> None:
         """Read heartbeat slots and log decoded progress for
         each kernel/phase. Safe to call from a signal handler
-        — no CUDA calls."""
+        — no CUDA calls.
+
+        Slots 0-7: per-spin-loop heartbeats, encoded as
+            (kernel_id << 24) | (phase_id << 16) | (spin/1024)
+        Slots 8-10: phase markers (last phase reached), written
+            at non-spin sync points. Value = plain phase_id.
+            Compare values across two dumps spaced seconds
+            apart: if stable → kernel is stuck at that phase.
+        """
         KERNEL_NAMES = {
             1: 'dispatch_and_route',
             3: 'combine_and_scatter',
         }
-        PHASE_NAMES = {
+        SPIN_PHASE_NAMES = {
             1: 'phase_a_grid_sync',
             2: 'dar_blk_wait',
             3: 'dar_p2p_barrier',
@@ -674,19 +682,53 @@ class DispatchCombineP2PManager:
             7: 'cas_p2p_barrier',
             8: 'cas_scatter_done',
         }
+        DAR_PHASE_NAMES = {
+            1: 'entry',
+            2: 'scan_write_done',
+            3: 'grid_sync_done',
+            4: 'p2p_done',
+            5: 'phase_c_done',
+            6: 'phase_d2_done',
+            7: 'exit',
+        }
+        CAS_PHASE_NAMES = {
+            1: 'entry',
+            2: 'zero_accum_done',
+            3: 'combine_p2p_done',
+            4: 'grid_sync_done',
+            5: 'p2p_done',
+            6: 'scatter_done',
+            7: 'exit',
+        }
+        DARC_PHASE_NAMES = {
+            1: 'entry',
+            2: 'exit',
+        }
+        PHASE_MARKER_SLOTS = {
+            8: ('dispatch_and_route', DAR_PHASE_NAMES),
+            9: ('combine_and_scatter', CAS_PHASE_NAMES),
+            10: ('dar_compact',         DARC_PHASE_NAMES),
+        }
         lines = [f"[DC heartbeat rank={self.rank}]"]
         for slot in range(64):
             val = int(self._heartbeat_host[slot])
             if val == 0:
                 continue
-            kid = (val >> 24) & 0xFF
-            pid = (val >> 16) & 0xFF
-            cnt = (val & 0xFFFF) * 1024
-            lines.append(
-                f"  slot{slot}: "
-                f"{KERNEL_NAMES.get(kid, f'k{kid}')}"
-                f"/{PHASE_NAMES.get(pid, f'p{pid}')} "
-                f"spin≈{cnt}")
+            if slot in PHASE_MARKER_SLOTS:
+                kname, pmap = PHASE_MARKER_SLOTS[slot]
+                pname = pmap.get(val, f'p{val}')
+                lines.append(
+                    f"  slot{slot}: {kname}/last_phase="
+                    f"{pname} ({val})")
+            else:
+                kid = (val >> 24) & 0xFF
+                pid = (val >> 16) & 0xFF
+                cnt = (val & 0xFFFF) * 1024
+                lines.append(
+                    f"  slot{slot}: "
+                    f"{KERNEL_NAMES.get(kid, f'k{kid}')}"
+                    f"/{SPIN_PHASE_NAMES.get(pid, f'p{pid}')} "
+                    f"spin≈{cnt}")
         logger.info("\n".join(lines))
 
     def update_experts_per_rank(self, experts_per_rank: int):
