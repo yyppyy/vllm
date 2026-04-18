@@ -62,26 +62,34 @@ PREFILL_ROUTING_MODE = int(
 # Set VLLM_ROUTING_DEBUG=1 to enable.
 _ROUTING_DEBUG = os.environ.get("VLLM_ROUTING_DEBUG", "0") == "1"
 
-# Hang localizer: when enabled, wrap each DC phase entry/exit
-# with torch.cuda.current_stream().synchronize() + a flushed
-# print. The last printed "in" without a matching "out"
-# pinpoints the hanging phase. Breaks CUDA-graph replay for
-# DC (forces eager) — use only for one-off diagnostic runs.
-_HANG_LOCALIZE = os.environ.get(
-    "VLLM_DC_HANG_LOCALIZE", "0") == "1"
+# Hang localizer:
+#   VLLM_DC_HANG_LOCALIZE=1 → synchronize() + print at each
+#       DC phase boundary. Slow (~480 sync points per forward
+#       at 48 MoE layers × 2 ranks), but the last "in" without
+#       a matching "out" pinpoints the exact hanging phase.
+#       Inserting these syncs may also mask timing-dependent
+#       races.
+#   VLLM_DC_HANG_LOCALIZE=2 → print only (no synchronize).
+#       Near-zero overhead. Less precise (kernel queue is
+#       async, so prints are ahead of GPU position), but
+#       doesn't perturb timing — useful when level=1 prevents
+#       the hang from reproducing.
+_HANG_LOCALIZE = int(
+    os.environ.get("VLLM_DC_HANG_LOCALIZE", "0"))
 
 
 def _hang_probe(tag: str, rank: int, layer_idx: int,
                 extra: str = ""):
-    if not _HANG_LOCALIZE:
+    if _HANG_LOCALIZE == 0:
         return
     # synchronize() is illegal during CUDA graph capture
     # (profile_run, capture phase) — skip the probe in that
     # window; the hang we're hunting is post-capture anyway.
     if torch.cuda.is_current_stream_capturing():
         return
+    if _HANG_LOCALIZE == 1:
+        torch.cuda.current_stream().synchronize()
     import sys
-    torch.cuda.current_stream().synchronize()
     print(f"DC[r={rank} L{layer_idx}] {tag}{extra}",
           flush=True)
     sys.stdout.flush()
