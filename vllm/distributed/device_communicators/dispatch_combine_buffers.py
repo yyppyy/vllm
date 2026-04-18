@@ -224,6 +224,33 @@ class DispatchCombineP2PManager:
         self._cuda_rt.cudaMemset(
             self._raw_scatter_done_counter, 0, 4)
 
+        # ---- Stall heartbeat (host-mapped pinned RAM) ----
+        # 64 int32 slots. Kernels write packed progress codes
+        # at spin-loop iterations; host can read directly
+        # without any CUDA sync. Works even when a kernel is
+        # hung (unlike printf which needs kernel completion to
+        # flush). Slot encoding: (kernel_id<<24) |
+        # (phase_id<<16) | spin_count/1024.
+        _CUDA_HOST_ALLOC_MAPPED = 2
+        self._heartbeat_bytes = 64 * 4
+        self._raw_heartbeat_host = self._cuda_rt.cudaHostAlloc(
+            self._heartbeat_bytes,
+            flags=_CUDA_HOST_ALLOC_MAPPED)
+        self._cuda_rt.cudaMemset(
+            self._raw_heartbeat_host, 0,
+            self._heartbeat_bytes)
+        # Device-side pointer for the same physical RAM.
+        self._raw_heartbeat_dev = (
+            self._cuda_rt.cudaHostGetDevicePointer(
+                self._raw_heartbeat_host))
+        # Host-side numpy view for zero-copy reads.
+        import numpy as np
+        self._heartbeat_host = np.ctypeslib.as_array(
+            ctypes.cast(
+                self._raw_heartbeat_host,
+                ctypes.POINTER(ctypes.c_int32)),
+            shape=(64,))
+
         # P2P barrier signal buffer.
         # Layout: alignas(128) flags[64] (256 bytes)
         #         + counter (4 bytes) = 260 bytes.
@@ -320,6 +347,28 @@ class DispatchCombineP2PManager:
         # Ensures cudaMemset zeroed offsets are visible
         # cross-GPU before first dispatch_p2p.
         self.gpu_p2p_barrier()
+
+        # SIGUSR1 → dump heartbeat slots (pure host-side,
+        # safe to call while the GPU is hung). Useful for
+        # diagnosing DC kernel spin deadlocks: user sends
+        # `kill -USR1 <pid>` once the engine shows 0 tok/s;
+        # the handler logs the last known (kernel, phase,
+        # spin_count) recorded by each kernel slot.
+        import signal
+        def _sigusr1_handler(signum, frame):
+            try:
+                self.dump_heartbeat()
+            except Exception as e:
+                logger.warning(
+                    "dump_heartbeat failed: %r", e)
+        try:
+            signal.signal(signal.SIGUSR1,
+                          _sigusr1_handler)
+        except (ValueError, OSError) as e:
+            # Signal registration may fail on non-main
+            # thread; tolerate it.
+            logger.debug(
+                "SIGUSR1 handler not installed: %r", e)
 
         logger.info(
             "DispatchCombineP2PManager initialized: rank=%d,"
@@ -597,11 +646,48 @@ class DispatchCombineP2PManager:
                else 0)
         data += struct.pack('Q', ptr)
 
+        # heartbeat (1 pointer) — host-mapped pinned, always
+        # populated (no env gate).
+        data += struct.pack('Q', self._raw_heartbeat_dev.value)
+
         config_bytes = bytes(data)
         config_tensor = torch.frombuffer(
             bytearray(config_bytes), dtype=torch.uint8
         ).cuda()
         return config_tensor
+
+    def dump_heartbeat(self) -> None:
+        """Read heartbeat slots and log decoded progress for
+        each kernel/phase. Safe to call from a signal handler
+        — no CUDA calls."""
+        KERNEL_NAMES = {
+            1: 'dispatch_and_route',
+            3: 'combine_and_scatter',
+        }
+        PHASE_NAMES = {
+            1: 'phase_a_grid_sync',
+            2: 'dar_blk_wait',
+            3: 'dar_p2p_barrier',
+            4: 'dar_routing_ready',
+            5: 'cas_combine_done',
+            6: 'cas_blk_wait',
+            7: 'cas_p2p_barrier',
+            8: 'cas_scatter_done',
+        }
+        lines = [f"[DC heartbeat rank={self.rank}]"]
+        for slot in range(64):
+            val = int(self._heartbeat_host[slot])
+            if val == 0:
+                continue
+            kid = (val >> 24) & 0xFF
+            pid = (val >> 16) & 0xFF
+            cnt = (val & 0xFFFF) * 1024
+            lines.append(
+                f"  slot{slot}: "
+                f"{KERNEL_NAMES.get(kid, f'k{kid}')}"
+                f"/{PHASE_NAMES.get(pid, f'p{pid}')} "
+                f"spin≈{cnt}")
+        logger.info("\n".join(lines))
 
     def update_experts_per_rank(self, experts_per_rank: int):
         """Update experts_per_rank in the config tensor."""
@@ -1136,3 +1222,7 @@ class DispatchCombineP2PManager:
         if self._raw_profiling_timestamps is not None:
             self._cuda_rt.cudaFree(
                 self._raw_profiling_timestamps)
+        if getattr(self, '_raw_heartbeat_host', None) \
+                is not None:
+            self._cuda_rt.cudaFreeHost(
+                self._raw_heartbeat_host)

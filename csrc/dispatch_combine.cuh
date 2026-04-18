@@ -181,6 +181,23 @@ struct DispatchCombineConfig {
   //     combine_and_scatter_kernel
   // Host reads back and accumulates averages.
   int64_t* profiling_timestamps;  // null = disabled
+
+  // ---- Stall heartbeat (host-mapped pinned memory) ----
+  // Each spin loop writes a packed progress code here at
+  // regular iteration intervals. CPU can read directly
+  // without any CUDA sync, so it works even when a kernel
+  // is hung. Slot layout:
+  //   0  dispatch_and_route — phase_a_done grid sync
+  //   1  dispatch_and_route — non-block-0 counter wait
+  //   2  dispatch_and_route — P2P barrier (block 0 tid<ws)
+  //   3  dispatch_and_route — routing_ready_flag (blocks>0)
+  //   4  combine_and_scatter — combine_done grid sync
+  //   5  combine_and_scatter — non-block-0 counter wait
+  //   6  combine_and_scatter — P2P barrier (block 0 tid<ws)
+  //   7  combine_and_scatter — scatter_done grid sync
+  // Encoded as: (kernel_id<<24) | (phase_id<<16) | spin/1024
+  // kernel_id: 1=DAR, 3=CAS. phase_id: 1..7 (see slot list).
+  int32_t* heartbeat;             // [64] or null = disabled
 };
 
 // Number of timestamp slots per kernel.
@@ -188,6 +205,35 @@ constexpr int kDarNumSteps = 19;
 constexpr int kCasNumSteps = 18;
 constexpr int kTotalProfileSlots =
     kDarNumSteps + kCasNumSteps;
+
+// Stall heartbeat encoder. Writes 1 int32 per call to
+// config->heartbeat[slot]. Safe to call from inside a spin
+// loop — the store is absorbed by PCIe and visible to host
+// CPU reads without any CUDA sync. Callers ensure the write
+// is on a single lane (e.g. inside `if (threadIdx.x == 0)`)
+// to cap PCIe traffic.
+#define DC_HEARTBEAT(cfg, slot, kid, pid, spin)               \
+    do {                                                      \
+        if ((cfg)->heartbeat) {                               \
+            int32_t _cnt = (int32_t)((spin) >> 10);           \
+            if (_cnt > 0xFFFF) _cnt = 0xFFFF;                 \
+            (cfg)->heartbeat[(slot)] =                        \
+                ((kid) << 24) | ((pid) << 16) | _cnt;         \
+        }                                                     \
+    } while (0)
+
+// Kernel ids
+constexpr int32_t kHbKernelDar = 1;
+constexpr int32_t kHbKernelCas = 3;
+// Phase ids (one per spin loop; matches slot ordering)
+constexpr int32_t kHbPhaseDarPhaseA    = 1;  // slot 0
+constexpr int32_t kHbPhaseDarBlkWait   = 2;  // slot 1
+constexpr int32_t kHbPhaseDarP2pBar    = 3;  // slot 2
+constexpr int32_t kHbPhaseDarRoutingRd = 4;  // slot 3
+constexpr int32_t kHbPhaseCasCombineDn = 5;  // slot 4
+constexpr int32_t kHbPhaseCasBlkWait   = 6;  // slot 5
+constexpr int32_t kHbPhaseCasP2pBar    = 7;  // slot 6
+constexpr int32_t kHbPhaseCasScatDn    = 8;  // slot 7
 
 // Step names (host-side, for printing).
 inline const char* dar_step_name(int i) {
@@ -1510,6 +1556,8 @@ __global__ void combine_and_scatter_kernel(
               < target) {
         __nanosleep(200);
         ++cd_spin;
+        DC_HEARTBEAT(config, 4, kHbKernelCas,
+                     kHbPhaseCasCombineDn, cd_spin);
         if (cd_spin == 5'000'000ull) {
           printf("[DC CAS combine_done stuck] rank=%d "
                  "cd_base=%u target=%u observed=%u\n",
@@ -1559,6 +1607,12 @@ __global__ void combine_and_scatter_kernel(
               != barrier_expected) {
         __nanosleep(100);
         ++cas_p2p_spin;
+        // Heartbeat: only tid=0 writes to avoid cross-
+        // thread PCIe write storm.
+        if (tid == 0) {
+          DC_HEARTBEAT(config, 6, kHbKernelCas,
+                       kHbPhaseCasP2pBar, cas_p2p_spin);
+        }
         if (cas_p2p_spin == 10'000'000ull) {
           printf("[DC CAS p2p_barrier stuck] rank=%d "
                  "tid=%d expected=%u observed=%u "
@@ -1596,6 +1650,12 @@ __global__ void combine_and_scatter_kernel(
               != barrier_expected) {
         __nanosleep(200);
         ++cas_blk_spin;
+        // Only block 1 writes heartbeat (all blocks would
+        // race on the same slot; pick one).
+        if (blockIdx.x == 1) {
+          DC_HEARTBEAT(config, 5, kHbKernelCas,
+                       kHbPhaseCasBlkWait, cas_blk_spin);
+        }
         if (cas_blk_spin == 5'000'000ull && blockIdx.x == 1) {
           printf("[DC CAS blk_wait stuck] rank=%d "
                  "expected=%u observed=%u\n",
@@ -1667,6 +1727,10 @@ __global__ void combine_and_scatter_kernel(
             < target) {
       __nanosleep(200);
       ++sd_spin;
+      if (blockIdx.x == 0) {
+        DC_HEARTBEAT(config, 7, kHbKernelCas,
+                     kHbPhaseCasScatDn, sd_spin);
+      }
       if (sd_spin == 5'000'000ull && blockIdx.x == 0) {
         printf("[DC CAS scatter_done stuck] rank=%d "
                "sd_base=%u target=%u observed=%u\n",
@@ -2128,6 +2192,8 @@ __global__ void dispatch_and_route_kernel(
               < target) {
         __nanosleep(200);
         ++pa_spin;
+        DC_HEARTBEAT(config, 0, kHbKernelDar,
+                     kHbPhaseDarPhaseA, pa_spin);
         if (pa_spin == 5'000'000ull) {
           printf("[DC DAR phase_a stuck] rank=%d "
                  "pa_base=%u target=%u observed=%u\n",
@@ -2209,6 +2275,10 @@ __global__ void dispatch_and_route_kernel(
               != barrier_expected) {
         __nanosleep(100);
         ++dar_spin;
+        if (tid == 0) {
+          DC_HEARTBEAT(config, 2, kHbKernelDar,
+                       kHbPhaseDarP2pBar, dar_spin);
+        }
         // One-shot printf after ~1s of spinning to
         // diagnose potential deadlocks. Emits each
         // spinning thread's rank/tid and the observed
@@ -2248,6 +2318,10 @@ __global__ void dispatch_and_route_kernel(
               != barrier_expected) {
         __nanosleep(200);
         ++blk_spin;
+        if (blockIdx.x == 1) {
+          DC_HEARTBEAT(config, 1, kHbKernelDar,
+                       kHbPhaseDarBlkWait, blk_spin);
+        }
         if (blk_spin == 5'000'000ull && blockIdx.x == 1) {
           printf("[DC DAR blk_wait stuck] rank=%d "
                  "expected=%u observed=%u\n",
@@ -2591,6 +2665,10 @@ __global__ void dispatch_and_route_kernel(
               != rf_expected) {
         __nanosleep(200);
         ++rf_spin;
+        if (blockIdx.x == 1) {
+          DC_HEARTBEAT(config, 3, kHbKernelDar,
+                       kHbPhaseDarRoutingRd, rf_spin);
+        }
         if (rf_spin == 5'000'000ull && blockIdx.x == 1) {
           printf("[DC DAR routing_ready stuck] rank=%d "
                  "routing_mode=%d expected=%u "

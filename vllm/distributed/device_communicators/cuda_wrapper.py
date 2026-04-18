@@ -94,6 +94,16 @@ class CudaRTLibrary:
         Function("cudaIpcOpenMemHandle", cudaError_t, [
             ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint
         ]),
+        # cudaError_t cudaHostAlloc ( void** pHost, size_t size, unsigned int flags ) # noqa
+        Function("cudaHostAlloc", cudaError_t, [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint
+        ]),
+        # cudaError_t cudaFreeHost ( void* ptr )
+        Function("cudaFreeHost", cudaError_t, [ctypes.c_void_p]),
+        # cudaError_t cudaHostGetDevicePointer ( void** pDevice, void* pHost, unsigned int flags ) # noqa
+        Function("cudaHostGetDevicePointer", cudaError_t, [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint
+        ]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -177,4 +187,28 @@ class CudaRTLibrary:
         devPtr = ctypes.c_void_p()
         self.CUDART_CHECK(self.funcs["cudaIpcOpenMemHandle"](
             ctypes.byref(devPtr), handle, cudaIpcMemLazyEnablePeerAccess))
+        return devPtr
+
+    def cudaHostAlloc(self, size: int,
+                      flags: int = 0) -> ctypes.c_void_p:
+        """Allocate host-pinned memory. flags: bitmask —
+        cudaHostAllocDefault=0, cudaHostAllocPortable=1,
+        cudaHostAllocMapped=2, cudaHostAllocWriteCombined=4.
+        Pass flags=2 for device-mapped pinned memory."""
+        hostPtr = ctypes.c_void_p()
+        self.CUDART_CHECK(self.funcs["cudaHostAlloc"](
+            ctypes.byref(hostPtr), size, flags))
+        return hostPtr
+
+    def cudaFreeHost(self, hostPtr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaFreeHost"](hostPtr))
+
+    def cudaHostGetDevicePointer(
+            self, hostPtr: ctypes.c_void_p,
+            flags: int = 0) -> ctypes.c_void_p:
+        """Given a host-mapped pinned pointer, return the
+        device-accessible pointer for the same memory."""
+        devPtr = ctypes.c_void_p()
+        self.CUDART_CHECK(self.funcs["cudaHostGetDevicePointer"](
+            ctypes.byref(devPtr), hostPtr, flags))
         return devPtr
