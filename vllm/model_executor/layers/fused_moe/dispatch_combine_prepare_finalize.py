@@ -63,19 +63,31 @@ PREFILL_ROUTING_MODE = int(
 _ROUTING_DEBUG = os.environ.get("VLLM_ROUTING_DEBUG", "0") == "1"
 
 # Hang localizer:
-#   VLLM_DC_HANG_LOCALIZE=1 → synchronize() + print at each
-#       DC phase boundary. Slow (~480 sync points per forward
-#       at 48 MoE layers × 2 ranks), but the last "in" without
-#       a matching "out" pinpoints the exact hanging phase.
-#       Inserting these syncs may also mask timing-dependent
-#       races.
-#   VLLM_DC_HANG_LOCALIZE=2 → print only (no synchronize).
-#       Near-zero overhead. Less precise (kernel queue is
-#       async, so prints are ahead of GPU position), but
-#       doesn't perturb timing — useful when level=1 prevents
-#       the hang from reproducing.
+#   VLLM_DC_HANG_LOCALIZE=1 → synchronize() + print at every
+#       DC phase boundary. Most precise but slow (~480 sync
+#       points per forward × 48 MoE layers × 2 ranks). May
+#       mask timing-dependent races.
+#   VLLM_DC_HANG_LOCALIZE=2 → print at every phase boundary,
+#       no synchronize. Near-zero overhead but prints are
+#       async (Python ahead of GPU).
+#   VLLM_DC_HANG_LOCALIZE=3 → forward-level + layer-level
+#       hybrid:
+#         * synchronize() + print "fwd=N start" once per
+#           forward (at layer 0's prep:in).
+#         * print "L{i} fin:out" each layer (no sync), as
+#           lightweight progress markers.
+#       Volume: ~49 lines per forward (vs 480 for level 1/2).
+#       The last "fwd=N start" before silence identifies
+#       which forward the GPU is actually stuck on. The fin
+#       lines after it show how far Python advanced (which
+#       lags GPU but bounds the hang window).
 _HANG_LOCALIZE = int(
     os.environ.get("VLLM_DC_HANG_LOCALIZE", "0"))
+
+# Per-rank forward counter for level 3. Class-level dict so
+# all PF instances on the same rank share the same counter,
+# but the counter only increments at layer 0's prep:in.
+_FWD_COUNTER: dict = {}
 
 
 def _hang_probe(tag: str, rank: int, layer_idx: int,
@@ -87,9 +99,31 @@ def _hang_probe(tag: str, rank: int, layer_idx: int,
     # window; the hang we're hunting is post-capture anyway.
     if torch.cuda.is_current_stream_capturing():
         return
+    import sys
+    if _HANG_LOCALIZE == 3:
+        # Layer-0 prep:in: sync + bump counter + print
+        # "fwd=N start". This reliably reflects GPU
+        # completion of the previous forward.
+        if layer_idx == 0 and tag.startswith("prep:in"):
+            torch.cuda.current_stream().synchronize()
+            _FWD_COUNTER[rank] = (
+                _FWD_COUNTER.get(rank, -1) + 1)
+            fwd = _FWD_COUNTER[rank]
+            print(f"DC[r={rank}] fwd={fwd} start{extra}",
+                  flush=True)
+            sys.stdout.flush()
+            return
+        # All other phase boundaries: print "L{i} {tag}"
+        # no sync. Async, lags GPU, but cheap.
+        if tag == "fin:out":
+            fwd = _FWD_COUNTER.get(rank, 0)
+            print(f"DC[r={rank} fwd={fwd}] L{layer_idx} "
+                  f"fin:out", flush=True)
+            sys.stdout.flush()
+        return
+    # Levels 1 and 2: full probe at every phase boundary.
     if _HANG_LOCALIZE == 1:
         torch.cuda.current_stream().synchronize()
-    import sys
     print(f"DC[r={rank} L{layer_idx}] {tag}{extra}",
           flush=True)
     sys.stdout.flush()
