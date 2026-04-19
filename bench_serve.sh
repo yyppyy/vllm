@@ -147,7 +147,7 @@ fi
 WARMUP_PROMPTS=$((1 * NUM_PROMPTS))
 
 INPUT_LEN=512
-OUTPUT_LEN=32
+OUTPUT_LEN=512
 
 # Warmup run: EPLB rebalances during these requests (results discarded)
 warmup_args=(
