@@ -46,6 +46,13 @@ import vllm.utils
 
 logger = init_logger(__name__)
 
+# Per-invocation MoE GEMM profile: VLLM_MOE_GEMM_PROFILE=N
+# logs activated experts and launched grid blocks every Nth
+# call to invoke_fused_moe_kernel. 0 = disabled.
+_MOE_GEMM_PROFILE_INTERVAL = int(
+    os.environ.get('VLLM_MOE_GEMM_PROFILE', '0'))
+_moe_gemm_call_count = 0
+
 class RouterWS:
 
     def __init__(
@@ -620,6 +627,39 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
                  A.size(0) * top_k * config['BLOCK_SIZE_M'])
     grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
         B.size(1), META['BLOCK_SIZE_N']), )
+
+    global _moe_gemm_call_count
+    _moe_gemm_call_count += 1
+    if (_MOE_GEMM_PROFILE_INTERVAL > 0
+            and _moe_gemm_call_count % _MOE_GEMM_PROFILE_INTERVAL == 0
+            and not torch.cuda.is_current_stream_capturing()):
+        bsm = config['BLOCK_SIZE_M']
+        bsn = config['BLOCK_SIZE_N']
+        N_dim = B.size(1)
+        m_blocks_total = expert_ids.numel()
+        n_blocks = triton.cdiv(N_dim, bsn)
+        total_blocks = m_blocks_total * n_blocks
+        # Padding M-blocks default to expert_ids=0 (see
+        # csrc/moe/moe_align_sum_kernels.cu); slice to the
+        # valid prefix so unique() doesn't over-count expert 0.
+        valid_m_blocks = int(
+            num_tokens_post_padded.item()) // bsm
+        if valid_m_blocks > 0:
+            activated = int(
+                expert_ids[:valid_m_blocks].unique().numel())
+        else:
+            activated = 0
+        num_experts_in_B = B.size(0)
+        logger.info(
+            "[MoE GEMM] call=%d M=%d top_k=%d EM=%d "
+            "BLOCK_SIZE_M=%d BLOCK_SIZE_N=%d N=%d "
+            "m_blocks=%d (valid=%d) n_blocks=%d "
+            "total_blocks=%d activated_experts=%d/%d",
+            _moe_gemm_call_count, M, top_k, EM,
+            bsm, bsn, N_dim,
+            m_blocks_total, valid_m_blocks, n_blocks,
+            total_blocks, activated, num_experts_in_B)
+
     HAS_BIAS = B_bias is not None
     if (use_int8_w8a16 or use_int4_w4a16) and \
             block_shape is not None and block_shape[1] > 0:
