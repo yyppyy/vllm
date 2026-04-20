@@ -288,7 +288,9 @@ class EplbState:
             off = g * S
             full_phy_to_log.extend(e + off for e in phy_to_log_group)
 
-        max_slots = max(replica_count)
+        # Pad l2p width to >= ep_size so callers (e.g., dispatch_combine
+        # buffers sized by max(max_replicas, world_size)) do not mismatch.
+        max_slots = max(max(replica_count), ep_size)
         p2l = torch.tensor(
             full_phy_to_log, dtype=torch.int32, device=device)
         l2p = torch.full(
