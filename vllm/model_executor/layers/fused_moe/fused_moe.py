@@ -53,6 +53,23 @@ _MOE_GEMM_PROFILE_INTERVAL = int(
     os.environ.get('VLLM_MOE_GEMM_PROFILE', '0'))
 _moe_gemm_call_count = 0
 
+# Per-stage wall-clock timing inside TritonExperts.apply():
+# VLLM_MOE_STAGE_PROFILE=N logs averaged CUDA-event deltas for
+# moe_align / gate+up GEMM / silu / quant / down GEMM every Nth
+# apply() call. Requires --enforce-eager (CUDA graph replay
+# skips the Python path and the timer block is gated off during
+# capture). 0 = disabled.
+_MOE_STAGE_PROFILE_INTERVAL = int(
+    os.environ.get('VLLM_MOE_STAGE_PROFILE', '0'))
+_moe_stage_call_count = 0
+_moe_stage_sums_ms: dict[str, float] = {
+    "A_align": 0.0,
+    "B_gemm_gu": 0.0,
+    "C_actmul": 0.0,
+    "D_quant": 0.0,
+    "E_gemm_dn": 0.0,
+}
+
 class RouterWS:
 
     def __init__(
@@ -1983,9 +2000,22 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         intermediate_cache3 = _resize_cache(workspace2,
                                             (num_tokens, top_k_num, K))
 
+        _stage_prof = (
+            _MOE_STAGE_PROFILE_INTERVAL > 0
+            and not torch.cuda.is_current_stream_capturing())
+
+        def _stage_evt():
+            if _stage_prof:
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record()
+                return ev
+            return None
+
+        _e0 = _stage_evt()
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'],
                                  global_num_experts, expert_map))
+        _e1 = _stage_evt()
 
         invoke_fused_moe_kernel(
             hidden_states,
@@ -2011,6 +2041,8 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             B_bias=self.w1_bias,
         )
 
+        _e2 = _stage_evt()
+
         if (expert_tokens_meta is not None
                 and expert_tokens_meta.topk_ids_for_masking
                 is not None):
@@ -2026,11 +2058,15 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 activation, intermediate_cache2,
                 intermediate_cache1.view(-1, N))
 
+        _e3 = _stage_evt()
+
         a2q_scale: Optional[torch.Tensor] = None
 
         qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
             intermediate_cache2, a2_scale, self.quant_dtype,
             self.per_act_token_quant, self.block_shape)
+
+        _e4 = _stage_evt()
 
         invoke_fused_moe_kernel(
             qintermediate_cache2,
@@ -2055,6 +2091,32 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             block_shape=self.block_shape,
             B_bias=self.w2_bias,
         )
+
+        if _stage_prof:
+            _e5 = torch.cuda.Event(enable_timing=True)
+            _e5.record()
+            torch.cuda.synchronize()
+            global _moe_stage_call_count
+            _moe_stage_call_count += 1
+            _moe_stage_sums_ms["A_align"]   += _e0.elapsed_time(_e1)
+            _moe_stage_sums_ms["B_gemm_gu"] += _e1.elapsed_time(_e2)
+            _moe_stage_sums_ms["C_actmul"]  += _e2.elapsed_time(_e3)
+            _moe_stage_sums_ms["D_quant"]   += _e3.elapsed_time(_e4)
+            _moe_stage_sums_ms["E_gemm_dn"] += _e4.elapsed_time(_e5)
+            if (_moe_stage_call_count
+                    % _MOE_STAGE_PROFILE_INTERVAL == 0):
+                _n = _moe_stage_call_count
+                logger.info(
+                    "[MoE Stage avg over %d calls, ms]  "
+                    "align=%.3f  gemm_gu=%.3f  actmul=%.3f  "
+                    "quant=%.3f  gemm_dn=%.3f  total=%.3f",
+                    _n,
+                    _moe_stage_sums_ms["A_align"]   / _n,
+                    _moe_stage_sums_ms["B_gemm_gu"] / _n,
+                    _moe_stage_sums_ms["C_actmul"]  / _n,
+                    _moe_stage_sums_ms["D_quant"]   / _n,
+                    _moe_stage_sums_ms["E_gemm_dn"] / _n,
+                    sum(_moe_stage_sums_ms.values()) / _n)
 
         if top_k_num == 1:
             # topk=1: sum across topk dim is identity.
