@@ -176,7 +176,7 @@ def zipfian_select_experts(
 
 
 _grouped_zipfian_result_cache: dict[
-    tuple[int, int, int, int, int, torch.device],
+    tuple[int, int, int, int, int, int, torch.device],
     tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -187,23 +187,30 @@ def grouped_zipfian_select_experts(
         topk: int,
         layer_idx: int,
         num_groups: int,
+        ep_rank: int,
+        ep_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Grouped Zipfian routing. Token t picks group
-    g = t % num_groups; topk experts are drawn from
-    the group's group_size = num_experts/num_groups
+    """Rank-local grouped Zipfian routing. Every token on
+    this rank routes to its own rank's expert group
+    g = ep_rank // (ep_size / num_groups), eliminating
+    cross-group dispatch traffic. topk experts are drawn
+    from the group's group_size = num_experts/num_groups
     experts via Gumbel-top-k on log-probs
     log_probs_k = -0.5 * log(k+1). Returned expert IDs
     are global logical IDs in [g*group_size,
     (g+1)*group_size). Cached per (M, topk, layer_idx,
-    num_experts, num_groups, device)."""
+    num_experts, num_groups, ep_rank, device)."""
     M = hidden_states.shape[0]
     device = hidden_states.device
     key = (M, topk, layer_idx, num_experts,
-           num_groups, device)
+           num_groups, ep_rank, device)
     if key in _grouped_zipfian_result_cache:
         return _grouped_zipfian_result_cache[key]
     assert num_experts % num_groups == 0
+    assert ep_size % num_groups == 0
     group_size = num_experts // num_groups
+    ranks_per_group = ep_size // num_groups
+    group_idx = ep_rank // ranks_per_group
     assert topk <= group_size, (
         f"topk={topk} exceeds group_size={group_size}")
 
@@ -213,7 +220,8 @@ def grouped_zipfian_select_experts(
 
     gen = torch.Generator(device=device)
     gen.manual_seed(
-        layer_idx * 1000003 + M * 7 + num_groups * 131)
+        layer_idx * 1000003 + M * 7
+        + num_groups * 131 + ep_rank * 17)
     u = torch.rand(M, group_size, generator=gen,
                    device=device, dtype=torch.float32)
     u.clamp_(1e-10, 1.0 - 1e-7)
@@ -221,11 +229,8 @@ def grouped_zipfian_select_experts(
     perturbed = log_probs.unsqueeze(0) + gumbel
     _, local_ids = perturbed.topk(topk, dim=-1)
 
-    group_idx = (torch.arange(M, device=device,
-                              dtype=torch.int64)
-                 % num_groups)
-    offsets = group_idx.unsqueeze(1) * group_size
-    expert_ids = local_ids.to(torch.int64) + offsets
+    offset = group_idx * group_size
+    expert_ids = local_ids.to(torch.int64) + offset
 
     probs = 1.0 / (local_ids.float() + 1)
     weights = probs / probs.sum(dim=1, keepdim=True)
@@ -906,10 +911,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # redundant physical copies).
             _n_logical = router_logits.shape[-1]
             if _route_grouped:
+                _mpc = self.moe.moe_parallel_config
                 topk_weights, topk_ids = (
                     grouped_zipfian_select_experts(
                         x, _n_logical, top_k,
-                        _layer_idx, _EPLB_NUM_GROUPS))
+                        _layer_idx, _EPLB_NUM_GROUPS,
+                        _mpc.ep_rank, _mpc.ep_size))
             else:
                 topk_weights, topk_ids = (
                     zipfian_select_experts(
