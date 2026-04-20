@@ -53,9 +53,14 @@ ROUTING_MODE_THRESHOLD = int(
 
 # Which routing mode to use for large M (> threshold):
 # 1 = greedy LPT (balance tokens across replicas),
-# 2 = even round-robin (split sections across replicas).
+# 2 = even round-robin (split sections across replicas),
+# 3 = minimize per-token destination rank fanout
+#     (greedy in-set + block-local load tie-break).
 PREFILL_ROUTING_MODE = int(
     os.environ.get("VLLM_PREFILL_ROUTING_MODE", "1"))
+assert PREFILL_ROUTING_MODE in (1, 2, 3), (
+    "VLLM_PREFILL_ROUTING_MODE must be 1, 2, or 3; got "
+    f"{PREFILL_ROUTING_MODE}")
 
 # Debug: dump routing decisions once per routing_mode,
 # and again after every EPLB rebalance.

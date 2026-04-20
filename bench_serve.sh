@@ -60,13 +60,16 @@ DCPF_PY="vllm/model_executor/layers/fused_moe/dispatch_combine_prepare_finalize.
 sed -i "s|\"VLLM_ROUTING_MODE_THRESHOLD\", \"[^\"]*\"|\"VLLM_ROUTING_MODE_THRESHOLD\", \"${MEM_BOUND_ROUTING_THRES}\"|" "$DCPF_PY"
 unset VLLM_ROUTING_MODE_THRESHOLD
 # Patch VLLM_PREFILL_ROUTING_MODE: MEM_BOUND_ROUTING=1 → mode 1 (LPT),
-# MEM_BOUND_ROUTING=2 → mode 2 (round-robin).
+# MEM_BOUND_ROUTING=2 → mode 2 (round-robin),
+# MEM_BOUND_ROUTING=3 → mode 3 (minimize per-token rank fanout).
 if (( MEM_BOUND_ROUTING == 1 )); then
   sed -i 's|"VLLM_PREFILL_ROUTING_MODE", "[^"]*"|"VLLM_PREFILL_ROUTING_MODE", "1"|' "$DCPF_PY"
 elif (( MEM_BOUND_ROUTING == 2 )); then
   sed -i 's|"VLLM_PREFILL_ROUTING_MODE", "[^"]*"|"VLLM_PREFILL_ROUTING_MODE", "2"|' "$DCPF_PY"
+elif (( MEM_BOUND_ROUTING == 3 )); then
+  sed -i 's|"VLLM_PREFILL_ROUTING_MODE", "[^"]*"|"VLLM_PREFILL_ROUTING_MODE", "3"|' "$DCPF_PY"
 elif (( MEM_BOUND_ROUTING != 0 )); then
-  echo "ERROR: MEM_BOUND_ROUTING must be 0, 1, or 2 (got $MEM_BOUND_ROUTING)" >&2
+  echo "ERROR: MEM_BOUND_ROUTING must be 0, 1, 2, or 3 (got $MEM_BOUND_ROUTING)" >&2
   exit 1
 fi
 # unset VLLM_PREFILL_ROUTING_MODE

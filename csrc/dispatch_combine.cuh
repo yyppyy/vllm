@@ -1853,6 +1853,12 @@ __global__ void dispatch_and_route_kernel(
       s_ent_grp + kMaxEntries;                  // [NL]
   int32_t* s_l2p_map =
       s_replica_count + NL;                     // [NL*mr]
+  // Mode-3 only: block-local per-rank load counter for
+  // tie-breaking the greedy minimize-fanout router. Lives
+  // in shared mem (per-block, per-invocation — invisible
+  // to CUDA-graph capture/replay).
+  int32_t* s_block_rank_load =
+      s_l2p_map + NL * max_rep;                 // [ws]
 
   __shared__ int32_t s_total_entries;
   __shared__ int32_t s_grp_base[kMaxRanks];
@@ -1869,8 +1875,10 @@ __global__ void dispatch_and_route_kernel(
     s_l2p_map[i] =
         config->logical_to_physical_map[i];
   }
-  if (threadIdx.x < ws)
+  if (threadIdx.x < ws) {
     s_grp_count[threadIdx.x] = 0;
+    s_block_rank_load[threadIdx.x] = 0;
+  }
   if (threadIdx.x == 0) s_total_entries = 0;
   __syncthreads();
 
@@ -1880,7 +1888,113 @@ __global__ void dispatch_and_route_kernel(
        t += gridDim.x) {
     // Step 1: Parallel expansion (threads 0..topk-1)
     // + direct group tagging (fused with old Step 2).
-    if (threadIdx.x < topk) {
+    // Mode 3 takes a separate single-thread path: the
+    // greedy minimize-rank-fanout decision is sequential
+    // across topk picks of the same token (later picks see
+    // the chosen-ranks set built by earlier picks).
+    if (routing_mode == 3) {
+      if (threadIdx.x == 0) {
+        constexpr int32_t kMaxTopkLocal = 16;
+        int32_t chosen_phys[kMaxTopkLocal];
+        uint64_t chosen_ranks_mask = 0;
+        const int32_t topk_eff =
+            (topk < kMaxTopkLocal) ? topk : kMaxTopkLocal;
+
+        // Pass 1: rc==1 forced (no choice). Establishes
+        // the initial chosen_ranks_mask before Pass 2's
+        // multi-replica greedy picks.
+        for (int32_t k = 0; k < topk_eff; k++) {
+          int32_t lid = topk_ids[t * topk + k];
+          if (lid < 0 || lid >= NL) {
+            chosen_phys[k] = -1;
+            continue;
+          }
+          int32_t rc = s_replica_count[lid];
+          if (rc > max_rep) rc = max_rep;
+          if (rc <= 0) {
+            chosen_phys[k] = -1;
+          } else if (rc == 1) {
+            int32_t phys = s_l2p_map[lid * max_rep];
+            chosen_phys[k] = phys;
+            int32_t r = phys / epr;
+            if (r >= 0 && r < ws) {
+              chosen_ranks_mask |= 1ULL << r;
+            }
+          } else {
+            chosen_phys[k] = -2;  // defer to Pass 2
+          }
+        }
+
+        // Pass 2: multi-replica picks. Primary: prefer a
+        // replica whose rank is already in chosen_ranks
+        // (collapse fanout). Secondary: lower block-local
+        // load. Final: smaller rank id (determinism).
+        for (int32_t k = 0; k < topk_eff; k++) {
+          if (chosen_phys[k] != -2) continue;
+          int32_t lid = topk_ids[t * topk + k];
+          int32_t rc = s_replica_count[lid];
+          if (rc > max_rep) rc = max_rep;
+          int32_t best_phys = -1;
+          int32_t best_rank = INT_MAX;
+          int32_t best_in_set = -1;
+          int32_t best_load = INT_MAX;
+          for (int32_t rep = 0; rep < rc; rep++) {
+            int32_t phys = s_l2p_map[lid * max_rep + rep];
+            int32_t r = phys / epr;
+            if (r < 0 || r >= ws) continue;
+            int32_t in_set = static_cast<int32_t>(
+                (chosen_ranks_mask >> r) & 1ULL);
+            int32_t load = s_block_rank_load[r];
+            bool better =
+                (in_set > best_in_set)
+                || (in_set == best_in_set
+                    && load < best_load)
+                || (in_set == best_in_set
+                    && load == best_load
+                    && r < best_rank);
+            if (better) {
+              best_phys = phys;
+              best_rank = r;
+              best_in_set = in_set;
+              best_load = load;
+            }
+          }
+          chosen_phys[k] = best_phys;
+          if (best_rank >= 0 && best_rank < ws) {
+            chosen_ranks_mask |= 1ULL << best_rank;
+          }
+        }
+
+        // Push entries to per-block staging arrays. For
+        // mode 3 we store the PHYSICAL expert id in
+        // s_ent_lid (Phase D2 reads it back as physical).
+        for (int32_t k = 0; k < topk_eff; k++) {
+          int32_t phys = chosen_phys[k];
+          if (phys < 0) continue;
+          int32_t lid = topk_ids[t * topk + k];
+          if (lid < 0 || lid >= NL) continue;
+          float wt = topk_weights[t * topk + k];
+          int32_t dr = phys / epr;
+          if (dr < 0 || dr >= ws) continue;
+          if (!config->remote_dispatch_offsets[dr]
+              || !config->remote_dispatch_recv[dr]
+              || !config->remote_dispatch_meta[dr])
+            continue;
+          // Logical-id count for global stats (still
+          // matches modes 0/1/2 semantics).
+          atomicAdd(&s_expert_counts[lid], 1);
+          int32_t ei = atomicAdd(&s_total_entries, 1);
+          if (ei < kMaxEntries) {
+            s_ent_lid[ei] = phys;  // physical for mode 3
+            s_ent_wt[ei] = wt;
+            s_ent_grp[ei] = dr;
+            atomicAdd(&s_grp_count[dr], 1);
+            // Single-thread; plain ++ is fine.
+            s_block_rank_load[dr] += 1;
+          }
+        }
+      }
+    } else if (threadIdx.x < topk) {
       int32_t slot = threadIdx.x;
       int32_t lid = topk_ids[t * topk + slot];
       if (lid >= 0 && lid < NL) {
@@ -2161,10 +2275,11 @@ __global__ void dispatch_and_route_kernel(
   DC_TIMESTAMP(config, 12);  // dar:phase_c_preload
 
   if (blockIdx.x == 0) {
-    if (routing_mode == 2) {
-      // Mode 2: routing decided in Phase A per-token
-      // (t % rc). No routing_selection needed. Just
-      // zero expert_num_tokens and signal readiness.
+    if (routing_mode == 2 || routing_mode == 3) {
+      // Modes 2 and 3: routing decided in Phase A per
+      // token (mode 2: t % rc; mode 3: greedy minimize
+      // fanout). No routing_selection table needed —
+      // just zero expert_num_tokens and signal readiness.
       DC_TIMESTAMP(config, 13);  // dar:phase_c_route
       DC_TIMESTAMP(config, 14);  // dar:route_pass1
       DC_TIMESTAMP(config, 15);  // dar:route_pass2
@@ -2513,6 +2628,27 @@ __global__ void dispatch_and_route_kernel(
               + meta_r[idx].source_token_idx;
 
           // Routing filter.
+          if (routing_mode == 3) {
+            // Mode 3: source rank stored the chosen
+            // PHYSICAL expert id directly in expert_id
+            // (not logical). It only pushed entries to
+            // the chosen rank, so the rank check below
+            // is a defensive sanity guard.
+            int32_t sel = meta_r[idx].expert_id;
+            if (sel < 0
+                || sel >= num_physical_experts) {
+              meta_w[idx].topk_weight = 0.0f;
+            } else if (sel / epr == rank) {
+              expert_topk_ids[idx] =
+                  static_cast<int64_t>(sel);
+              expert_topk_weights[idx] =
+                  meta_r[idx].topk_weight;
+              atomicAdd(
+                  &expert_num_tokens[sel], 1);
+            } else {
+              meta_w[idx].topk_weight = 0.0f;
+            }
+          } else {
           const int32_t logical_id =
               meta_r[idx].expert_id;
           if (logical_id < 0
@@ -2574,6 +2710,7 @@ __global__ void dispatch_and_route_kernel(
               meta_w[idx].topk_weight = 0.0f;
             }
           }
+          }  // end else (modes 0/1/2)
         }
       }
     }
