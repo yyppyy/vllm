@@ -618,13 +618,22 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
     num_tokens = M * top_k
 
     EM = sorted_token_ids.size(0)
-    if A.size(0) < config["BLOCK_SIZE_M"]:
+    # Tighter static upper bound for num_tokens_post_padded:
+    # Σ_e ceil(count[e]/BSM)*BSM ≤ M*top_k + num_active_experts*BSM
+    # and num_active_experts ≤ B.size(0) (local physical experts).
+    # For EP paths moe_align was passed the GLOBAL expert count,
+    # which inflates EM by ~global/local. This cap fixes that with
+    # no host/device sync; the kernel's existing early-exit at
+    # `pid_m * BSM >= num_tokens_post_padded` handles remaining
+    # slack safely. For TP this is a no-op (B.size(0) == num_experts).
+    bsm_cap = config['BLOCK_SIZE_M']
+    EM = min(EM, A.size(0) * top_k + B.size(0) * bsm_cap)
+    if A.size(0) < bsm_cap:
         # optimize for small batch_size.
         # We assume that top_ids of each token is unique,
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
-        EM = min(sorted_token_ids.size(0),
-                 A.size(0) * top_k * config['BLOCK_SIZE_M'])
+        EM = min(EM, A.size(0) * top_k * bsm_cap)
     grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
         B.size(1), META['BLOCK_SIZE_N']), )
 
