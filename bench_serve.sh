@@ -12,6 +12,7 @@ DATASET_NAME=$9
 USE_PROFILER=${10}
 MEM_BOUND_ROUTING_THRES=${11}
 MODEL_NAME=${12:-Qwen3-30B-A3B}
+EPLB_NUM_GROUPS=${13:-1}
 MODEL_DIR=./models/${MODEL_NAME}
 
 # If MODEL_NAME matches Qwen3-30B-A3B-{topk}-{num_experts},
@@ -34,7 +35,7 @@ print(f'Patched Qwen3 config: topk=${QWEN_TOPK}, num_experts=${QWEN_NUM_EXPERTS}
 fi
 
 RES_DIR=./results
-RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}_${MEM_BOUND_ROUTING_THRES}_${MODEL_NAME}
+RUN_HASH=${NUM_GPUS}_${EP_DEGREE}_${USE_EP}_${NUM_REPLICAS}_${BATCH_SIZE}_${MEM_BOUND_ROUTING}_${ALLTOALL_BACKEND}_${DATASET}_${USE_PROFILER}_${MEM_BOUND_ROUTING_THRES}_${MODEL_NAME}_g${EPLB_NUM_GROUPS}
 mkdir -p "$RES_DIR"/"$RUN_HASH"
 
 PORT=$(python3 -c 'import socket as s; sock=s.socket(); sock.bind(("",0)); print(sock.getsockname()[1]); sock.close()')
@@ -78,6 +79,7 @@ sed -i 's|"VLLM_PREFILL_BEFORE_DECODE", "[^"]*"|"VLLM_PREFILL_BEFORE_DECODE", "1
 unset VLLM_PREFILL_BEFORE_DECODE
 
 export VLLM_ZIPFIAN_ROUTING=1
+export VLLM_EPLB_NUM_GROUPS=${EPLB_NUM_GROUPS}
 # export VLLM_DC_PROFILE=1 # time breakdown debug
 # export VLLM_DC_EXPERT_PROFILE_M=256 # threshold
 
@@ -109,7 +111,14 @@ if (( USE_EP > 0 )); then
   args+=( --enable-expert-parallel )
   args+=( --enable-eplb )
   EPLB_STEP=$((2 * NUM_PROMPTS))
-  args+=( --eplb-config "{\"window_size\":${EPLB_STEP},\"step_interval\":${EPLB_STEP},\"num_redundant_experts\":${NUM_REPLICAS},\"max_rearrangements\":1}" )
+  # When grouping is active, disable runtime rearrange — the existing
+  # rebalance algorithm is not group-aware and would clobber the layout.
+  if (( EPLB_NUM_GROUPS > 1 )); then
+    MAX_REARR=0
+  else
+    MAX_REARR=1
+  fi
+  args+=( --eplb-config "{\"window_size\":${EPLB_STEP},\"step_interval\":${EPLB_STEP},\"num_redundant_experts\":${NUM_REPLICAS},\"max_rearrangements\":${MAX_REARR}}" )
   if (( MEM_BOUND_ROUTING > 0 )); then
     args+=( --mem-bound-aware-routing greedy )
   fi

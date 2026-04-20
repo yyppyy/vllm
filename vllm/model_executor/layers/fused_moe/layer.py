@@ -94,6 +94,11 @@ logger = init_logger(__name__)
 # Zipfian pseudo-random expert selection (for debugging).
 _ZIPFIAN_ROUTING = bool(int(
     os.environ.get('VLLM_ZIPFIAN_ROUTING', '0')))
+# When > 1, each token round-robin picks an expert group by
+# (token_idx % G), then samples topk experts from that group's
+# Zipfian distribution. Pairs with grouped placement in EPLB.
+_EPLB_NUM_GROUPS = int(
+    os.environ.get('VLLM_EPLB_NUM_GROUPS', '1'))
 _zipfian_cdf_cache: dict[
     tuple[int, torch.device], torch.Tensor] = {}
 
@@ -167,6 +172,65 @@ def zipfian_select_experts(
     result = (weights.to(torch.float32),
               expert_ids.to(torch.int64))
     _zipfian_result_cache[key] = result
+    return result
+
+
+_grouped_zipfian_result_cache: dict[
+    tuple[int, int, int, int, int, torch.device],
+    tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+@torch.compiler.disable
+def grouped_zipfian_select_experts(
+        hidden_states: torch.Tensor,
+        num_experts: int,
+        topk: int,
+        layer_idx: int,
+        num_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Grouped Zipfian routing. Token t picks group
+    g = t % num_groups; topk experts are drawn from
+    the group's group_size = num_experts/num_groups
+    experts via Gumbel-top-k on log-probs
+    log_probs_k = -0.5 * log(k+1). Returned expert IDs
+    are global logical IDs in [g*group_size,
+    (g+1)*group_size). Cached per (M, topk, layer_idx,
+    num_experts, num_groups, device)."""
+    M = hidden_states.shape[0]
+    device = hidden_states.device
+    key = (M, topk, layer_idx, num_experts,
+           num_groups, device)
+    if key in _grouped_zipfian_result_cache:
+        return _grouped_zipfian_result_cache[key]
+    assert num_experts % num_groups == 0
+    group_size = num_experts // num_groups
+    assert topk <= group_size, (
+        f"topk={topk} exceeds group_size={group_size}")
+
+    log_probs = -0.5 * torch.log(torch.arange(
+        1, group_size + 1,
+        dtype=torch.float32, device=device))
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(
+        layer_idx * 1000003 + M * 7 + num_groups * 131)
+    u = torch.rand(M, group_size, generator=gen,
+                   device=device, dtype=torch.float32)
+    u.clamp_(1e-10, 1.0 - 1e-7)
+    gumbel = -torch.log(-torch.log(u))
+    perturbed = log_probs.unsqueeze(0) + gumbel
+    _, local_ids = perturbed.topk(topk, dim=-1)
+
+    group_idx = (torch.arange(M, device=device,
+                              dtype=torch.int64)
+                 % num_groups)
+    offsets = group_idx.unsqueeze(1) * group_size
+    expert_ids = local_ids.to(torch.int64) + offsets
+
+    probs = 1.0 / (local_ids.float() + 1)
+    weights = probs / probs.sum(dim=1, keepdim=True)
+    result = (weights.to(torch.float32), expert_ids)
+    _grouped_zipfian_result_cache[key] = result
     return result
 
 
@@ -829,7 +893,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                .mem_bound_aware_routing)
         eplb_for_select = enable_eplb and not _ir
 
-        if _ZIPFIAN_ROUTING:
+        _route_grouped = _EPLB_NUM_GROUPS > 1
+        if _ZIPFIAN_ROUTING or _route_grouped:
             pf = (self.fused_experts.prepare_finalize
                   if hasattr(self.fused_experts,
                              'prepare_finalize')
@@ -840,10 +905,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # expert count (global_num_experts includes
             # redundant physical copies).
             _n_logical = router_logits.shape[-1]
-            topk_weights, topk_ids = (
-                zipfian_select_experts(
-                    x, _n_logical,
-                    top_k, _layer_idx))
+            if _route_grouped:
+                topk_weights, topk_ids = (
+                    grouped_zipfian_select_experts(
+                        x, _n_logical, top_k,
+                        _layer_idx, _EPLB_NUM_GROUPS))
+            else:
+                topk_weights, topk_ids = (
+                    zipfian_select_experts(
+                        x, _n_logical,
+                        top_k, _layer_idx))
             zero_expert_result = None
         else:
             topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(

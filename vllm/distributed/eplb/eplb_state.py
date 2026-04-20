@@ -26,6 +26,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -45,6 +46,11 @@ from .rebalance_algo import rebalance_experts
 from .rebalance_execute import rearrange_expert_weights_inplace
 
 logger = init_logger(__name__)
+
+# Partition logical experts and ranks into this many groups. Experts in
+# group g live only on ranks in group g. When > 1, EplbState.build() uses
+# build_grouped_initial_maps instead of the default sequential layout.
+_EPLB_NUM_GROUPS = int(os.environ.get("VLLM_EPLB_NUM_GROUPS", "1"))
 
 
 @dataclass
@@ -192,6 +198,120 @@ class EplbState:
 
         return global_physical_to_logical_map
 
+    @staticmethod
+    def build_grouped_initial_maps(
+        num_logical: int,
+        num_physical: int,
+        ep_size: int,
+        num_groups: int,
+        num_moe_layers: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Grouped initial placement.
+
+        Experts and ranks are partitioned into `num_groups` equal groups.
+        Experts in group g live exclusively on ranks [g*R, (g+1)*R) where
+        R = ep_size // num_groups. Within each group the replica count per
+        logical expert follows the greedy min-max-load allocator
+        (equivalent to replicate_experts) driven by Zipfian weights
+        w_k = 1/(k+1). The allocator is capped at R so no logical expert
+        has more replicas than ranks in its group, and the replica-to-rank
+        assignment is constrained so each rank hosts at most one replica
+        of any given logical expert.
+
+        Returns (physical_to_logical_map, logical_to_physical_map,
+        logical_replica_count) with a leading num_moe_layers dim.
+        """
+        G = num_groups
+        assert num_logical % G == 0, (
+            f"num_logical={num_logical} not divisible by G={G}")
+        assert ep_size % G == 0, (
+            f"ep_size={ep_size} not divisible by G={G}")
+        assert num_physical % ep_size == 0, (
+            f"num_physical={num_physical} not divisible by "
+            f"ep_size={ep_size}")
+        S = num_logical // G
+        P_per_group = num_physical // G
+        R = ep_size // G
+        phy_per_rank = num_physical // ep_size
+        assert phy_per_rank * R == P_per_group
+        assert phy_per_rank <= S, (
+            f"phy_per_rank={phy_per_rank} > S={S}; cannot honor "
+            "1-replica-per-rank invariant")
+
+        zipf = [1.0 / (k + 1) for k in range(S)]
+        replica_count = [1] * S
+        redundant_per_group = P_per_group - S
+        for _ in range(redundant_per_group):
+            best = -1
+            best_score = -float("inf")
+            for e in range(S):
+                if replica_count[e] >= R:
+                    continue
+                score = zipf[e] / replica_count[e]
+                if score > best_score:
+                    best_score = score
+                    best = e
+            assert best >= 0, (
+                "grouped placement infeasible: per-rank cap too tight")
+            replica_count[best] += 1
+
+        rank_slots = [0] * R
+        rank_load = [0.0] * R
+        rank_experts: list[list[int]] = [[] for _ in range(R)]
+        exp_order = sorted(
+            range(S), key=lambda e: (-replica_count[e], -zipf[e]))
+        per_replica_load = [zipf[e] / replica_count[e] for e in range(S)]
+        for e in exp_order:
+            cnt = replica_count[e]
+            eligible = [r for r in range(R)
+                        if rank_slots[r] < phy_per_rank]
+            eligible.sort(key=lambda r: rank_load[r])
+            assert len(eligible) >= cnt, (
+                f"grouped placement: only {len(eligible)} eligible ranks "
+                f"for expert {e} needing {cnt} replicas")
+            for r in eligible[:cnt]:
+                rank_experts[r].append(e)
+                rank_slots[r] += 1
+                rank_load[r] += per_replica_load[e]
+        for r in range(R):
+            assert rank_slots[r] == phy_per_rank
+
+        phy_to_log_group = [0] * P_per_group
+        for r in range(R):
+            base = r * phy_per_rank
+            for i, e in enumerate(rank_experts[r]):
+                phy_to_log_group[base + i] = e
+
+        full_phy_to_log: list[int] = []
+        for g in range(G):
+            off = g * S
+            full_phy_to_log.extend(e + off for e in phy_to_log_group)
+
+        max_slots = max(replica_count)
+        p2l = torch.tensor(
+            full_phy_to_log, dtype=torch.int32, device=device)
+        l2p = torch.full(
+            (num_logical, max_slots),
+            -1, dtype=torch.int32, device=device)
+        lcnt = torch.zeros(
+            num_logical, dtype=torch.long, device=device)
+        slot_cursor = [0] * num_logical
+        for phy, log in enumerate(full_phy_to_log):
+            slot = slot_cursor[log]
+            l2p[log, slot] = phy
+            slot_cursor[log] = slot + 1
+        for log in range(num_logical):
+            lcnt[log] = slot_cursor[log]
+
+        p2l = p2l.unsqueeze(0).expand(
+            num_moe_layers, -1).contiguous()
+        l2p = l2p.unsqueeze(0).expand(
+            num_moe_layers, -1, -1).contiguous()
+        lcnt = lcnt.unsqueeze(0).expand(
+            num_moe_layers, -1).contiguous()
+        return p2l, l2p, lcnt
+
     @classmethod
     def build(
         cls,
@@ -205,55 +325,78 @@ class EplbState:
         """
         Build the initial EPLB state.
         """
-        physical_to_logical_map_list = (
-            cls.build_initial_global_physical_to_logical_map(
-                model.num_routed_experts,
-                model.num_redundant_experts,
-                get_ep_group().device_group.size()
-            ))
-        physical_to_logical_map = torch.tensor(
-            physical_to_logical_map_list,
-            device=device,
-        )
-        # Each logical expert can be replicated at most once per EP rank.
-        # Also account for the degenerate zero-load case where the greedy
-        # algorithm may concentrate all redundant replicas on one expert,
-        # producing logcnt.max() = num_redundant_experts + 1.
         ep_size = get_ep_group().device_group.size()
-        max_slots_per_logical_expert = max(
-            ep_size, model.num_redundant_experts + 1)
-        logical_to_physical_map = torch.full(
-            (model.num_logical_experts, max_slots_per_logical_expert),
-            -1,
-            device=device,
-            dtype=torch.int32,
-        )
-        logical_replica_count = torch.zeros(
-            (model.num_logical_experts, ),
-            device=device,
-            dtype=torch.long,
-        )
+        if _EPLB_NUM_GROUPS > 1:
+            # Grouped placement: logical experts in group g live exclusively
+            # on the g-th rank group. Zipfian weights drive replica counts.
+            (physical_to_logical_map, logical_to_physical_map,
+                logical_replica_count) = cls.build_grouped_initial_maps(
+                    model.num_logical_experts,
+                    model.num_physical_experts,
+                    ep_size,
+                    _EPLB_NUM_GROUPS,
+                    model.num_moe_layers,
+                    device,
+                )
+            logger.info(
+                "EPLB grouped placement: G=%d, "
+                "experts/group=%d, ranks/group=%d",
+                _EPLB_NUM_GROUPS,
+                model.num_logical_experts // _EPLB_NUM_GROUPS,
+                ep_size // _EPLB_NUM_GROUPS)
+        else:
+            physical_to_logical_map_list = (
+                cls.build_initial_global_physical_to_logical_map(
+                    model.num_routed_experts,
+                    model.num_redundant_experts,
+                    ep_size,
+                ))
+            physical_to_logical_map = torch.tensor(
+                physical_to_logical_map_list,
+                device=device,
+            )
+            # Each logical expert can be replicated at most once per EP rank.
+            # Also account for the degenerate zero-load case where the greedy
+            # algorithm may concentrate all redundant replicas on one expert,
+            # producing logcnt.max() = num_redundant_experts + 1.
+            max_slots_per_logical_expert = max(
+                ep_size, model.num_redundant_experts + 1)
+            logical_to_physical_map = torch.full(
+                (model.num_logical_experts, max_slots_per_logical_expert),
+                -1,
+                device=device,
+                dtype=torch.int32,
+            )
+            logical_replica_count = torch.zeros(
+                (model.num_logical_experts, ),
+                device=device,
+                dtype=torch.long,
+            )
 
-        for i in range(model.num_physical_experts):
-            logical_idx = physical_to_logical_map[i]
-            logical_to_physical_map[logical_idx,
-                                    logical_replica_count[logical_idx]] = i
-            logical_replica_count[logical_idx] += 1
+            for i in range(model.num_physical_experts):
+                logical_idx = physical_to_logical_map[i]
+                logical_to_physical_map[
+                    logical_idx,
+                    logical_replica_count[logical_idx]] = i
+                logical_replica_count[logical_idx] += 1
 
-        # Duplicate initial mapping for all layers
-        physical_to_logical_map = physical_to_logical_map.unsqueeze(0).expand(
-            model.num_moe_layers,
-            -1,
-        ).contiguous()
-        logical_to_physical_map = logical_to_physical_map.unsqueeze(0).expand(
-            model.num_moe_layers,
-            -1,
-            -1,
-        ).contiguous()
-        logical_replica_count = logical_replica_count.unsqueeze(0).expand(
-            model.num_moe_layers,
-            -1,
-        ).contiguous()
+            # Duplicate initial mapping for all layers
+            physical_to_logical_map = physical_to_logical_map.unsqueeze(
+                0).expand(
+                model.num_moe_layers,
+                -1,
+            ).contiguous()
+            logical_to_physical_map = logical_to_physical_map.unsqueeze(
+                0).expand(
+                model.num_moe_layers,
+                -1,
+                -1,
+            ).contiguous()
+            logical_replica_count = logical_replica_count.unsqueeze(
+                0).expand(
+                model.num_moe_layers,
+                -1,
+            ).contiguous()
 
         expert_load_pass = torch.zeros(
             (model.num_moe_layers, model.num_physical_experts),
