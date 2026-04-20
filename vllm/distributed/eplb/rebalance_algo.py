@@ -12,7 +12,13 @@ Please find at [#12](https://github.com/deepseek-ai/EPLB/issues/12) an example
 on how the EPLB algorithm works.
 """
 
+import os
+
 import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def balanced_packing(weight: torch.Tensor,
@@ -88,8 +94,30 @@ def replicate_experts(
     rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
     logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
     arangen = torch.arange(n, dtype=torch.int64, device=device)
+
+    # Optional per-expert cap. 0 = unlimited (default).
+    # Clamped from below so the budget is always satisfiable
+    # (we must fill num_phy slots across num_log experts).
+    cap = int(os.environ.get(
+        "VLLM_EPLB_MAX_REPLICAS_PER_EXPERT", "0"))
+    if cap > 0:
+        min_required = (num_phy + num_log - 1) // num_log
+        if cap < min_required:
+            logger.warning(
+                "VLLM_EPLB_MAX_REPLICAS_PER_EXPERT=%d is below the "
+                "minimum required cap (%d) for num_phy=%d, "
+                "num_log=%d. Raising cap to %d.",
+                cap, min_required, num_phy, num_log, min_required)
+            cap = min_required
+        neg_inf = torch.tensor(float("-inf"), device=device)
+
     for i in range(num_log, num_phy):
-        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        score = weight / logcnt
+        if cap > 0:
+            # Mask out experts already at the cap so argmax
+            # picks a non-capped expert.
+            score = torch.where(logcnt < cap, score, neg_inf)
+        redundant_indices = score.max(dim=-1).indices
         phy2log[:, i] = redundant_indices
         rank[:, i] = logcnt[arangen, redundant_indices]
         logcnt[arangen, redundant_indices] += 1
