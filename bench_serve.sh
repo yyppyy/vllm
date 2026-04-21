@@ -140,6 +140,8 @@ if (( USE_PROFILER > 0 )); then
     --trace-fork-before-exec=true \
     --sample=process-tree \
     --cuda-graph-trace=node \
+    --gpu-metrics-set=ga100 \
+    --gpu-metrics-device=all \
     --delay 30 \
     --duration 6000 \
     --output="$RES_DIR"/"$RUN_HASH"/profile \
