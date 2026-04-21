@@ -139,8 +139,11 @@ if (( USE_PROFILER > 0 )); then
   # nsys is run via sudo so it can read GPU PMU counters
   # (--gpu-metrics-set / --gpu-metrics-device). Without root,
   # NVreg_RestrictProfilingToAdminUsers=1 makes nsys abort with
-  # ERR_NVGPUCTRPERM. -E preserves PATH/VIRTUAL_ENV.
-  setsid sudo -E nsys profile \
+  # ERR_NVGPUCTRPERM. sudo's secure_path drops the venv, so resolve
+  # vllm's absolute path BEFORE sudo and pass it through.
+  VLLM_BIN=$(command -v vllm)
+  setsid sudo -E env "PATH=$PATH" "VIRTUAL_ENV=$VIRTUAL_ENV" \
+    nsys profile \
     --trace-fork-before-exec=true \
     --sample=process-tree \
     --cuda-graph-trace=node \
@@ -150,7 +153,7 @@ if (( USE_PROFILER > 0 )); then
     --duration 6000 \
     --output="$RES_DIR"/"$RUN_HASH"/profile \
     -- \
-    vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
+    "$VLLM_BIN" "${args[@]}" >"$RES_DIR/$RUN_HASH/server.log" 2>&1 &
   NSYS_PID=$!
   SESSION_PID=$NSYS_PID     # setsid => session leader PID == NSYS_PID
 else
