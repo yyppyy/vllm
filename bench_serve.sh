@@ -136,20 +136,16 @@ sed -i "s|env_with_choices(\"VLLM_ALL2ALL_BACKEND\", \"[^\"]*\"|env_with_choices
 unset VLLM_ALL2ALL_BACKEND
 
 if (( USE_PROFILER > 0 )); then
-  # Optional GPU PMU counters (DRAM throughput, L2 hit rate, etc.).
-  # Requires NVreg_RestrictProfilingToAdminUsers=0 OR running as root
-  # (see https://developer.nvidia.com/ERR_NVGPUCTRPERM).
-  # Off by default; enable with VLLM_NSYS_GPU_METRICS=1.
-  if [ "${VLLM_NSYS_GPU_METRICS:-0}" = "1" ]; then
-    NSYS_METRIC_FLAGS=(--gpu-metrics-set=ga100 --gpu-metrics-device=all)
-  else
-    NSYS_METRIC_FLAGS=()
-  fi
-  setsid nsys profile \
+  # nsys is run via sudo so it can read GPU PMU counters
+  # (--gpu-metrics-set / --gpu-metrics-device). Without root,
+  # NVreg_RestrictProfilingToAdminUsers=1 makes nsys abort with
+  # ERR_NVGPUCTRPERM. -E preserves PATH/VIRTUAL_ENV.
+  setsid sudo -E nsys profile \
     --trace-fork-before-exec=true \
     --sample=process-tree \
     --cuda-graph-trace=node \
-    "${NSYS_METRIC_FLAGS[@]}" \
+    --gpu-metrics-set=ga100 \
+    --gpu-metrics-device=all \
     --delay 30 \
     --duration 6000 \
     --output="$RES_DIR"/"$RUN_HASH"/profile \
