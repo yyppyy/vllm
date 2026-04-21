@@ -2433,35 +2433,44 @@ __global__ void dispatch_and_route_kernel(
       if (routing_mode == 0) {
         // Greedy: one replica per expert.
         // Tie-break on equal rank-active load: prefer the
-        // replica with the SMALLEST physical id. Since
-        // redundant-copy physical ids always live above the
-        // original experts' ids (EPLB appends redundants
-        // after the base logical->physical mapping), this
-        // tie-break biases the chosen slot toward each
-        // rank's "original" section [0..num_logical/ws-1]
-        // over the "redundant" section. Keeps the active
-        // expert-id set contiguous on each rank, which
-        // matters for memory-access locality under grouping
-        // (G>1) where mode-0 only has ws/G replicas to
-        // pick from and the previous rank-id tie-break let
-        // redundant slots win ~50% of the time.
+        // replica with the SMALLEST LOCAL SLOT INDEX
+        // (= phys % epr). Under the grouped two-phase
+        // placement, originals live at slots 0..S/R-1 and
+        // redundants at slots S/R..phy_per_rank-1, so
+        // "smaller slot" biases the pick toward the
+        // original replica and keeps each rank's active
+        // expert set contiguous in the low-slot range.
+        //
+        // Note: comparing `phys` itself wouldn't do this —
+        // phys = rank*epr + slot, so phys ordering is
+        // dominated by rank and is equivalent to the old
+        // "smaller rank" tie-break (a no-op). The slot
+        // extraction below is what actually changes mode-0's
+        // behavior.
         for (int32_t idx = 0; idx < nm; idx++) {
           const int32_t e = s_multi_experts[idx];
           int32_t rc = s_replica_count[e];
           if (rc > max_rep) rc = max_rep;
-          int32_t best_phys = INT_MAX;
+          int32_t best_phys = -1;
           int32_t best_rank = -1;
           int32_t best_cost = INT_MAX;
+          int32_t best_slot = INT_MAX;
           for (int32_t i = 0; i < rc; i++) {
             const int32_t phys =
                 s_l2p_map[e * max_rep + i];
             const int32_t r = phys / epr;
             const int32_t c = rank_active[r];
-            if (c < best_cost ||
-                (c == best_cost && phys < best_phys)) {
+            const int32_t slot = phys - r * epr;
+            const bool better =
+                (c < best_cost)
+                || (c == best_cost && slot < best_slot)
+                || (c == best_cost && slot == best_slot
+                    && r < best_rank);
+            if (better) {
               best_cost = c;
               best_rank = r;
               best_phys = phys;
+              best_slot = slot;
             }
           }
           routing_sel[e] = best_phys;
