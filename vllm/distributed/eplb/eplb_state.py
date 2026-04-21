@@ -256,26 +256,91 @@ class EplbState:
                 "grouped placement infeasible: per-rank cap too tight")
             replica_count[best] += 1
 
-        rank_slots = [0] * R
+        # Two-phase placement (keeps redundants on distinct ranks
+        # from their originals, so each rank's slots 0..S/R-1 hold
+        # unique experts and slots S/R..phy_per_rank-1 hold
+        # redundants of experts whose originals are on other ranks):
+        #
+        #   Phase 1: place ONE replica of every logical expert,
+        #            greedy least-load, with a hot/cold count quota
+        #            per rank so hot replication is balanced.
+        #   Phase 2: place each extra replica of a hot expert on a
+        #            rank that doesn't already host it and still
+        #            has a redundant slot free.
+        originals_per_rank = S // R
+        redundants_per_rank = phy_per_rank - originals_per_rank
+        H = sum(1 for c in replica_count if c > 1)
+        assert originals_per_rank * R == S, (
+            f"S={S} not divisible by R={R}")
+        assert H % R == 0, (
+            f"grouped placement: H={H} (#experts with rc>1) not "
+            f"divisible by R={R}; replica_count={replica_count}")
+        hot_quota = H // R
+        cold_quota = originals_per_rank - hot_quota
+        assert cold_quota >= 0 and cold_quota * R == S - H
+
         rank_load = [0.0] * R
         rank_experts: list[list[int]] = [[] for _ in range(R)]
-        exp_order = sorted(
-            range(S), key=lambda e: (-replica_count[e], -zipf[e]))
-        per_replica_load = [zipf[e] / replica_count[e] for e in range(S)]
-        for e in exp_order:
-            cnt = replica_count[e]
-            eligible = [r for r in range(R)
-                        if rank_slots[r] < phy_per_rank]
-            eligible.sort(key=lambda r: rank_load[r])
-            assert len(eligible) >= cnt, (
-                f"grouped placement: only {len(eligible)} eligible ranks "
-                f"for expert {e} needing {cnt} replicas")
-            for r in eligible[:cnt]:
-                rank_experts[r].append(e)
-                rank_slots[r] += 1
-                rank_load[r] += per_replica_load[e]
+        hot_count = [0] * R
+        cold_count = [0] * R
+        per_replica_load = [zipf[e] / replica_count[e]
+                            for e in range(S)]
+
+        # Phase 1: originals, iterated by hotness so load balance
+        # sees the biggest experts first.
+        for e in range(S):
+            is_hot = replica_count[e] > 1
+            if is_hot:
+                eligible = [r for r in range(R)
+                            if hot_count[r] < hot_quota]
+            else:
+                eligible = [r for r in range(R)
+                            if cold_count[r] < cold_quota]
+            assert eligible, (
+                f"grouped placement phase 1: no eligible rank for "
+                f"expert {e} (hot={is_hot}, hot_count={hot_count}, "
+                f"cold_count={cold_count})")
+            r = min(eligible, key=lambda r: (rank_load[r], r))
+            rank_experts[r].append(e)
+            rank_load[r] += per_replica_load[e]
+            if is_hot:
+                hot_count[r] += 1
+            else:
+                cold_count[r] += 1
+
         for r in range(R):
-            assert rank_slots[r] == phy_per_rank
+            assert len(rank_experts[r]) == originals_per_rank, (
+                f"phase 1 under-filled rank {r}: "
+                f"{len(rank_experts[r])}/{originals_per_rank}")
+
+        # Phase 2: redundants of hot experts, by hotness priority.
+        # For each extra replica, place on the rank with fewest
+        # redundants so far that doesn't already host the expert.
+        redundants_added = [0] * R
+        for e in range(S):
+            extras = replica_count[e] - 1
+            for _ in range(extras):
+                cands = [r for r in range(R)
+                         if e not in rank_experts[r]]
+                cands.sort(
+                    key=lambda r: (redundants_added[r], r))
+                placed = False
+                for r in cands:
+                    if redundants_added[r] < redundants_per_rank:
+                        rank_experts[r].append(e)
+                        redundants_added[r] += 1
+                        placed = True
+                        break
+                assert placed, (
+                    f"phase 2: failed to add redundant for expert "
+                    f"{e} (candidates={cands}, "
+                    f"redundants_added={redundants_added}, "
+                    f"cap={redundants_per_rank})")
+
+        for r in range(R):
+            assert len(rank_experts[r]) == phy_per_rank, (
+                f"phase 2 under-filled rank {r}: "
+                f"{len(rank_experts[r])}/{phy_per_rank}")
 
         phy_to_log_group = [0] * P_per_group
         for r in range(R):
