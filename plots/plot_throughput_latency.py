@@ -6,13 +6,13 @@ Groups by dataset (0=random, 2=sharegpt) and backend configuration.
 """
 
 import json
+import math
 import os
 import re
 import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 
 RESULTS_DIR = Path("results/vllm_results_final")
 OUTPUT_DIR = Path("plots")
@@ -93,20 +93,42 @@ def parse_dirname(dirname):
     return None
 
 
-def aggregate_bench_files(paths):
-    """Pool per-prompt TTFT/TPOT across one or more bench_result*.json files.
+def trim_top(values):
+    """Drop the top max(1, ceil(1% * n)) values; return the rest.
 
-    P99 is computed from the pooled distribution (not averaged across files);
-    throughput is the simple average of total_token_throughput across files.
-    Falls back to per-file aggregate p99_*_ms when --save-detailed data is
-    absent (legacy result files).
+    Targets the structural prefill-queue tail where each client run
+    exhibits a small number of "always-slow" prompts.
     """
+    n = len(values)
+    if n == 0:
+        return []
+    k = max(1, math.ceil(0.01 * n))
+    if k >= n:
+        return []
+    return sorted(values, reverse=True)[k:]
+
+
+def aggregate_bench_files(paths):
+    """Aggregate one or more bench_result*.json files for a single run.
+
+    Throughput is the simple average of total_token_throughput across
+    files. P99 latency uses ONLY the last client (highest CLIENT_IDX):
+    trim its top max(1, ceil(1% * n_last)) per-prompt latencies and
+    return the largest remaining value. Falls back to per-file aggregate
+    p99_*_ms when --save-detailed data is absent (legacy result files).
+    """
+    def client_idx(p):
+        m = re.search(r"bench_result_(\d+)\.json$", p.name)
+        return int(m.group(1)) if m else -1
+
+    paths = sorted(paths, key=client_idx)
+
     throughputs = []
-    pooled_ttft_ms = []
-    pooled_tpot_ms = []
+    last_ttft_ms = []
+    last_tpot_ms = []
     legacy_p99_ttft = []
     legacy_p99_tpot = []
-    for p in paths:
+    for i, p in enumerate(paths):
         try:
             data = json.loads(p.read_text())
         except json.JSONDecodeError:
@@ -114,28 +136,32 @@ def aggregate_bench_files(paths):
             continue
         if "total_token_throughput" in data:
             throughputs.append(data["total_token_throughput"])
+        is_last = (i == len(paths) - 1)
         ttfts = data.get("ttfts")  # seconds, per request
         itls = data.get("itls")    # seconds, list[list] per request
         olens = data.get("output_lens")
         has_detailed = bool(ttfts) and bool(itls) and bool(olens)
-        if has_detailed:
-            for ttft_s, itl_list, out_len in zip(ttfts, itls, olens):
-                pooled_ttft_ms.append(ttft_s * 1000.0)
-                if out_len > 1 and itl_list:
-                    pooled_tpot_ms.append(
-                        (sum(itl_list) / (out_len - 1)) * 1000.0)
-        else:
-            # Legacy aggregate-only file.
-            if "p99_ttft_ms" in data:
-                legacy_p99_ttft.append(data["p99_ttft_ms"])
-            if "p99_tpot_ms" in data:
-                legacy_p99_tpot.append(data["p99_tpot_ms"])
+        if is_last:
+            if has_detailed:
+                last_ttft_ms = [t * 1000.0 for t in ttfts]
+                last_tpot_ms = [
+                    (sum(il) / (ol - 1)) * 1000.0
+                    for il, ol in zip(itls, olens) if ol > 1 and il
+                ]
+            else:
+                # Legacy aggregate-only file: no per-prompt data to trim.
+                if "p99_ttft_ms" in data:
+                    legacy_p99_ttft.append(data["p99_ttft_ms"])
+                if "p99_tpot_ms" in data:
+                    legacy_p99_tpot.append(data["p99_tpot_ms"])
     if not throughputs:
         return None
     avg_throughput = sum(throughputs) / len(throughputs)
-    if pooled_ttft_ms and pooled_tpot_ms:
-        p99_ttft = float(np.percentile(pooled_ttft_ms, 99))
-        p99_tpot = float(np.percentile(pooled_tpot_ms, 99))
+    if last_ttft_ms and last_tpot_ms:
+        trimmed_ttft = trim_top(last_ttft_ms)
+        trimmed_tpot = trim_top(last_tpot_ms)
+        p99_ttft = max(trimmed_ttft) if trimmed_ttft else 0
+        p99_tpot = max(trimmed_tpot) if trimmed_tpot else 0
     else:
         p99_ttft = (sum(legacy_p99_ttft) / len(legacy_p99_ttft)
                     if legacy_p99_ttft else 0)
