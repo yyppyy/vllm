@@ -16,11 +16,19 @@ import matplotlib.pyplot as plt
 RESULTS_DIR = Path("results/vllm_results_final")
 OUTPUT_DIR = Path("plots")
 
+# Knobs: change these to plot a different model / group size.
+MODEL_FILTER = "Qwen3-30B-A3B-8-128"
+GROUP_FILTER = 1
+
 # Directory name format:
-# {gpus}_{ep}_{use_ep}_{replicas}_{batch}_{routing}_{backend}_{dataset}_{profiler}_{threshold}_{model}
-# e.g. 8_8_1_64_32_2_dispatch_combine_0_0_256_Qwen3-30B-A3B-4-128
+# {gpus}_{ep}_{use_ep}_{replicas}_{batch}_{routing}_{backend}_{dataset}_{profiler}_{threshold}_{model}_g{groups}
+# e.g. 8_8_1_64_32_2_dispatch_combine_0_0_256_Qwen3-30B-A3B-8-128_g1
+
+# Threshold sentinel meaning "match any threshold > 0".
+ANY_POSITIVE = ">0"
 
 # Legend configurations: (use_ep, replicas, backend, threshold) -> label
+# threshold is either an exact int or the ANY_POSITIVE sentinel.
 CONFIGS = {
     # TP: use_ep=0, backend=allgather_reducescatter
     (0, 0, "allgather_reducescatter", 0): {
@@ -40,8 +48,8 @@ CONFIGS = {
         "color": "#2ca02c",
         "marker": "^",
     },
-    # METRO 1.5x: use_ep=1, 64 rep, threshold=256
-    (1, 64, "dispatch_combine", 256): {
+    # METRO 1.5x: use_ep=1, 64 rep, any threshold > 0
+    (1, 64, "dispatch_combine", ANY_POSITIVE): {
         "label": "METRO 1.5x",
         "color": "#d62728",
         "marker": "D",
@@ -49,20 +57,21 @@ CONFIGS = {
 }
 
 DATASET_NAMES = {
-    0: "Random",
+    0: "InstructCoder",
     2: "ShareGPT",
 }
 
 
 def parse_dirname(dirname):
     """Parse result directory name into config dict."""
-    # Match: {gpus}_{ep}_{use_ep}_{replicas}_{batch}_{routing}_{backend}_{dataset}_{profiler}_{threshold}_{model}
-    # backend can be multi-word with underscores, so match known backends
+    # Match: {gpus}_{ep}_{use_ep}_{replicas}_{batch}_{routing}_{backend}_{dataset}_{profiler}_{threshold}_{model}[_g{groups}]
+    # backend can be multi-word with underscores, so match known backends.
+    # _g{groups} suffix is optional for backward compatibility with older runs.
     for backend_name in ["allgather_reducescatter", "dispatch_combine"]:
         pattern = (
             r"^(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_"
             + re.escape(backend_name)
-            + r"_(\d+)_(\d+)_(\d+)_(.+)$"
+            + r"_(\d+)_(\d+)_(\d+)_(.+?)(?:_g(\d+))?$"
         )
         m = re.match(pattern, dirname)
         if m:
@@ -78,6 +87,7 @@ def parse_dirname(dirname):
                 "profiler": int(m.group(8)),
                 "threshold": int(m.group(9)),
                 "model": m.group(10),
+                "groups": int(m.group(11)) if m.group(11) else 1,
             }
     return None
 
@@ -107,9 +117,12 @@ def load_results():
     return results
 
 
-def filter_model(results, model_prefix="Qwen3"):
-    """Filter results for a specific model prefix."""
-    return [r for r in results if model_prefix in r.get("model", "")]
+def filter_results(results, model=MODEL_FILTER, groups=GROUP_FILTER):
+    """Filter results for a specific model and EPLB group size."""
+    return [
+        r for r in results
+        if r.get("model") == model and r.get("groups") == groups
+    ]
 
 
 def plot_dataset(results, dataset_id, metric, ylabel, filename):
@@ -118,6 +131,10 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
 
     for config_key, style in CONFIGS.items():
         use_ep, replicas, backend, threshold = config_key
+        if threshold == ANY_POSITIVE:
+            thr_match = lambda t: t > 0
+        else:
+            thr_match = lambda t, th=threshold: t == th
         # Filter matching results
         pts = [
             r for r in results
@@ -125,7 +142,7 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
             and r["use_ep"] == use_ep
             and r["replicas"] == replicas
             and r["backend"] == backend
-            and r["threshold"] == threshold
+            and thr_match(r["threshold"])
         ]
         if not pts:
             continue
@@ -157,6 +174,8 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
     ax.set_title(f"{dataset_name}: {ylabel} vs Throughput", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
     fig.tight_layout()
 
     out_path = OUTPUT_DIR / filename
@@ -168,8 +187,8 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
 def main():
     print("Loading results...")
     results = load_results()
-    results = filter_model(results, "Qwen3")
-    print(f"Found {len(results)} Qwen3 results")
+    results = filter_results(results)
+    print(f"Found {len(results)} results for model={MODEL_FILTER} g{GROUP_FILTER}")
 
     if not results:
         print("No results found!")
