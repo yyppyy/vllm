@@ -196,7 +196,7 @@ echo "=== Warmup: sending $WARMUP_PROMPTS requests ==="
 vllm bench serve "${warmup_args[@]}"
 
 # Real benchmark run (EPLB already rebalanced, no interference)
-if (( NUM_PROMPTS * NUM_GPUS >= 128 )); then
+if (( NUM_PROMPTS >= 128 )); then
   BENCH_NUM_PROMPTS=$NUM_PROMPTS
 else
   BENCH_NUM_PROMPTS=128
