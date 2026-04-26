@@ -196,6 +196,11 @@ echo "=== Warmup: sending $WARMUP_PROMPTS requests ==="
 vllm bench serve "${warmup_args[@]}"
 
 # Real benchmark run (EPLB already rebalanced, no interference)
+if (( NUM_PROMPTS * NUM_GPUS >= 128 )); then
+  BENCH_NUM_PROMPTS=$NUM_PROMPTS
+else
+  BENCH_NUM_PROMPTS=128
+fi
 cli_args=(
     --model "$MODEL_DIR"
     --backend vllm
@@ -205,7 +210,7 @@ cli_args=(
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 2400
     --port "$PORT"
-    --num-prompts $NUM_PROMPTS
+    --num-prompts $BENCH_NUM_PROMPTS
     --max-concurrency $NUM_PROMPTS
 )
 if [[ "$DATASET_NAME" == "random" ]]; then
@@ -220,7 +225,7 @@ fi
 #   cli_args+=( --profile )
 # fi
 
-echo "=== Benchmark: sending $NUM_PROMPTS requests ==="
+echo "=== Benchmark: sending $BENCH_NUM_PROMPTS requests ==="
 vllm bench serve "${cli_args[@]}"
 
 
