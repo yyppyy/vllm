@@ -195,38 +195,48 @@ fi
 echo "=== Warmup: sending $WARMUP_PROMPTS requests ==="
 vllm bench serve "${warmup_args[@]}"
 
-# Real benchmark run (EPLB already rebalanced, no interference)
-if (( NUM_PROMPTS >= 128 )); then
-  BENCH_NUM_PROMPTS=$NUM_PROMPTS
+# Real benchmark run (EPLB already rebalanced, no interference).
+# Run multiple sequential clients to gather >=TARGET_TOTAL_PROMPTS total
+# prompts for stable percentiles. Each client uses the same NUM_PROMPTS as
+# both --num-prompts and --max-concurrency, so the in-flight load matches
+# the configured batch capacity. The plotting script pools per-prompt
+# latencies across these per-client files.
+TARGET_TOTAL_PROMPTS=128
+if (( NUM_PROMPTS >= TARGET_TOTAL_PROMPTS )); then
+  NUM_CLIENT_RUNS=1
 else
-  BENCH_NUM_PROMPTS=128
-fi
-cli_args=(
-    --model "$MODEL_DIR"
-    --backend vllm
-    --save-result
-    --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result.json
-    --percentile-metrics ttft,tpot,itl,e2el
-    --metric-percentiles 10,20,30,40,50,95,99
-    --ready-check-timeout-sec 2400
-    --port "$PORT"
-    --num-prompts $BENCH_NUM_PROMPTS
-    --max-concurrency $NUM_PROMPTS
-)
-if [[ "$DATASET_NAME" == "random" ]]; then
-  cli_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
-elif [[ "$DATASET_NAME" == "sharegpt" ]]; then
-  cli_args+=( --dataset-name sharegpt --dataset-path ./datasets/ShareGPT_V3_unfiltered_cleaned_split.json --sharegpt-output-len $OUTPUT_LEN )
-else
-  cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" --hf-output-len $OUTPUT_LEN )
+  NUM_CLIENT_RUNS=$(( (TARGET_TOTAL_PROMPTS + NUM_PROMPTS - 1) / NUM_PROMPTS ))
 fi
 
-# if (( USE_PROFILER > 0 )); then
-#   cli_args+=( --profile )
-# fi
+# Wipe any stale bench_result*.json from a previous run at the same hash.
+rm -f "$RES_DIR"/"$RUN_HASH"/bench_result*.json
 
-echo "=== Benchmark: sending $BENCH_NUM_PROMPTS requests ==="
-vllm bench serve "${cli_args[@]}"
+for ((CLIENT_IDX=0; CLIENT_IDX<NUM_CLIENT_RUNS; CLIENT_IDX++)); do
+  cli_args=(
+      --model "$MODEL_DIR"
+      --backend vllm
+      --save-result
+      --save-detailed
+      --seed $CLIENT_IDX
+      --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result_${CLIENT_IDX}.json
+      --percentile-metrics ttft,tpot,itl,e2el
+      --metric-percentiles 10,20,30,40,50,95,99
+      --ready-check-timeout-sec 2400
+      --port "$PORT"
+      --num-prompts $NUM_PROMPTS
+      --max-concurrency $NUM_PROMPTS
+  )
+  if [[ "$DATASET_NAME" == "random" ]]; then
+    cli_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
+  elif [[ "$DATASET_NAME" == "sharegpt" ]]; then
+    cli_args+=( --dataset-name sharegpt --dataset-path ./datasets/ShareGPT_V3_unfiltered_cleaned_split.json --sharegpt-output-len $OUTPUT_LEN )
+  else
+    cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" --hf-output-len $OUTPUT_LEN )
+  fi
+
+  echo "=== Bench client $((CLIENT_IDX+1))/$NUM_CLIENT_RUNS: sending $NUM_PROMPTS requests (seed=$CLIENT_IDX) ==="
+  vllm bench serve "${cli_args[@]}"
+done
 
 
 ############## kill server & collect profile and logs ##############

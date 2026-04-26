@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 RESULTS_DIR = Path("results/vllm_results_final")
 OUTPUT_DIR = Path("plots")
@@ -92,27 +93,85 @@ def parse_dirname(dirname):
     return None
 
 
+def aggregate_bench_files(paths):
+    """Pool per-prompt TTFT/TPOT across one or more bench_result*.json files.
+
+    P99 is computed from the pooled distribution (not averaged across files);
+    throughput is the simple average of total_token_throughput across files.
+    Falls back to per-file aggregate p99_*_ms when --save-detailed data is
+    absent (legacy result files).
+    """
+    throughputs = []
+    pooled_ttft_ms = []
+    pooled_tpot_ms = []
+    legacy_p99_ttft = []
+    legacy_p99_tpot = []
+    for p in paths:
+        try:
+            data = json.loads(p.read_text())
+        except json.JSONDecodeError:
+            print(f"  Skipping invalid JSON: {p}")
+            continue
+        if "total_token_throughput" in data:
+            throughputs.append(data["total_token_throughput"])
+        ttfts = data.get("ttfts")  # seconds, per request
+        itls = data.get("itls")    # seconds, list[list] per request
+        olens = data.get("output_lens")
+        has_detailed = bool(ttfts) and bool(itls) and bool(olens)
+        if has_detailed:
+            for ttft_s, itl_list, out_len in zip(ttfts, itls, olens):
+                pooled_ttft_ms.append(ttft_s * 1000.0)
+                if out_len > 1 and itl_list:
+                    pooled_tpot_ms.append(
+                        (sum(itl_list) / (out_len - 1)) * 1000.0)
+        else:
+            # Legacy aggregate-only file.
+            if "p99_ttft_ms" in data:
+                legacy_p99_ttft.append(data["p99_ttft_ms"])
+            if "p99_tpot_ms" in data:
+                legacy_p99_tpot.append(data["p99_tpot_ms"])
+    if not throughputs:
+        return None
+    avg_throughput = sum(throughputs) / len(throughputs)
+    if pooled_ttft_ms and pooled_tpot_ms:
+        p99_ttft = float(np.percentile(pooled_ttft_ms, 99))
+        p99_tpot = float(np.percentile(pooled_tpot_ms, 99))
+    else:
+        p99_ttft = (sum(legacy_p99_ttft) / len(legacy_p99_ttft)
+                    if legacy_p99_ttft else 0)
+        p99_tpot = (sum(legacy_p99_tpot) / len(legacy_p99_tpot)
+                    if legacy_p99_tpot else 0)
+    return {
+        "throughput": avg_throughput,
+        "p99_ttft": p99_ttft,
+        "p99_tpot": p99_tpot,
+    }
+
+
 def load_results():
-    """Load all bench_result.json files."""
+    """Load and aggregate per-run bench_result*.json files."""
     results = []
     for d in sorted(RESULTS_DIR.iterdir()):
         if not d.is_dir():
-            continue
-        bench_file = d / "bench_result.json"
-        if not bench_file.exists():
             continue
         cfg = parse_dirname(d.name)
         if cfg is None:
             print(f"  Skipping unparseable dir: {d.name}")
             continue
-        try:
-            data = json.loads(bench_file.read_text())
-        except json.JSONDecodeError:
-            print(f"  Skipping invalid JSON: {bench_file}")
+        # Prefer multi-client bench_result_*.json; fall back to legacy
+        # single-file bench_result.json.
+        bench_files = sorted(d.glob("bench_result_*.json"))
+        if not bench_files:
+            legacy = d / "bench_result.json"
+            if legacy.exists():
+                bench_files = [legacy]
+        if not bench_files:
             continue
-        cfg["throughput"] = data.get("total_token_throughput", 0)
-        cfg["p99_tpot"] = data.get("p99_tpot_ms", 0)
-        cfg["p99_ttft"] = data.get("p99_ttft_ms", 0)
+        agg = aggregate_bench_files(bench_files)
+        if agg is None:
+            print(f"  Skipping, no usable data: {d.name}")
+            continue
+        cfg.update(agg)
         results.append(cfg)
     return results
 
