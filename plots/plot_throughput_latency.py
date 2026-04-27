@@ -59,6 +59,7 @@ CONFIGS = {
 
 DATASET_NAMES = {
     0: "InstructCoder",
+    1: "TextEdit",
     2: "ShareGPT",
 }
 
@@ -283,7 +284,7 @@ def main():
     datasets = sorted(set(r["dataset"] for r in results))
     print(f"Datasets: {datasets}")
 
-    for ds in [0, 2]:
+    for ds in [0, 1, 2]:
         if ds not in datasets:
             print(f"  Dataset {ds} not found, skipping")
             continue
