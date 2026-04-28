@@ -17,8 +17,7 @@ import matplotlib.pyplot as plt
 RESULTS_DIR = Path("results/vllm_results_final")
 OUTPUT_DIR = Path("plots")
 
-# Knobs: change these to plot a different model / group size.
-MODEL_FILTER = "Qwen3-30B-A3B-8-128"
+# Knob: only group size is filtered globally; model is iterated per-run.
 GROUP_FILTER = 1
 
 # Directory name format:
@@ -28,34 +27,47 @@ GROUP_FILTER = 1
 # Threshold sentinel meaning "match any threshold > 0".
 ANY_POSITIVE = ">0"
 
-# Legend configurations: (use_ep, replicas, backend, threshold) -> label
-# threshold is either an exact int or the ANY_POSITIVE sentinel.
-CONFIGS = {
-    # TP: use_ep=0, backend=allgather_reducescatter
-    (0, 0, "allgather_reducescatter", 0): {
-        "label": "TP",
-        "color": "#1f77b4",
-        "marker": "o",
-    },
-    # EP 1.0x: use_ep=1, 0 rep, dispatch_combine
-    (1, 0, "dispatch_combine", 0): {
-        "label": "EP 1.0x",
-        "color": "#ff7f0e",
-        "marker": "s",
-    },
-    # EP 1.5x: use_ep=1, 64 rep, threshold=0
-    (1, 64, "dispatch_combine", 0): {
-        "label": "EP 1.5x",
-        "color": "#2ca02c",
-        "marker": "^",
-    },
-    # METRO 1.5x: use_ep=1, 64 rep, any threshold > 0
-    (1, 64, "dispatch_combine", ANY_POSITIVE): {
-        "label": "METRO 1.5x",
-        "color": "#d62728",
-        "marker": "D",
-    },
-}
+
+def model_num_experts(model_name):
+    """Extract num_experts from a "...-{topk}-{num_experts}" model name.
+
+    Returns None if the suffix isn't an integer.
+    """
+    m = re.search(r"-(\d+)$", model_name or "")
+    return int(m.group(1)) if m else None
+
+
+def build_configs(replicas_15x):
+    """Legend configurations keyed by (use_ep, replicas, backend, threshold).
+
+    The 1.5x rows use replicas_15x = num_experts // 2 for the current model.
+    """
+    return {
+        # TP: use_ep=0, backend=allgather_reducescatter
+        (0, 0, "allgather_reducescatter", 0): {
+            "label": "TP",
+            "color": "#1f77b4",
+            "marker": "o",
+        },
+        # EP 1.0x: use_ep=1, 0 rep, dispatch_combine
+        (1, 0, "dispatch_combine", 0): {
+            "label": "EP 1.0x",
+            "color": "#ff7f0e",
+            "marker": "s",
+        },
+        # EP 1.5x: use_ep=1, replicas_15x rep, threshold=0
+        (1, replicas_15x, "dispatch_combine", 0): {
+            "label": "EP 1.5x",
+            "color": "#2ca02c",
+            "marker": "^",
+        },
+        # METRO 1.5x: use_ep=1, replicas_15x rep, any threshold > 0
+        (1, replicas_15x, "dispatch_combine", ANY_POSITIVE): {
+            "label": "METRO 1.5x",
+            "color": "#d62728",
+            "marker": "D",
+        },
+    }
 
 DATASET_NAMES = {
     0: "InstructCoder",
@@ -113,10 +125,11 @@ def aggregate_bench_files(paths):
     """Aggregate one or more bench_result*.json files for a single run.
 
     Throughput is the simple average of total_token_throughput across
-    files. P99 latency uses ONLY the last client (highest CLIENT_IDX):
-    trim its top max(1, ceil(1% * n_last)) per-prompt latencies and
-    return the largest remaining value. Falls back to per-file aggregate
-    p99_*_ms when --save-detailed data is absent (legacy result files).
+    files. P99 and mean latency both use ONLY the last client (highest
+    CLIENT_IDX) after trimming its top max(1, ceil(1% * n_last))
+    per-prompt latencies; the trimmed set's max is reported as P99 and
+    its arithmetic mean as the mean. Falls back to per-file aggregate
+    {p99,mean}_*_ms when --save-detailed data is absent (legacy files).
     """
     def client_idx(p):
         m = re.search(r"bench_result_(\d+)\.json$", p.name)
@@ -127,8 +140,8 @@ def aggregate_bench_files(paths):
     throughputs = []
     last_ttft_ms = []
     last_tpot_ms = []
-    legacy_p99_ttft = []
-    legacy_p99_tpot = []
+    legacy = {k: [] for k in
+              ("p99_ttft", "p99_tpot", "mean_ttft", "mean_tpot")}
     for i, p in enumerate(paths):
         try:
             data = json.loads(p.read_text())
@@ -151,27 +164,35 @@ def aggregate_bench_files(paths):
                 ]
             else:
                 # Legacy aggregate-only file: no per-prompt data to trim.
-                if "p99_ttft_ms" in data:
-                    legacy_p99_ttft.append(data["p99_ttft_ms"])
-                if "p99_tpot_ms" in data:
-                    legacy_p99_tpot.append(data["p99_tpot_ms"])
+                for key in legacy:
+                    field = f"{key}_ms"
+                    if field in data:
+                        legacy[key].append(data[field])
     if not throughputs:
         return None
     avg_throughput = sum(throughputs) / len(throughputs)
+
+    def _avg(xs):
+        return sum(xs) / len(xs) if xs else 0
+
     if last_ttft_ms and last_tpot_ms:
         trimmed_ttft = trim_top(last_ttft_ms)
         trimmed_tpot = trim_top(last_tpot_ms)
         p99_ttft = max(trimmed_ttft) if trimmed_ttft else 0
         p99_tpot = max(trimmed_tpot) if trimmed_tpot else 0
+        mean_ttft = _avg(trimmed_ttft)
+        mean_tpot = _avg(trimmed_tpot)
     else:
-        p99_ttft = (sum(legacy_p99_ttft) / len(legacy_p99_ttft)
-                    if legacy_p99_ttft else 0)
-        p99_tpot = (sum(legacy_p99_tpot) / len(legacy_p99_tpot)
-                    if legacy_p99_tpot else 0)
+        p99_ttft = _avg(legacy["p99_ttft"])
+        p99_tpot = _avg(legacy["p99_tpot"])
+        mean_ttft = _avg(legacy["mean_ttft"])
+        mean_tpot = _avg(legacy["mean_tpot"])
     return {
         "throughput": avg_throughput,
         "p99_ttft": p99_ttft,
         "p99_tpot": p99_tpot,
+        "mean_ttft": mean_ttft,
+        "mean_tpot": mean_tpot,
     }
 
 
@@ -203,19 +224,17 @@ def load_results():
     return results
 
 
-def filter_results(results, model=MODEL_FILTER, groups=GROUP_FILTER):
-    """Filter results for a specific model and EPLB group size."""
-    return [
-        r for r in results
-        if r.get("model") == model and r.get("groups") == groups
-    ]
+def model_slug(model_name):
+    """Filename-safe lowercase form of a model name."""
+    return re.sub(r"[^a-z0-9]+", "-", model_name.lower()).strip("-")
 
 
-def plot_dataset(results, dataset_id, metric, ylabel, filename):
-    """Plot throughput vs metric for one dataset."""
+def plot_dataset(results, model, configs, dataset_id, metric, ylabel,
+                 filename):
+    """Plot throughput vs metric for one (model, dataset)."""
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for config_key, style in CONFIGS.items():
+    for config_key, style in configs.items():
         use_ep, replicas, backend, threshold = config_key
         if threshold == ANY_POSITIVE:
             thr_match = lambda t: t > 0
@@ -257,7 +276,8 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
     dataset_name = DATASET_NAMES.get(dataset_id, f"Dataset {dataset_id}")
     ax.set_xlabel(ylabel, fontsize=12)
     ax.set_ylabel("Total Token Throughput (tok/s)", fontsize=12)
-    ax.set_title(f"{dataset_name}: {ylabel} vs Throughput", fontsize=13)
+    ax.set_title(f"{model} | {dataset_name}: {ylabel} vs Throughput",
+                 fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
@@ -273,28 +293,57 @@ def plot_dataset(results, dataset_id, metric, ylabel, filename):
 def main():
     print("Loading results...")
     results = load_results()
-    results = filter_results(results)
-    print(f"Found {len(results)} results for model={MODEL_FILTER} g{GROUP_FILTER}")
-
+    # Filter by group only; iterate over all available models.
+    results = [r for r in results if r.get("groups") == GROUP_FILTER]
     if not results:
-        print("No results found!")
+        print(f"No results found for g{GROUP_FILTER}!")
         sys.exit(1)
 
-    # Find which datasets are available
-    datasets = sorted(set(r["dataset"] for r in results))
-    print(f"Datasets: {datasets}")
+    models = sorted({r["model"] for r in results})
+    print(f"Models (g{GROUP_FILTER}): {models}")
 
-    for ds in [0, 1, 2]:
-        if ds not in datasets:
-            print(f"  Dataset {ds} not found, skipping")
-            continue
-        ds_name = DATASET_NAMES.get(ds, str(ds)).lower()
-        plot_dataset(results, ds, "p99_tpot",
-                     "P99 TPOT (ms)",
-                     f"throughput_vs_p99tpot_{ds_name}.pdf")
-        plot_dataset(results, ds, "p99_ttft",
-                     "P99 TTFT (ms)",
-                     f"throughput_vs_p99ttft_{ds_name}.pdf")
+    for model in models:
+        model_results = [r for r in results if r["model"] == model]
+        num_experts = model_num_experts(model)
+        if num_experts is not None:
+            replicas_15x = num_experts // 2
+            replicas_src = f"name (num_experts={num_experts})"
+        else:
+            # Fall back to observed replicas in the data: the largest
+            # nonzero replicas seen for use_ep=1 runs is the 1.5x count.
+            observed = sorted({
+                r["replicas"] for r in model_results
+                if r["use_ep"] == 1 and r["replicas"] > 0
+            })
+            if observed:
+                replicas_15x = max(observed)
+                replicas_src = f"data (observed nonzero replicas={observed})"
+            else:
+                replicas_15x = -1  # unmatchable
+                replicas_src = "none (no 1.5x rows)"
+        configs = build_configs(replicas_15x)
+        slug = model_slug(model)
+        datasets = sorted({r["dataset"] for r in model_results})
+        print(f"  [{model}] {len(model_results)} runs, "
+              f"replicas_15x={replicas_15x} via {replicas_src}, "
+              f"datasets={datasets}")
+
+        metric_specs = [
+            ("p99_tpot",  "P99 TPOT (ms)",  "p99tpot"),
+            ("p99_ttft",  "P99 TTFT (ms)",  "p99ttft"),
+            ("mean_tpot", "Mean TPOT (ms)", "meantpot"),
+            ("mean_ttft", "Mean TTFT (ms)", "meanttft"),
+        ]
+        for ds in [0, 1, 2]:
+            if ds not in datasets:
+                continue
+            ds_name = DATASET_NAMES.get(ds, str(ds)).lower()
+            for metric_key, metric_label, metric_slug in metric_specs:
+                plot_dataset(
+                    model_results, model, configs, ds, metric_key,
+                    metric_label,
+                    f"throughput_vs_{metric_slug}_{slug}_{ds_name}.pdf",
+                )
 
     print("Done!")
 
