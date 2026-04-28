@@ -70,6 +70,14 @@ _moe_stage_sums_ms: dict[str, float] = {
     "E_gemm_dn": 0.0,
 }
 
+# Per-batch expert-kernel latency profile. When set, TritonExperts.apply
+# brackets each of the 5 kernels (align, gemm_gu, silu, quant, gemm_dn)
+# with tight cuda events and stashes them on the prepare_finalize so
+# accumulate_expert_times() can sum + emit per (rank, layer, batch).
+# Requires --enforce-eager.
+_EXP_LATENCY_PROFILE = int(
+    os.environ.get('VLLM_EXP_LATENCY_PROFILE', '0'))
+
 class RouterWS:
 
     def __init__(
@@ -2011,12 +2019,39 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 return ev
             return None
 
+        _fmk_prof = (
+            _EXP_LATENCY_PROFILE != 0
+            and not torch.cuda.is_current_stream_capturing())
+
+        def _fmk_pair():
+            if _fmk_prof:
+                return [
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                ]
+            return [None, None]
+
+        _fmk_evts = {
+            'align': _fmk_pair(),
+            'gemm_gu': _fmk_pair(),
+            'silu': _fmk_pair(),
+            'quant': _fmk_pair(),
+            'gemm_dn': _fmk_pair(),
+        } if _fmk_prof else None
+
+        def _rec(name, idx):
+            if _fmk_prof:
+                _fmk_evts[name][idx].record()
+
         _e0 = _stage_evt()
+        _rec('align', 0)
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'],
                                  global_num_experts, expert_map))
+        _rec('align', 1)
         _e1 = _stage_evt()
 
+        _rec('gemm_gu', 0)
         invoke_fused_moe_kernel(
             hidden_states,
             w1,
@@ -2040,9 +2075,11 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             block_shape=self.block_shape,
             B_bias=self.w1_bias,
         )
+        _rec('gemm_gu', 1)
 
         _e2 = _stage_evt()
 
+        _rec('silu', 0)
         if (expert_tokens_meta is not None
                 and expert_tokens_meta.topk_ids_for_masking
                 is not None):
@@ -2057,17 +2094,21 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             self.activation(
                 activation, intermediate_cache2,
                 intermediate_cache1.view(-1, N))
+        _rec('silu', 1)
 
         _e3 = _stage_evt()
 
         a2q_scale: Optional[torch.Tensor] = None
 
+        _rec('quant', 0)
         qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
             intermediate_cache2, a2_scale, self.quant_dtype,
             self.per_act_token_quant, self.block_shape)
+        _rec('quant', 1)
 
         _e4 = _stage_evt()
 
+        _rec('gemm_dn', 0)
         invoke_fused_moe_kernel(
             qintermediate_cache2,
             w2,
@@ -2091,6 +2132,12 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             block_shape=self.block_shape,
             B_bias=self.w2_bias,
         )
+        _rec('gemm_dn', 1)
+
+        if _fmk_prof:
+            pf = getattr(self, '_fmk_log_target', None)
+            if pf is not None:
+                pf._fmk_kernel_evts = _fmk_evts
 
         if _stage_prof:
             _e5 = torch.cuda.Event(enable_timing=True)

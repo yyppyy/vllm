@@ -997,6 +997,11 @@ class FusedMoEModularKernel(torch.nn.Module):
                        'record_expert_event'):
                 self.prepare_finalize\
                     .record_expert_event('align_done')
+            # ExpLat profile: TritonExperts.apply stashes per-kernel
+            # cuda events on self.prepare_finalize via this back-pointer.
+            if hasattr(self.prepare_finalize, '_moe_layer_idx'):
+                self.fused_experts._fmk_log_target = (
+                    self.prepare_finalize)
             fused_out = self._maybe_chunk_fused_experts(
                 a1=a1,
                 a1q=a1q,

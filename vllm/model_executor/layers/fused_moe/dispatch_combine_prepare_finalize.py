@@ -33,6 +33,33 @@ _MOE_LOAD_PROFILE_INTERVAL = int(
 _EXPERT_PROFILE_M_THRESHOLD = int(
     os.environ.get('VLLM_DC_EXPERT_PROFILE_M', '256'))
 
+# Per-batch / per-layer / per-expert latency profile.
+# When set, every batch emits one ExpLat line per (rank, layer)
+# with full per-expert token counts and per-kernel cuda-event times
+# summed (excluding host-launch idle gaps). Requires --enforce-eager.
+_EXP_LATENCY_PROFILE = int(
+    os.environ.get('VLLM_EXP_LATENCY_PROFILE', '0'))
+# Sentinel file: prints are suppressed until this file exists, so the
+# vLLM dummy/profile-run and bench warmup do not pollute the log.
+_EXP_LATENCY_READY_FILE = os.environ.get(
+    'VLLM_EXP_LATENCY_READY_FILE', '')
+_exp_latency_ready_cached = False  # latch — once True, stays True
+
+
+def _exp_latency_ready() -> bool:
+    global _exp_latency_ready_cached
+    if not _EXP_LATENCY_PROFILE:
+        return False
+    if _exp_latency_ready_cached:
+        return True
+    if not _EXP_LATENCY_READY_FILE:
+        _exp_latency_ready_cached = True
+        return True
+    if os.path.exists(_EXP_LATENCY_READY_FILE):
+        _exp_latency_ready_cached = True
+        return True
+    return False
+
 # Buffer managers registered for profiling.
 _registered_mgrs: list = []
 
@@ -148,10 +175,11 @@ class DispatchCombinePrepareAndFinalize(
         """Record a CUDA event for expert compute
         profiling. Only active after EPLB rebalance."""
         mgr = self.p2p_manager
-        if not mgr._profiling_enabled:
-            return
-        if not mgr._profiling_after_rebalance:
-            return
+        if not _EXP_LATENCY_PROFILE:
+            if not mgr._profiling_enabled:
+                return
+            if not mgr._profiling_after_rebalance:
+                return
         if torch.cuda.is_current_stream_capturing():
             return
         if name not in self._expert_events:
@@ -163,21 +191,28 @@ class DispatchCombinePrepareAndFinalize(
         """Print per-layer expert compute breakdown.
         Only prints after EPLB rebalance, throttled."""
         mgr = self.p2p_manager
-        if not mgr._profiling_enabled:
-            return
-        if not mgr._profiling_after_rebalance:
+        dc_on = (mgr._profiling_enabled
+                 and mgr._profiling_after_rebalance)
+        explat_on = (_EXP_LATENCY_PROFILE != 0
+                     and _exp_latency_ready())
+        if not dc_on and not explat_on:
             return
         if torch.cuda.is_current_stream_capturing():
             return
         M = self._expert_M
         local_tokens = self._expert_local_tokens
-        # Only print for large M (prefill batches).
-        if M < _EXPERT_PROFILE_M_THRESHOLD:
-            return
-        # Per-(layer, M) throttle: max 10 prints.
-        counts = self._print_counts
-        counts[M] = counts.get(M, 0) + 1
-        if counts[M] > 10:
+        # M threshold + throttle apply only to the legacy DC print
+        # path; explat prints every batch unconditionally.
+        dc_print_ok = dc_on
+        if dc_print_ok and M < _EXPERT_PROFILE_M_THRESHOLD:
+            dc_print_ok = False
+        if dc_print_ok:
+            # Per-(layer, M) throttle: max 10 prints.
+            counts = self._print_counts
+            counts[M] = counts.get(M, 0) + 1
+            if counts[M] > 10:
+                dc_print_ok = False
+        if not dc_print_ok and not explat_on:
             return
         names = self._expert_step_names
         # Need all events recorded.
@@ -206,8 +241,10 @@ class DispatchCombinePrepareAndFinalize(
             except RuntimeError:
                 parts.append(
                     f"  {names[i]}: N/A")
-        # Per-expert token distribution.
-        if (self._expert_num_tokens is not None
+        # Per-expert token distribution (only built for the legacy
+        # DC print; explat builds its own per-expert dump below).
+        if (dc_print_ok
+                and self._expert_num_tokens is not None
                 and self._expert_num_tokens.numel() > 0):
             et = self._expert_num_tokens.cpu().tolist()
             mx = max(et)
@@ -279,14 +316,46 @@ class DispatchCombinePrepareAndFinalize(
                     f" rc_dist="
                     f"{dict(sorted(rc_dist.items()))}"
                     f" mapped={n_mapped}/{len(et)}")
-        logger.info(
-            "DC profile [rank %d] layer %d "
-            "expert_compute "
-            "(total %.1f us, M=%d, "
-            "local_tokens=%d):\n%s",
-            mgr.rank, self._moe_layer_idx,
-            total_us, M,
-            local_tokens, "\n".join(parts))
+        if dc_print_ok:
+            logger.info(
+                "DC profile [rank %d] layer %d "
+                "expert_compute "
+                "(total %.1f us, M=%d, "
+                "local_tokens=%d):\n%s",
+                mgr.rank, self._moe_layer_idx,
+                total_us, M,
+                local_tokens, "\n".join(parts))
+        if explat_on:
+            kev = getattr(self, '_fmk_kernel_evts', None) or {}
+
+            def _us(name):
+                pair = kev.get(name)
+                if not pair or pair[0] is None:
+                    return 0.0
+                try:
+                    return pair[0].elapsed_time(pair[1]) * 1000.0
+                except RuntimeError:
+                    return 0.0
+
+            align_us = _us('align')
+            gu_us = _us('gemm_gu')
+            silu_us = _us('silu')
+            quant_us = _us('quant')
+            dn_us = _us('gemm_dn')
+            sum_us = align_us + gu_us + silu_us + quant_us + dn_us
+            et = (self._expert_num_tokens.cpu().tolist()
+                  if self._expert_num_tokens is not None else [])
+            logger.info(
+                "ExpLat rank=%d layer=%d M=%d local_tokens=%d "
+                "expert_compute_us=%.1f window_us=%.1f "
+                "gemm_gu_us=%.1f gemm_dn_us=%.1f "
+                "align_us=%.1f silu_us=%.1f quant_us=%.1f "
+                "per_expert_tokens=%s",
+                mgr.rank, self._moe_layer_idx, M, local_tokens,
+                sum_us, total_us,
+                gu_us, dn_us,
+                align_us, silu_us, quant_us, et)
+            self._fmk_kernel_evts = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
