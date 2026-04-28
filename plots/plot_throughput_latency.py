@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import statistics
 import sys
 from pathlib import Path
 
@@ -125,11 +126,12 @@ def aggregate_bench_files(paths):
     """Aggregate one or more bench_result*.json files for a single run.
 
     Throughput is the simple average of total_token_throughput across
-    files. P99 and mean latency both use ONLY the last client (highest
+    files. P99 and median latency both use ONLY the last client (highest
     CLIENT_IDX) after trimming its top max(1, ceil(1% * n_last))
     per-prompt latencies; the trimmed set's max is reported as P99 and
-    its arithmetic mean as the mean. Falls back to per-file aggregate
-    {p99,mean}_*_ms when --save-detailed data is absent (legacy files).
+    its statistical median as the median. Falls back to per-file
+    aggregate {p99,median}_*_ms when --save-detailed data is absent
+    (legacy files).
     """
     def client_idx(p):
         m = re.search(r"bench_result_(\d+)\.json$", p.name)
@@ -141,7 +143,7 @@ def aggregate_bench_files(paths):
     last_ttft_ms = []
     last_tpot_ms = []
     legacy = {k: [] for k in
-              ("p99_ttft", "p99_tpot", "mean_ttft", "mean_tpot")}
+              ("p99_ttft", "p99_tpot", "median_ttft", "median_tpot")}
     for i, p in enumerate(paths):
         try:
             data = json.loads(p.read_text())
@@ -180,19 +182,19 @@ def aggregate_bench_files(paths):
         trimmed_tpot = trim_top(last_tpot_ms)
         p99_ttft = max(trimmed_ttft) if trimmed_ttft else 0
         p99_tpot = max(trimmed_tpot) if trimmed_tpot else 0
-        mean_ttft = _avg(trimmed_ttft)
-        mean_tpot = _avg(trimmed_tpot)
+        median_ttft = statistics.median(trimmed_ttft) if trimmed_ttft else 0
+        median_tpot = statistics.median(trimmed_tpot) if trimmed_tpot else 0
     else:
         p99_ttft = _avg(legacy["p99_ttft"])
         p99_tpot = _avg(legacy["p99_tpot"])
-        mean_ttft = _avg(legacy["mean_ttft"])
-        mean_tpot = _avg(legacy["mean_tpot"])
+        median_ttft = _avg(legacy["median_ttft"])
+        median_tpot = _avg(legacy["median_tpot"])
     return {
         "throughput": avg_throughput,
         "p99_ttft": p99_ttft,
         "p99_tpot": p99_tpot,
-        "mean_ttft": mean_ttft,
-        "mean_tpot": mean_tpot,
+        "median_ttft": median_ttft,
+        "median_tpot": median_tpot,
     }
 
 
@@ -329,10 +331,10 @@ def main():
               f"datasets={datasets}")
 
         metric_specs = [
-            ("p99_tpot",  "P99 TPOT (ms)",  "p99tpot"),
-            ("p99_ttft",  "P99 TTFT (ms)",  "p99ttft"),
-            ("mean_tpot", "Mean TPOT (ms)", "meantpot"),
-            ("mean_ttft", "Mean TTFT (ms)", "meanttft"),
+            ("p99_tpot",    "P99 TPOT (ms)",    "p99tpot"),
+            ("p99_ttft",    "P99 TTFT (ms)",    "p99ttft"),
+            ("median_tpot", "Median TPOT (ms)", "mediantpot"),
+            ("median_ttft", "Median TTFT (ms)", "medianttft"),
         ]
         for ds in [0, 1, 2]:
             if ds not in datasets:
