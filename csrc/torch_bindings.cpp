@@ -67,6 +67,22 @@ void dar_compact(torch::Tensor expert_topk_ids,
                  int64_t num_physical_experts,
                  int64_t K);
 }  // namespace dispatch_combine
+
+// Forward declarations for the per-(rank, layer, batch) MoE profiler
+// in csrc/explat_logger.cu.
+namespace explat {
+void record_stamp(torch::Tensor stamps, int64_t idx);
+void log_expert_tokens(int64_t rank,
+                       int64_t layer_idx,
+                       int64_t M,
+                       torch::Tensor expert_num_tokens,
+                       torch::Tensor stamps,
+                       torch::Tensor armed,
+                       torch::Tensor counter,
+                       torch::Tensor ringbuf,
+                       int64_t e_max);
+}  // namespace explat
+
 }  // namespace vllm
 #include "ops.h"
 #include "core/registration.h"
@@ -964,6 +980,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _dispatch_combine),
       "int K) -> ()");
   dc.impl("dar_compact", torch::kCUDA,
           &vllm::dispatch_combine::dar_compact);
+}
+
+TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _explat), explat) {
+  // Per-(rank, layer, batch) MoE profiler ops.
+  explat.def(
+      "record_stamp(Tensor! stamps, int idx) -> ()");
+  explat.impl("record_stamp", torch::kCUDA,
+              &vllm::explat::record_stamp);
+  explat.def(
+      "log_expert_tokens(int rank, int layer_idx, int M, "
+      "Tensor expert_num_tokens, Tensor! stamps, Tensor armed, "
+      "Tensor! counter, Tensor! ringbuf, int e_max) -> ()");
+  explat.impl("log_expert_tokens", torch::kCUDA,
+              &vllm::explat::log_expert_tokens);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

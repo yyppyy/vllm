@@ -33,32 +33,13 @@ _MOE_LOAD_PROFILE_INTERVAL = int(
 _EXPERT_PROFILE_M_THRESHOLD = int(
     os.environ.get('VLLM_DC_EXPERT_PROFILE_M', '256'))
 
-# Per-batch / per-layer / per-expert latency profile.
-# When set, every batch emits one ExpLat line per (rank, layer)
-# with full per-expert token counts and per-kernel cuda-event times
-# summed (excluding host-launch idle gaps). Requires --enforce-eager.
-_EXP_LATENCY_PROFILE = int(
-    os.environ.get('VLLM_EXP_LATENCY_PROFILE', '0'))
-# Sentinel file: prints are suppressed until this file exists, so the
-# vLLM dummy/profile-run and bench warmup do not pollute the log.
-_EXP_LATENCY_READY_FILE = os.environ.get(
-    'VLLM_EXP_LATENCY_READY_FILE', '')
-_exp_latency_ready_cached = False  # latch — once True, stays True
-
-
-def _exp_latency_ready() -> bool:
-    global _exp_latency_ready_cached
-    if not _EXP_LATENCY_PROFILE:
-        return False
-    if _exp_latency_ready_cached:
-        return True
-    if not _EXP_LATENCY_READY_FILE:
-        _exp_latency_ready_cached = True
-        return True
-    if os.path.exists(_EXP_LATENCY_READY_FILE):
-        _exp_latency_ready_cached = True
-        return True
-    return False
+# Per-batch / per-layer / per-expert latency profile. Captureable
+# under CUDA graphs: TritonExperts.apply stamps boundaries via a tiny
+# %globaltimer-reading op; the logger op below picks up the stamps and
+# the per-rank expert_num_tokens vector and writes one ringbuffer slot
+# per (rank, layer, batch). The host poller in explat_runtime drains
+# the ringbuffer to disk.
+from vllm.model_executor.layers.fused_moe import explat_runtime  # noqa: E402
 
 # Buffer managers registered for profiling.
 _registered_mgrs: list = []
@@ -175,11 +156,10 @@ class DispatchCombinePrepareAndFinalize(
         """Record a CUDA event for expert compute
         profiling. Only active after EPLB rebalance."""
         mgr = self.p2p_manager
-        if not _EXP_LATENCY_PROFILE:
-            if not mgr._profiling_enabled:
-                return
-            if not mgr._profiling_after_rebalance:
-                return
+        if not mgr._profiling_enabled:
+            return
+        if not mgr._profiling_after_rebalance:
+            return
         if torch.cuda.is_current_stream_capturing():
             return
         if name not in self._expert_events:
@@ -193,26 +173,19 @@ class DispatchCombinePrepareAndFinalize(
         mgr = self.p2p_manager
         dc_on = (mgr._profiling_enabled
                  and mgr._profiling_after_rebalance)
-        explat_on = (_EXP_LATENCY_PROFILE != 0
-                     and _exp_latency_ready())
-        if not dc_on and not explat_on:
+        if not dc_on:
             return
         if torch.cuda.is_current_stream_capturing():
             return
         M = self._expert_M
         local_tokens = self._expert_local_tokens
-        # M threshold + throttle apply only to the legacy DC print
-        # path; explat prints every batch unconditionally.
-        dc_print_ok = dc_on
-        if dc_print_ok and M < _EXPERT_PROFILE_M_THRESHOLD:
-            dc_print_ok = False
-        if dc_print_ok:
-            # Per-(layer, M) throttle: max 10 prints.
-            counts = self._print_counts
-            counts[M] = counts.get(M, 0) + 1
-            if counts[M] > 10:
-                dc_print_ok = False
-        if not dc_print_ok and not explat_on:
+        # M threshold + throttle for the legacy DC print path.
+        if M < _EXPERT_PROFILE_M_THRESHOLD:
+            return
+        # Per-(layer, M) throttle: max 10 prints.
+        counts = self._print_counts
+        counts[M] = counts.get(M, 0) + 1
+        if counts[M] > 10:
             return
         names = self._expert_step_names
         # Need all events recorded.
@@ -241,10 +214,8 @@ class DispatchCombinePrepareAndFinalize(
             except RuntimeError:
                 parts.append(
                     f"  {names[i]}: N/A")
-        # Per-expert token distribution (only built for the legacy
-        # DC print; explat builds its own per-expert dump below).
-        if (dc_print_ok
-                and self._expert_num_tokens is not None
+        # Per-expert token distribution.
+        if (self._expert_num_tokens is not None
                 and self._expert_num_tokens.numel() > 0):
             et = self._expert_num_tokens.cpu().tolist()
             mx = max(et)
@@ -316,46 +287,14 @@ class DispatchCombinePrepareAndFinalize(
                     f" rc_dist="
                     f"{dict(sorted(rc_dist.items()))}"
                     f" mapped={n_mapped}/{len(et)}")
-        if dc_print_ok:
-            logger.info(
-                "DC profile [rank %d] layer %d "
-                "expert_compute "
-                "(total %.1f us, M=%d, "
-                "local_tokens=%d):\n%s",
-                mgr.rank, self._moe_layer_idx,
-                total_us, M,
-                local_tokens, "\n".join(parts))
-        if explat_on:
-            kev = getattr(self, '_fmk_kernel_evts', None) or {}
-
-            def _us(name):
-                pair = kev.get(name)
-                if not pair or pair[0] is None:
-                    return 0.0
-                try:
-                    return pair[0].elapsed_time(pair[1]) * 1000.0
-                except RuntimeError:
-                    return 0.0
-
-            align_us = _us('align')
-            gu_us = _us('gemm_gu')
-            silu_us = _us('silu')
-            quant_us = _us('quant')
-            dn_us = _us('gemm_dn')
-            sum_us = align_us + gu_us + silu_us + quant_us + dn_us
-            et = (self._expert_num_tokens.cpu().tolist()
-                  if self._expert_num_tokens is not None else [])
-            logger.info(
-                "ExpLat rank=%d layer=%d M=%d local_tokens=%d "
-                "expert_compute_us=%.1f window_us=%.1f "
-                "gemm_gu_us=%.1f gemm_dn_us=%.1f "
-                "align_us=%.1f silu_us=%.1f quant_us=%.1f "
-                "per_expert_tokens=%s",
-                mgr.rank, self._moe_layer_idx, M, local_tokens,
-                sum_us, total_us,
-                gu_us, dn_us,
-                align_us, silu_us, quant_us, et)
-            self._fmk_kernel_evts = None
+        logger.info(
+            "DC profile [rank %d] layer %d "
+            "expert_compute "
+            "(total %.1f us, M=%d, "
+            "local_tokens=%d):\n%s",
+            mgr.rank, self._moe_layer_idx,
+            total_us, M,
+            local_tokens, "\n".join(parts))
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -594,6 +533,28 @@ class DispatchCombinePrepareAndFinalize(
             self.rank_expert_offset:
             self.rank_expert_offset
             + self.num_local_experts]
+        # ExpLat profile: emit one ringbuffer slot per (rank, layer,
+        # batch). The op is captureable into CUDA graphs; stamps were
+        # written by TritonExperts.apply via record_stamp on the same
+        # _explat_stamps tensor, stashed onto self via the back-pointer
+        # set in modular_kernel. Slot writes are gated GPU-side by the
+        # `armed` flag, so dummy-run + warmup produce no records.
+        if explat_runtime.is_enabled():
+            stamps = getattr(self, '_explat_stamps', None)
+            if stamps is None:
+                stamps = explat_runtime.alloc_layer_stamps()
+                self._explat_stamps = stamps
+            torch.ops._C_explat.log_expert_tokens(
+                mgr.rank,
+                self._moe_layer_idx,
+                M,
+                self._expert_num_tokens.contiguous(),
+                stamps,
+                explat_runtime.get_armed_tensor(),
+                explat_runtime.get_counter_tensor(),
+                explat_runtime.get_ringbuf_tensor(),
+                explat_runtime.get_e_max())
+            explat_runtime.ensure_poller_started()
         # Router unique expert count (before dispatch).
         if (mgr._profiling_enabled
                 and mgr._profiling_after_rebalance):

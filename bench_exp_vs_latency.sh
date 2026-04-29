@@ -3,14 +3,17 @@
 # Per-batch / per-layer / per-expert profile companion to bench_serve.sh.
 #
 # Same 13 positional args as bench_serve.sh. Differences:
-#   - never runs nsys (10th arg accepted for signature parity but ignored)
-#   - always passes --enforce-eager (cuda graphs would suppress event timing)
-#   - sets VLLM_EXP_LATENCY_PROFILE=1, gates printing on a sentinel file
-#     so that the vLLM dummy/profile-run AND the bench warmup pass produce
-#     no profile output
+#   - CUDA graphs ENABLED (no --enforce-eager). Per-kernel timing is
+#     read GPU-side via %globaltimer inside captureable ops; nsys is
+#     not used (10th arg accepted for signature parity but ignored).
+#   - sets VLLM_EXP_LATENCY_PROFILE=1, gates writing on a sentinel file
+#     so that the vLLM dummy/profile-run AND the bench warmup produce
+#     no profile records
 #   - drives traffic with warmup -> touch sentinel -> ONE short bench
-#     client run, no --save-result, no JSON
-#   - server log goes to results/$RUN_HASH/server_explat.log
+#     client run, then sleep 35s so the in-process poller observes the
+#     idle counter and drains the pinned ringbuffer to disk
+#   - profiler output goes to results/$RUN_HASH/server_explat.log
+#     (the engine stdout/stderr go to results/$RUN_HASH/server_main.log)
 
 NUM_GPUS=$1
 EP_DEGREE=$2
@@ -21,7 +24,7 @@ MEM_BOUND_ROUTING=$6
 ALLTOALL_BACKEND=$7
 DATASET=$8
 DATASET_NAME=$9
-USE_PROFILER=${10}        # accepted for signature parity, ignored
+USE_PROFILER=${10}        # 0 = stream events only; >0 = also run under nsys
 MEM_BOUND_ROUTING_THRES=${11}
 MODEL_NAME=${12:-Qwen3-30B-A3B}
 EPLB_NUM_GROUPS=${13:-1}
@@ -85,13 +88,16 @@ unset VLLM_PREFILL_BEFORE_DECODE
 export VLLM_ZIPFIAN_ROUTING=1
 export VLLM_EPLB_NUM_GROUPS=${EPLB_NUM_GROUPS}
 
-# ExpLat profile: gate prints on this sentinel file. We rm it before
-# server start so the dummy/profile-run produces no output, then touch
-# it after the bench-serve warmup completes.
+# ExpLat profile: gate the GPU armed flag on this sentinel file. We rm
+# it before server start so the dummy/profile-run produces no records,
+# then touch it after the bench-serve warmup completes — the in-process
+# poller flips `armed[0] = 1` on the next tick.
 READY_FILE="$RES_DIR/$RUN_HASH/explat_ready"
-rm -f "$READY_FILE"
+EXPLAT_LOG="$RES_DIR/$RUN_HASH/server_explat.log"
+rm -f "$READY_FILE" "$EXPLAT_LOG"
 export VLLM_EXP_LATENCY_PROFILE=1
 export VLLM_EXP_LATENCY_READY_FILE="$READY_FILE"
+export VLLM_EXP_LATENCY_LOG_PATH="$EXPLAT_LOG"
 
 if (( NUM_GPUS <= 2 )); then
   GPU_MEM_UTIL="0.9"
@@ -106,7 +112,6 @@ args=(
   --tensor-parallel-size 1
   --max-num-seqs $MAX_REQ_PER_BATCH
   --no-enable-chunked-prefill
-  --enforce-eager
   --max-model-len 8192
   --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
@@ -136,7 +141,12 @@ ENVS_PY="vllm/envs.py"
 sed -i "s|env_with_choices(\"VLLM_ALL2ALL_BACKEND\", \"[^\"]*\"|env_with_choices(\"VLLM_ALL2ALL_BACKEND\", \"${ALLTOALL_BACKEND}\"|" "$ENVS_PY"
 unset VLLM_ALL2ALL_BACKEND
 
-setsid vllm "${args[@]}" >"$RES_DIR/$RUN_HASH/server_explat.log" 2>&1 &
+# nsys path is intentionally dropped here — kernel timing comes from
+# the GPU-side %globaltimer reads in csrc/explat_logger.cu. The 10th
+# positional arg USE_PROFILER is accepted for signature parity with
+# bench_serve.sh but ignored.
+setsid vllm "${args[@]}" \
+  >"$RES_DIR/$RUN_HASH/server_main.log" 2>&1 &
 SERVER_PID=$!
 SESSION_PID=$SERVER_PID
 
@@ -197,6 +207,17 @@ fi
 
 echo "=== Profile run: sending $NUM_PROMPTS requests (ExpLat output enabled) ==="
 vllm bench serve "${cli_args[@]}"
+
+# The in-process explat poller drains the pinned ringbuffer 30s after
+# the last replay. Give it 35s of slack before tearing the server down.
+echo "=== Bench done; sleeping 35s to let the explat poller drain ==="
+sleep 35
+
+if [[ -s "$EXPLAT_LOG" ]]; then
+  echo "=== ExpLat log written: $EXPLAT_LOG ($(wc -l <"$EXPLAT_LOG") lines) ==="
+else
+  echo "WARN: ExpLat log $EXPLAT_LOG missing or empty"
+fi
 
 ############## kill server ##############
 
