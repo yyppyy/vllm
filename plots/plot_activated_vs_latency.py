@@ -36,6 +36,19 @@ DATASET_NAMES = {
     2: "ShareGPT",
 }
 
+# Aliases accepted in --active-range. Case-insensitive lookup.
+DATASET_ALIASES = {
+    "0": 0, "instructcoder": 0, "likaixin/instructcoder": 0,
+    "1": 1, "textedit": 1, "vdaita/edit_5k_char": 1,
+    "2": 2, "sharegpt": 2,
+}
+
+
+def resolve_dataset(name):
+    """Resolve a dataset spec (int id, friendly name, or HF path) to
+    the integer id used in run dirnames."""
+    return DATASET_ALIASES.get(name.lower())
+
 
 def parse_dirname(dirname):
     """Mirror of plot_throughput_latency.parse_dirname."""
@@ -224,48 +237,88 @@ METRIC_INFO = {
 
 
 def make_plot(model, dataset, records, metric, xaxis, color_by,
-              out_dir):
+              out_dir, max_latency_us=None, style="box",
+              min_per_box=5, min_active=None, max_active=None):
     if not records:
         return
-    xs = np.array([r[xaxis] for r in records], dtype=float)
     rec_key, ylabel, metric_tag = METRIC_INFO[metric]
+    if min_active is not None or max_active is not None:
+        n_before = len(records)
+        lo = min_active if min_active is not None else -1
+        hi = max_active if max_active is not None else 1 << 30
+        records = [r for r in records if lo <= r["n_active"] <= hi]
+        n_dropped = n_before - len(records)
+        if n_dropped:
+            print(f"  dropped {n_dropped} record(s) with "
+                  f"n_active outside [{lo}, {hi}] "
+                  f"(of {n_before})")
+        if not records:
+            return
+    if max_latency_us is not None:
+        n_before = len(records)
+        records = [r for r in records if r[rec_key] <= max_latency_us]
+        n_dropped = n_before - len(records)
+        if n_dropped:
+            print(f"  dropped {n_dropped} outlier(s) with "
+                  f"{rec_key} > {max_latency_us:.0f}us "
+                  f"(of {n_before})")
+        if not records:
+            return
+    xs = np.array([r[xaxis] for r in records], dtype=float)
     ys = np.array([r[rec_key] for r in records], dtype=float)
 
-    a, b = np.polyfit(xs, ys, 1)
-    r = float(np.corrcoef(xs, ys)[0, 1]) if len(xs) > 1 else float("nan")
-
     fig, ax = plt.subplots(figsize=(7.8, 5.2))
-    if color_by != "none":
-        cs = np.array([r[color_by] for r in records], dtype=float)
-        sc = ax.scatter(xs, ys, c=cs, cmap="viridis",
-                        s=12, alpha=0.55, edgecolor="none")
-        cbar = fig.colorbar(sc, ax=ax)
-        cbar.set_label(COLOR_BY_LABELS[color_by], fontsize=9)
+    dataset_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
+
+    if style == "box":
+        # Group by integer x value; each group becomes one box.
+        groups: dict[int, list[float]] = defaultdict(list)
+        for x_val, y_val in zip(xs, ys):
+            groups[int(round(x_val))].append(float(y_val))
+        keys = sorted(k for k, vs in groups.items()
+                      if len(vs) >= min_per_box)
+        if not keys:
+            print(f"  skipping {model}/{dataset_name}: no x-bin had "
+                  f">= {min_per_box} samples")
+            plt.close(fig)
+            return
+        data = [groups[k] for k in keys]
+        ax.boxplot(data, positions=keys, widths=0.6,
+                   showfliers=False, manage_ticks=False,
+                   medianprops=dict(color="#d62728", linewidth=1.4),
+                   boxprops=dict(linewidth=0.9),
+                   whiskerprops=dict(linewidth=0.9),
+                   capprops=dict(linewidth=0.9))
+        ax.set_xlim(min(keys) - 0.7, max(keys) + 0.7)
     else:
-        ax.scatter(xs, ys, s=10, alpha=0.25, edgecolor="none",
-                   color="#1f77b4", label=f"n={len(xs)}")
-    x_line = np.array([xs.min(), xs.max()])
-    ax.plot(x_line, a * x_line + b, color="#d62728", linewidth=1.6,
-            label=f"y = {a:.3f}x + {b:.1f}   R = {r:.3f}  "
-                  f"(n={len(xs)})")
+        if color_by != "none":
+            cs = np.array([r[color_by] for r in records], dtype=float)
+            sc = ax.scatter(xs, ys, c=cs, cmap="viridis",
+                            s=12, alpha=0.55, edgecolor="none")
+            cbar = fig.colorbar(sc, ax=ax)
+            cbar.set_label(COLOR_BY_LABELS[color_by], fontsize=9)
+        else:
+            ax.scatter(xs, ys, s=10, alpha=0.25, edgecolor="none",
+                       color="#1f77b4")
 
     ax.set_xlabel(XAXIS_LABELS[xaxis])
     ax.set_ylabel(ylabel)
-    dataset_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
     ax.set_title(f"{model}  /  {dataset_name}")
-    ax.legend(loc="best", fontsize=9)
+    ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
     safe_model = model.replace("/", "_")
-    color_tag = "" if color_by == "none" else f"_by{color_by}"
+    color_tag = "" if color_by == "none" or style == "box" \
+                else f"_by{color_by}"
+    style_tag = "_box" if style == "box" else ""
     out = out_dir / (
         f"activated_vs_latency_{metric_tag}_"
-        f"x{XAXIS_TAGS[xaxis]}{color_tag}_"
+        f"x{XAXIS_TAGS[xaxis]}{color_tag}{style_tag}_"
         f"{safe_model}_{dataset_name}.pdf")
     fig.savefig(out)
     plt.close(fig)
-    print(f"  wrote {out}  (n={len(xs)}, slope={a:.3f}, R={r:.3f})")
+    print(f"  wrote {out}  (n={len(xs)})")
 
 
 def main():
@@ -318,10 +371,80 @@ def main():
         help="Triton BLOCK_SIZE_M assumed when computing post_pad "
              "(default: 16; the autotuner usually picks 16 for "
              "small M).")
+    p.add_argument(
+        "--max-latency-us", type=float, default=500.0,
+        help="Drop ExpLat records whose y-axis metric exceeds this "
+             "threshold in microseconds (default: 500us, matches "
+             "the y-axis units). Filters obvious outliers "
+             "(e.g. warmup/recapture transients). Set to 0 or "
+             "negative to disable.")
+    p.add_argument(
+        "--style", choices=("box", "scatter"), default="box",
+        help="Plot style. 'box' groups records by integer x-value "
+             "and draws one box per group (default; better for "
+             "dense data). 'scatter' draws every record as a dot.")
+    p.add_argument(
+        "--min-per-box", type=int, default=5,
+        help="Skip x-bins with fewer than this many samples in box "
+             "mode (default: 5).")
+    p.add_argument(
+        "--min-active", type=int, default=None,
+        help="Drop ExpLat records with n_active < min_active "
+             "(default: no lower bound). Applies to every "
+             "(model, dataset) unless overridden by "
+             "--active-range.")
+    p.add_argument(
+        "--max-active", type=int, default=None,
+        help="Drop ExpLat records with n_active > max_active "
+             "(default: no upper bound). Applies to every "
+             "(model, dataset) unless overridden by "
+             "--active-range.")
+    p.add_argument(
+        "--active-range",
+        action="append",
+        default=[],
+        metavar="MODEL:DATASET:MIN:MAX",
+        help="Per-(model, dataset) override of n_active range. "
+             "MODEL is the model name as parsed from the run "
+             "dirname (must match exactly). DATASET accepts the "
+             "integer id (0=InstructCoder, 1=TextEdit, "
+             "2=ShareGPT), the friendly name "
+             "(InstructCoder/TextEdit/ShareGPT), or the HF path "
+             "(likaixin/InstructCoder, vdaita/edit_5k_char). "
+             "MIN and MAX may each be empty to leave that bound "
+             "unconstrained "
+             "(e.g. 'Qwen3-30B-A3B-8-128:0:4:16' or "
+             "'ERNIE-4.5-21B-A3B-PT:vdaita/edit_5k_char:7:12'). "
+             "Repeat the flag to override multiple groups.")
     args = p.parse_args()
+
+    # Parse --active-range entries into a dict keyed by
+    # (model, dataset) -> (min, max).
+    active_overrides: dict[tuple[str, int],
+                            tuple[int | None, int | None]] = {}
+    for spec in args.active_range:
+        parts = spec.split(":")
+        if len(parts) != 4:
+            print(f"ERROR: --active-range expects "
+                  f"MODEL:DATASET:MIN:MAX, got {spec!r}",
+                  file=sys.stderr)
+            return 2
+        model_key, ds_str, mn_str, mx_str = parts
+        ds_key = resolve_dataset(ds_str)
+        if ds_key is None:
+            print(f"ERROR: bad dataset in --active-range "
+                  f"{spec!r}; expected int id or one of "
+                  f"{sorted(DATASET_ALIASES.keys())}",
+                  file=sys.stderr)
+            return 2
+        mn = int(mn_str) if mn_str else None
+        mx = int(mx_str) if mx_str else None
+        active_overrides[(model_key, ds_key)] = (mn, mx)
 
     min_batch = args.min_batch if args.min_batch > 0 else None
     max_batch = args.max_batch if args.max_batch > 0 else None
+    max_latency_us = (args.max_latency_us
+                      if args.max_latency_us > 0 else None)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     grouped = collect(args.results_dir, args.log_filename,
                       min_batch, max_batch, args.block_size_m)
@@ -331,8 +454,16 @@ def main():
         return 1
     for (model, dataset), records in sorted(grouped.items()):
         print(f"{model} / dataset={dataset}: {len(records)} records")
+        mn, mx = active_overrides.get(
+            (model, dataset),
+            (args.min_active, args.max_active))
         make_plot(model, dataset, records, args.metric,
-                  args.xaxis, args.color_by, args.output_dir)
+                  args.xaxis, args.color_by, args.output_dir,
+                  max_latency_us=max_latency_us,
+                  style=args.style,
+                  min_per_box=args.min_per_box,
+                  min_active=mn,
+                  max_active=mx)
     return 0
 
 
