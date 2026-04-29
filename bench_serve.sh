@@ -217,7 +217,6 @@ for ((CLIENT_IDX=0; CLIENT_IDX<NUM_CLIENT_RUNS; CLIENT_IDX++)); do
       --backend vllm
       --save-result
       --save-detailed
-      --seed $CLIENT_IDX
       --result-filename "$RES_DIR"/"$RUN_HASH"/bench_result_${CLIENT_IDX}.json
       --percentile-metrics ttft,tpot,itl,e2el
       --metric-percentiles 10,20,30,40,50,95,99

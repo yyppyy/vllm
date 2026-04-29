@@ -37,9 +37,9 @@ patch_topk "./models/Qwen3-30B-A3B" 4
 
 # ERNIE-4.5-21B-A3B-PT
 download_model "baidu/ERNIE-4.5-21B-A3B-PT" "./models/ERNIE-4.5-21B-A3B-PT"
-patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 3 moe_k
+# patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 3 moe_k
 # Make all 14 layers MoE (no dense layers)
-patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 14 num_hidden_layers
+patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 27 num_hidden_layers
 patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 0 moe_layer_start_index
-patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 13 moe_layer_end_index
+patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 26 moe_layer_end_index
 patch_topk "./models/ERNIE-4.5-21B-A3B-PT" 1 moe_layer_interval
