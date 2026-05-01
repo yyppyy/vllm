@@ -41,7 +41,9 @@ from matplotlib.ticker import MaxNLocator
 from collections import defaultdict
 import re
 
-from utils import set_paper_style, get_palette, HATCHES
+from style import (apply_style, paper_figure, save_fig, palette,
+                   HATCHES, style_axes, style_legend)
+apply_style()
 
 # Profile file paths
 TP_PROFILE = Path("../results/vllm_results_dev/8_8_0_0_4_0_allgather_reducescatter_0_1/profile.nsys-rep")
@@ -844,7 +846,7 @@ def plot_comparison(tp_breakdown, ep_breakdown,
                     tp_kernels=None, ep_kernels=None):
     """Create stacked bar chart comparing TP and EP latency breakdowns."""
     BASE_FONT = 11
-    set_paper_style(base_font=BASE_FONT)
+    apply_style(base_font=BASE_FONT)
 
     categories = ['attention', 'norm', 'topk', 'expert', 'communication', 'others']
     category_labels = {
@@ -866,13 +868,13 @@ def plot_comparison(tp_breakdown, ep_breakdown,
     ep_values = [ep_breakdown.get(cat, 0.0) for cat in active_cats]
 
     # Create figure with two panels: bar chart (left) + kernel list (right)
-    fig = plt.figure(figsize=(12, 5))
+    fig = plt.figure(figsize=(7.0, 3.2))
     gs = fig.add_gridspec(1, 2, width_ratios=[1, 1.6], wspace=0.05)
     ax = fig.add_subplot(gs[0])
     ax_text = fig.add_subplot(gs[1])
 
     # Get colors (index into full palette to keep colors stable)
-    full_colors = get_palette(len(categories), name="tableau10")
+    full_colors = palette(len(categories), name="tableau10")
     colors = [full_colors[categories.index(c)] for c in active_cats]
     hatches = [HATCHES[categories.index(c)] for c in active_cats]
 
@@ -915,15 +917,15 @@ def plot_comparison(tp_breakdown, ep_breakdown,
 
     # Y-axis
     y_max = max(bottom_tp, bottom_ep)
-    ax.set_ylim(0, y_max * 1.18)
-    ax.set_ylabel('Latency per Decode Layer (ms)', fontsize=BASE_FONT)
+    style_axes(ax,
+               y_label='Latency per Decode Layer (ms)',
+               y_lim=(0, y_max * 1.18),
+               x_lim=(-0.5, 1.5))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, steps=[1, 2, 5, 10]))
-    ax.grid(axis='y', linestyle='--', alpha=0.35)
 
-    # X-axis
+    # X-axis tick labels
     ax.set_xticks(x)
-    ax.set_xticklabels(systems, fontsize=BASE_FONT)
-    ax.set_xlim(-0.5, 1.5)
+    ax.set_xticklabels(systems)
 
     # Total latency on top of bars
     top_font = BASE_FONT
@@ -933,13 +935,8 @@ def plot_comparison(tp_breakdown, ep_breakdown,
             ha='center', va='bottom', fontsize=top_font, fontweight='bold')
 
     # Legend — below the bar chart
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.10),
-              ncol=2, frameon=False, fontsize=BASE_FONT - 1,
-              columnspacing=1.0, handletextpad=0.5)
-
-    # Remove top and right spines
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    style_legend(ax, loc='upper center',
+                 bbox_to_anchor=(0.5, -0.10), ncol=2)
 
     # ---- Right panel: kernel name listing per category ----
     ax_text.axis('off')
@@ -993,8 +990,7 @@ def plot_comparison(tp_breakdown, ep_breakdown,
 
             y -= 0.02  # gap between categories
 
-    fig.tight_layout()
-    fig.savefig(OUTPUT_FILE, format='pdf', bbox_inches='tight')
+    save_fig(fig, OUTPUT_FILE)
     print(f"\nSaved plot to {OUTPUT_FILE}")
 
 

@@ -38,9 +38,11 @@ from pathlib import Path
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
-from utils import *
-
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from matplotlib import cycler
+from style import (apply_style, paper_figure, save_fig, palette,
+                   style_axes, style_legend, MARKERS, PALETTES)
 
 BytesModel = Literal["weights-only", "weights+activations"]
 
@@ -150,17 +152,12 @@ def main():
         ('H100', 295),
         ('B200', 281),
     ]
-    set_paper_style()
-    apply_color_cycle(len(gpu_ois) + 2, "tableau10")
-    
-    fig = plt.figure(figsize=(3.5, 3))
-    ax = plt.gca()
+    apply_style()
+    plt.rcParams["axes.prop_cycle"] = cycler(
+        color=palette(len(gpu_ois) + 2, "tableau10"))
 
-    # clean axes
-    # ax.spines["top"].set_visible(False)
-    # ax.spines["right"].set_visible(False)
-    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-    ax.grid(True, axis="x", linestyle="--", alpha=0.35)
+    fig, ax = paper_figure(width="single", height=2.4)
+    ax.grid(True, axis="both", linestyle="--", alpha=0.35)
 
     # integer x axis from your `reps`
     x_vals = np.array(batches, dtype=float)
@@ -188,11 +185,7 @@ def main():
 
         marker = MARKERS[series_idx % len(MARKERS)]
         series_idx += 1
-        ax.plot(
-            x_vals, y_vals,
-            marker=marker, linewidth=2.2, markersize=5.5,
-            label=f"{model} FFN",
-        )
+        ax.plot(x_vals, y_vals, marker=marker, label=f"{model} FFN")
 
             # print(f"Config: B={batch}, S={args.seq}, D={cfg.D}, MD={cfg.MD}, MR={cfg.MR}, MS={cfg.MS}, "
             #     f"elem_bytes={cfg.elem_bytes}, bytes_model={args.bytes_model}")
@@ -203,22 +196,18 @@ def main():
     colors = PALETTES["tableau10"][len(model2configs):]
     idx = 0
     for gpu, oi in gpu_ois:
-        ax.axhline(y=oi, linestyle='--', linewidth=2.2, label=gpu, color=colors[idx])
+        ax.axhline(y=oi, linestyle='--', label=gpu, color=colors[idx])
         idx += 1
     max_h = max(max_h, max(x[1] for x in gpu_ois))
 
-    ax.set_ylabel('Operational Intensity\n(FLOPs/byte)')
-    ax.set_xlabel('Batch Size (Tokens)')
-    # ax.set_title('')
-    ax.legend()
-    if max_h > 0:
-        ax.set_ylim(-10, max_h * 1.15)
-
-    fig.subplots_adjust(top=0.99, bottom=0.17, left=0.23, right=0.97)
+    style_axes(ax,
+               x_label='Batch Size (Tokens)',
+               y_label='Operational Intensity\n(FLOPs/byte)',
+               y_lim=(-10, max_h * 1.15) if max_h > 0 else None)
+    style_legend(ax)
 
     base = Path(args.output_dir) / f"moe_vs_gpu_oi"
-    base.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(f"{base}.pdf", transparent=True)
+    save_fig(fig, f"{base}.pdf")
     plt.close(fig)
     
     

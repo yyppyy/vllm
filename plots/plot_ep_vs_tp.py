@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import json
-import matplotlib.pyplot as plt
 from pathlib import Path
 import re
 
-from utils import set_paper_style, get_palette
+from style import (apply_style, paper_figure, save_fig, palette,
+                   style_axes, style_legend)
 
 # Directories containing the results
 EXPERT_PARALLEL_DIR = Path("../results/vllm_results_likaixin_InstructCoder1/results")
@@ -67,7 +67,7 @@ def load_data(directory):
     return data_points
 
 def main():
-    set_paper_style()
+    apply_style()
 
     # Load data from both directories
     ep_data = load_data(EXPERT_PARALLEL_DIR)
@@ -76,11 +76,9 @@ def main():
     print(f"Expert Parallel data points: {len(ep_data)}")
     print(f"Tensor Parallel data points: {len(tp_data)}")
 
-    # Create the plot with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-
-    # Get colors from palette
-    colors = get_palette(2, name="tableau10")
+    fig, (ax1, ax2) = paper_figure(width="double", n_axes=2,
+                                    height=2.6)
+    colors = palette(2, name="tableau10")
 
     # ===== Plot 1: TPOT vs Throughput =====
     # Plot Expert Parallel series
@@ -90,7 +88,7 @@ def main():
         ep_batch_sizes = [d['batch_size'] for d in ep_data]
 
         ax1.plot(ep_tpots, ep_throughputs, '-o', color=colors[0],
-                linewidth=2, markersize=8, label='Expert Parallel')
+                label='Expert Parallel')
 
         # Annotate each point with batch size
         for throughput, tpot, batch_size in zip(ep_throughputs, ep_tpots, ep_batch_sizes):
@@ -108,7 +106,7 @@ def main():
         tp_batch_sizes = [d['batch_size'] for d in tp_data]
 
         ax1.plot(tp_tpots, tp_throughputs, '-s', color=colors[1],
-                linewidth=2, markersize=8, label='Tensor Parallel')
+                label='Tensor Parallel')
 
         # Annotate each point with batch size
         for throughput, tpot, batch_size in zip(tp_throughputs, tp_tpots, tp_batch_sizes):
@@ -119,12 +117,9 @@ def main():
                        fontsize=8,
                        alpha=0.8)
 
-    # Configure plot 1
-    ax1.set_xlabel('Mean TPOT (ms)')
-    ax1.set_ylabel('Total Token Throughput (tokens/s)')
-    ax1.legend(loc='best', frameon=False)
-    ax1.grid(True, linestyle='--', alpha=0.35)
-    ax1.set_title('TPOT vs Throughput')
+    style_axes(ax1, x_label='Mean TPOT (ms)',
+               y_label='Total Token Throughput (tokens/s)')
+    style_legend(ax1)
 
     # ===== Plot 2: TTFT vs Throughput =====
     # Plot Expert Parallel series
@@ -134,7 +129,7 @@ def main():
         ep_batch_sizes = [d['batch_size'] for d in ep_data]
 
         ax2.plot(ep_ttfts, ep_throughputs, '-o', color=colors[0],
-                linewidth=2, markersize=8, label='Expert Parallel')
+                label='Expert Parallel')
 
         # Annotate each point with batch size
         for throughput, ttft, batch_size in zip(ep_throughputs, ep_ttfts, ep_batch_sizes):
@@ -152,7 +147,7 @@ def main():
         tp_batch_sizes = [d['batch_size'] for d in tp_data]
 
         ax2.plot(tp_ttfts, tp_throughputs, '-s', color=colors[1],
-                linewidth=2, markersize=8, label='Tensor Parallel')
+                label='Tensor Parallel')
 
         # Annotate each point with batch size
         for throughput, ttft, batch_size in zip(tp_throughputs, tp_ttfts, tp_batch_sizes):
@@ -163,18 +158,11 @@ def main():
                        fontsize=8,
                        alpha=0.8)
 
-    # Configure plot 2
-    ax2.set_xlabel('Mean TTFT (ms)')
-    ax2.set_ylabel('Total Token Throughput (tokens/s)')
-    ax2.legend(loc='best', frameon=False)
-    ax2.grid(True, linestyle='--', alpha=0.35)
-    ax2.set_title('TTFT vs Throughput')
+    style_axes(ax2, x_label='Mean TTFT (ms)',
+               y_label='Total Token Throughput (tokens/s)')
+    style_legend(ax2)
 
-    # Adjust layout
-    fig.tight_layout()
-
-    # Save the figure
-    fig.savefig(OUTPUT_FILE, format='pdf', bbox_inches='tight')
+    save_fig(fig, OUTPUT_FILE)
     print(f"Saved plot to {OUTPUT_FILE}")
 
     # Print summary

@@ -6,9 +6,11 @@ from pathlib import Path
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
-from utils import *
-
 import matplotlib.pyplot as plt
+from matplotlib import cycler
+from matplotlib.ticker import MaxNLocator
+from style import (apply_style, paper_figure, save_fig, palette,
+                   style_axes, style_legend, MARKERS)
 
 total_experts = 128
 
@@ -216,18 +218,14 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
     # center bars around tick
 
     # Paper style + consistent colors for all lines in these figures
-    set_paper_style()
-    apply_color_cycle(len(all_batch_sizes) * len(routing_ids), "tableau10")
+    apply_style()
+    plt.rcParams["axes.prop_cycle"] = cycler(
+        color=palette(len(all_batch_sizes) * len(routing_ids),
+                      "tableau10"))
 
     for metric in METRICS:
-        fig = plt.figure(figsize=(3.0, 2.4))
-        ax = plt.gca()
-
-        # clean axes
-        # ax.spines["top"].set_visible(False)
-        # ax.spines["right"].set_visible(False)
-        ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-        ax.grid(True, axis="x", linestyle="--", alpha=0.35)
+        fig, ax = paper_figure(width="single", height=2.0)
+        ax.grid(True, axis="both", linestyle="--", alpha=0.35)
 
         # integer x axis from your `reps`
         x_vals = np.array(sorted(reps), dtype=float)
@@ -254,39 +252,29 @@ def plot_group(group_key, rep_to_bsdata, outdir, dataset_name, routing_ids):
 
                 marker = MARKERS[series_idx % len(MARKERS)]
                 series_idx += 1
-                ax.plot(
-                    x_vals, arr,
-                    marker=marker, linewidth=2.2, markersize=5.5,
-                    label=f"batch={batch_size}",
-                )
+                ax.plot(x_vals, arr, marker=marker,
+                         label=f"batch={batch_size}")
                 print(arr)
                 if np.any(np.isfinite(arr)):
                     max_h = max(max_h, np.nanmax(arr))
 
-        ax.set_ylabel(metric_to_ylabel(metric))
-        ax.set_xlabel("Replication Ratio")
-        ax.set_title(metric_to_title(metric))
+        style_axes(ax,
+                   x_label="Replication Ratio",
+                   y_label=metric_to_ylabel(metric),
+                   y_lim=(0, max_h * 1.15) if max_h > 0 else None)
         if metric == 'total_token_throughput':
             ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
             offset_text = ax.yaxis.get_offset_text()
             offset_text.set_x(-0.1)
             offset_text.set_y(0.5)
-        if max_h > 0:
-            ax.set_ylim(0, max_h * 1.15)
 
-        if metric == 'mean_tpot_ms':
-            if series_idx > 0:
-                ax.legend(frameon=False, ncol=1, handlelength=2.2, columnspacing=1.0)
-
-        fig.tight_layout()
+        if metric == 'mean_tpot_ms' and series_idx > 0:
+            style_legend(ax, ncol=1)
 
         bs_tag = ",".join(map(str, sorted(all_batch_sizes)))
         base = Path(outdir) / f"{metric}_g{num_gpus}_ep{ep_degree}_bs{bs_tag}_{dataset_name.replace('/', '_')}"
-        base.parent.mkdir(parents=True, exist_ok=True)
         plt.locator_params(axis='y', nbins=metric_to_ticks[metric])
-        fig.subplots_adjust(top=0.88, bottom=0.2, left=metric_to_plot_left_adust[metric], right=0.97)
-        fig.savefig(f"{base}.pdf", transparent=True)
-        # fig.savefig(f"{base}.png", transparent=True)
+        save_fig(fig, f"{base}.pdf")
         plt.close(fig)
 
 def main():

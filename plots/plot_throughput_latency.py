@@ -15,6 +15,11 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from style import (apply_style, paper_figure, save_fig, style_axes,
+                   style_legend, metro_palette)
+
+apply_style()
+
 RESULTS_DIR = Path("results/vllm_results_final")
 OUTPUT_DIR = Path("plots")
 
@@ -42,37 +47,43 @@ def build_configs(replicas_15x):
     """Legend configurations keyed by (use_ep, replicas, backend, threshold).
 
     The 1.5x rows use replicas_15x = num_experts // 2 for the current model.
+
+    Color rule: METRO is the only warm series (vermilion); the other
+    three baselines (TP, EP 1.0x, EP 1.5x) draw from the cold family
+    so the warm/cold contrast pre-attentively separates "our system"
+    from the baselines.
     """
+    metro_c, cold = metro_palette(3)
     return {
         # TP: use_ep=0, backend=allgather_reducescatter
         (0, 0, "allgather_reducescatter", 0): {
             "label": "TP",
-            "color": "#1f77b4",
+            "color": cold[0],
             "marker": "o",
         },
         # EP 1.0x: use_ep=1, 0 rep, dispatch_combine
         (1, 0, "dispatch_combine", 0): {
             "label": "EP 1.0x",
-            "color": "#ff7f0e",
+            "color": cold[1],
             "marker": "s",
         },
         # EP 1.5x: use_ep=1, replicas_15x rep, threshold=0
         (1, replicas_15x, "dispatch_combine", 0): {
             "label": "EP 1.5x",
-            "color": "#2ca02c",
+            "color": cold[2],
             "marker": "^",
         },
         # METRO 1.5x: use_ep=1, replicas_15x rep, any threshold > 0
         (1, replicas_15x, "dispatch_combine", ANY_POSITIVE): {
             "label": "METRO 1.5x",
-            "color": "#d62728",
+            "color": metro_c,
             "marker": "D",
         },
     }
 
 DATASET_NAMES = {
     0: "InstructCoder",
-    1: "TextEdit",
+    1: "Edit_5k_char",
     2: "ShareGPT",
 }
 
@@ -234,7 +245,7 @@ def model_slug(model_name):
 def plot_dataset(results, model, configs, dataset_id, metric, ylabel,
                  filename):
     """Plot throughput vs metric for one (model, dataset)."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = paper_figure(width="single", ratio=0.75)
 
     for config_key, style in configs.items():
         use_ep, replicas, backend, threshold = config_key
@@ -242,7 +253,6 @@ def plot_dataset(results, model, configs, dataset_id, metric, ylabel,
             thr_match = lambda t: t > 0
         else:
             thr_match = lambda t, th=threshold: t == th
-        # Filter matching results
         pts = [
             r for r in results
             if r["dataset"] == dataset_id
@@ -253,41 +263,25 @@ def plot_dataset(results, model, configs, dataset_id, metric, ylabel,
         ]
         if not pts:
             continue
-        # Sort by batch size
         pts.sort(key=lambda r: r["batch"])
         x = [r["throughput"] for r in pts]
         y = [r[metric] for r in pts]
-        batches = [r["batch"] for r in pts]
 
         ax.plot(y, x,
                 label=style["label"],
                 color=style["color"],
                 marker=style["marker"],
-                markersize=8,
-                linewidth=2)
+                markersize=7,
+                linewidth=2.0)
 
-        # Annotate batch sizes
-        for xi, yi, b in zip(x, y, batches):
-            ax.annotate(f"B={b}",
-                        (yi, xi),
-                        textcoords="offset points",
-                        xytext=(5, 5),
-                        fontsize=7,
-                        color=style["color"])
-
-    dataset_name = DATASET_NAMES.get(dataset_id, f"Dataset {dataset_id}")
-    ax.set_xlabel(ylabel, fontsize=12)
-    ax.set_ylabel("Total Token Throughput (tok/s)", fontsize=12)
-    ax.set_title(f"{model} | {dataset_name}: {ylabel} vs Throughput",
-                 fontsize=13)
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-    fig.tight_layout()
+    style_axes(ax,
+               x_label=ylabel,
+               y_label="Throughput (token/s)",
+               y_lim=(0, None))
+    style_legend(ax)
 
     out_path = OUTPUT_DIR / filename
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    save_fig(fig, out_path)
     print(f"Saved: {out_path}")
     plt.close(fig)
 

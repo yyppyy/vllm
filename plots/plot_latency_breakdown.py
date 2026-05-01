@@ -4,11 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from utils import (
-    set_paper_style,
-    get_palette,
-    HATCHES
-)
+from style import (apply_style, paper_figure, save_fig, palette,
+                   HATCHES, style_axes, style_legend)
 
 num_layers = 48
 
@@ -22,24 +19,21 @@ components = ["topk", "routing_lock", "all2all", "ffn", "attention"]
 legend_components = ["Top-k", "Routing", "All2All / AllGather", "FFN", "Attention"]
 
 def main():
-    # make it pretty
-    set_paper_style()
+    apply_style()
 
     df = pd.read_csv(CSV_PATH)
-    # keep ordering nice
     df = df.sort_values(["replication_id", "routing_id"])
 
     replications = df["replication_id"].unique()
     routing_ids = sorted(df["routing_id"].unique())
 
-    # colors: one per component, consistent
-    comp_colors = get_palette(len(components), name="tableau10")
+    comp_colors = palette(len(components), name="tableau10")
     comp_color_map = {comp: comp_colors[i] for i, comp in enumerate(components)}
 
     x = np.arange(len(replications), dtype=float)
     bar_width = 0.36 if len(routing_ids) == 2 else 0.8 / max(len(routing_ids), 1)
 
-    fig, ax = plt.subplots(figsize=(8, 3.5))
+    fig, ax = paper_figure(width="double", height=2.4)
 
     # y positions for each replication group
     y = np.arange(len(replications), dtype=float)
@@ -121,19 +115,12 @@ def main():
         frameon=False,
     )
 
-    # y ticks correspond to replications
     ax.set_yticks(y)
     ax.set_yticklabels([str(r) for r in replications])
-    ax.set_ylabel("Replication Ratio")
+    style_axes(ax, x_label="Time (us)", y_label="Replication Ratio")
 
-    ax.set_xlabel("Time (us)")
-
-    # ax.grid(axis="x", linestyle="--", alpha=0.4)
-    # ax.margins(y=0.03)
-
-    plt.subplots_adjust(top=0.85, bottom=0.15, left=0.1, right=0.99)  # leave space for legends
-    # fig.tight_layout()
-    fig.savefig(OUT_PATH, format="pdf")
+    plt.subplots_adjust(top=0.85, bottom=0.15, left=0.1, right=0.99)
+    save_fig(fig, OUT_PATH, tight=False)
     print(f"saved to {OUT_PATH.resolve()}")
 
 

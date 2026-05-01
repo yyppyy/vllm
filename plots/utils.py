@@ -1,62 +1,50 @@
-# =========================
-# Reusable plotting helpers
-# =========================
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
-from matplotlib import cycler
-from pathlib import Path
+# SPDX-License-Identifier: Apache-2.0
+"""Backwards-compatibility shim.
 
-# 1) Color-blind-safe palettes you can reuse anywhere
-PALETTES = {
-    "okabe_ito": [
-        "#000000", "#E69F00", "#56B4E9", "#009E73",
-        "#F0E442", "#0072B2", "#D55E00", "#CC79A7"
-    ],
-    "tableau10": [
-        "#4E79A7", "#59A14F", "#B07AA1", "#F28E2B", "#E15759",
-        "#76B7B2", "#EDC948", "#FF9DA7", "#9C755F", "#BAB0AC"
-    ],
-    "tol_bright": [
-        "#4477AA", "#66CCEE", "#228833", "#CCBB44",
-        "#EE6677", "#AA3377", "#BBBBBB", "#000000"
-    ],
-}
+The unified plotting style now lives in `plots/style.py`. This module
+re-exports the functions and palettes scripts already imported via
+`from utils import …`, so older callers keep working unchanged. New
+code should import from `plots.style` directly.
+"""
+from style import (  # noqa: F401
+    PALETTES,
+    DEFAULT_PALETTE,
+    MARKERS,
+    LINE_STYLES,
+    HATCHES,
+    apply_style,
+    palette,
+    markers,
+    line_styles,
+    hatches,
+    paper_figure,
+    save_fig,
+    style_axes,
+    style_legend,
+    line,
+    scatter,
+    bar,
+    box,
+)
 
+
+# Legacy spellings kept for the old call sites.
 def get_palette(n: int, name: str = "okabe_ito"):
-    base = PALETTES.get(name, PALETTES["okabe_ito"])
-    if n <= len(base):
-        return base[:n]
-    reps = int(np.ceil(n / len(base)))
-    return (base * reps)[:n]
+    return palette(n, name)
+
 
 def apply_color_cycle(n_series: int, name: str = "okabe_ito"):
-    colors = get_palette(n_series, name)
+    """Set the global color cycle. New code should call apply_style()
+    which already does this."""
+    import matplotlib.pyplot as plt
+    from matplotlib import cycler
+    colors = palette(n_series, name)
     plt.rcParams["axes.prop_cycle"] = cycler(color=colors)
     return colors
 
-def set_paper_style(*, base_font=11, dpi=300, grid_alpha=0.35):
-    plt.rcParams.update({
-        "figure.dpi": 180,
-        # "savefig.dpi": dpi,
-        # "savefig.bbox": "tight",
-        # "savefig.pad_inches": 0.02,
-        "font.size": base_font,
-        "axes.titlesize": base_font,
-        "axes.labelsize": base_font,
-        "xtick.labelsize": base_font,
-        "ytick.labelsize": base_font,
-        "legend.fontsize": base_font,
-        "axes.titlepad": 8,
-        "axes.labelpad": 6,
-        "axes.linewidth": 1.0,
-        "grid.linewidth": 0.6,
-        "grid.alpha": grid_alpha,
-        "pdf.fonttype": 42,
-        "ps.fonttype": 42,
-    })
 
-MARKERS = ['o', 's', '^', 'D', 'v', 'X', 'P', '*', 'h', 'p']
-
-# hatches to distinguish routing_id
-HATCHES = ["//", "\\\\", "--", "xx", "||", "++", "oo", "**", ""]
+def set_paper_style(*, base_font: float = 9.0,
+                    palette_name: str = "okabe_ito",
+                    **kwargs):
+    """Legacy entry point. Forwards to apply_style()."""
+    apply_style(base_font=base_font, palette_name=palette_name)

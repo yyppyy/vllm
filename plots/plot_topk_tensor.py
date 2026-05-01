@@ -9,6 +9,9 @@ import itertools
 
 import torch
 import matplotlib.pyplot as plt
+from style import (apply_style, paper_figure, save_fig, style_axes,
+                   style_legend)
+apply_style()
 
 
 FNAME_RANK_RE = re.compile(r"\.ep(\d+)\.pt$")
@@ -207,7 +210,7 @@ def main():
         all_bs = sorted({b for r in replica_values for b in groups[(ng, ep)][r].keys()})
 
         # Plot 1: avg max activated replicas vs BATCH_SIZE
-        plt.figure()
+        fig, ax = paper_figure(width="single")
         for r in replica_values:
             x, y = [], []
             for bs in all_bs:
@@ -215,18 +218,17 @@ def main():
                     x.append(bs)
                     y.append(groups[(ng, ep)][r][bs][0])
             if x:
-                plt.plot(x, y, marker="o", label=f"NUM_REPLICAS={r}")
-        plt.xlabel("BATCH_SIZE")
-        plt.ylabel("Avg. max activated replicas (per-batch, max over EP ranks)")
-        plt.title(f"Activated replicas vs BATCH_SIZE (NUM_GPUS={ng}, EP_DEGREE={ep})")
-        plt.grid(True, linestyle="--", alpha=0.4)
-        plt.legend()
+                ax.plot(x, y, marker="o", label=f"NUM_REPLICAS={r}")
+        style_axes(ax,
+                   x_label="BATCH_SIZE",
+                   y_label="Avg. max activated replicas")
+        style_legend(ax)
         out1 = os.path.join(args.output_dir, f"activated_replicas_NUMGPUS{ng}_EP{ep}.png")
-        plt.savefig(out1, bbox_inches="tight")
-        plt.close()
+        save_fig(fig, out1)
+        plt.close(fig)
 
         # Plot 2: avg max tokens on a rank vs BATCH_SIZE
-        plt.figure()
+        fig, ax = paper_figure(width="single")
         for r in replica_values:
             x, y = [], []
             for bs in all_bs:
@@ -234,15 +236,14 @@ def main():
                     x.append(bs)
                     y.append(groups[(ng, ep)][r][bs][1])
             if x:
-                plt.plot(x, y, marker="o", label=f"NUM_REPLICAS={r}")
-        plt.xlabel("BATCH_SIZE")
-        plt.ylabel("Avg. max tokens on a rank (per-batch)")
-        plt.title(f"Max tokens per rank vs BATCH_SIZE (NUM_GPUS={ng}, EP_DEGREE={ep})")
-        plt.grid(True, linestyle="--", alpha=0.4)
-        plt.legend()
+                ax.plot(x, y, marker="o", label=f"NUM_REPLICAS={r}")
+        style_axes(ax,
+                   x_label="BATCH_SIZE",
+                   y_label="Avg. max tokens on a rank")
+        style_legend(ax)
         out2 = os.path.join(args.output_dir, f"max_tokens_NUMGPUS{ng}_EP{ep}.png")
-        plt.savefig(out2, bbox_inches="tight")
-        plt.close()
+        save_fig(fig, out2)
+        plt.close(fig)
 
         print(f"Wrote:\n  {out1}\n  {out2}")
 

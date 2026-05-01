@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 
-from utils import set_paper_style, get_palette, HATCHES
+from style import (apply_style, paper_figure, save_fig, palette,
+                   HATCHES, style_axes, style_legend, metro_palette)
 
 CSV_PATH = Path("../results") / "routing_solver.csv"
 OUT_TIME = Path("routing_solver_time.pdf")
@@ -37,7 +37,7 @@ dataset_to_legend = {
 vllm_eplb_ffn_time_us = [281.3125, 297.7916666666667, 310.7916666666667, 335.7083333333333]
 
 def main():
-    set_paper_style()
+    apply_style()
     
     df = pd.read_csv(CSV_PATH)
 
@@ -59,14 +59,22 @@ def main():
     x = np.arange(len(density_vals), dtype=float)
     bar_width = 0.7 / max(len(algos), 1)
 
-    # colors for algos (consistent across figures)
-    algo_colors = get_palette(len(algo_to_legend), name="tableau10")
-    algo_color_map = {algo: algo_colors[i] for i, algo in enumerate(algo_to_legend.keys())}
+    # METRO is the only warm series; baselines (CPU Optimal, GPU
+    # Optimal, EPLB) get cold colors so the eye snaps to METRO at
+    # first glance.
+    metro_c, cold = metro_palette(len(algo_to_legend) - 1)
+    algo_color_map: dict[str, str] = {}
+    cold_iter = iter(cold)
+    for algo in algo_to_legend:
+        if algo == 'gpu_greedy_lock':       # METRO
+            algo_color_map[algo] = metro_c
+        else:
+            algo_color_map[algo] = next(cold_iter)
 
     # --------------------------------------------------
     # Figure 1: stacked avg_time_ms + avg_copy_ms
     # --------------------------------------------------
-    fig1, ax1 = plt.subplots(figsize=(4, 3.5))
+    fig1, ax1 = paper_figure(width="single", height=2.4)
 
     for j, algo in enumerate(algos):
         sub = df[df["algo"] == algo].set_index("density_factor")
@@ -117,24 +125,14 @@ def main():
     
     ax1.set_xticks(x)
     ax1.set_xticklabels([f'{v}x' for v in density_vals], rotation=30)
-    ax1.set_xlabel("Replication Ratio")
-    ax1.set_ylabel("Time (us)")
-    # ax1.set_title("Routing solver time breakdown")
+    style_axes(ax1, x_label="Replication Ratio", y_label="Time (us)")
 
-    # legend on top
-    leg1 = ax1.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.26),
-        ncol=len(algos),
-        frameon=False,
-        # title="algo",
-    )
-    # leave room for legend
+    style_legend(ax1, loc="upper center",
+                 bbox_to_anchor=(0.5, 1.26),
+                 ncol=len(algos))
     fig1.subplots_adjust(top=0.85, bottom=0.22, left=0.16, right=0.99)
 
-    ax1.grid(axis="y", linestyle="--", alpha=0.35)
-    # fig1.tight_layout()
-    fig1.savefig(OUT_TIME, format="pdf")
+    save_fig(fig1, OUT_TIME, tight=False)
     print(f"saved {OUT_TIME}")
 
     # --------------------------------------------------
@@ -159,7 +157,8 @@ def main():
     datasets = ('humaneval', 'gsm8k')
     mds = [(m, d) for m in models for d in datasets]
     # create subplots with shared y so they all use the same scale
-    fig2, ax2s = plt.subplots(1, len(mds), figsize=(8, 3.5), sharey=True)
+    fig2, ax2s = paper_figure(width="double", n_axes=len(mds),
+                               height=2.4, sharey=True)
 
     # if len(mds) == 1, make ax2s iterable
     if not isinstance(ax2s, (list, np.ndarray)):
@@ -227,7 +226,7 @@ def main():
     # tighten layout, remove horizontal gaps
     fig2.subplots_adjust(top=0.8, bottom=0.2, left=0.07, right=0.995, wspace=0.0)
 
-    fig2.savefig(OUT_EXPERTS, format="pdf")
+    save_fig(fig2, OUT_EXPERTS, tight=False)
     print(f"saved {OUT_EXPERTS}")
 
 

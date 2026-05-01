@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 
-from utils import set_paper_style, get_palette
+from style import (apply_style, paper_figure, save_fig, palette,
+                   style_axes, style_legend)
 
 CSV_PATH = Path("../results/all2all.csv")
 OUT_PATH = Path("all2all_8gpus.pdf")
 
 def main():
-    set_paper_style()
+    apply_style()
 
     df = pd.read_csv(CSV_PATH)
 
@@ -30,10 +30,10 @@ def main():
     bar_width = 0.4 if len(allgathers) == 2 else 0.8 / max(len(allgathers), 1)
 
     # colors per allgather
-    colors = get_palette(len(allgathers), name="okabe_ito")
+    colors = palette(len(allgathers), name="okabe_ito")
     allgather_color = {ag: colors[i] for i, ag in enumerate(allgathers)}
 
-    fig, ax = plt.subplots(figsize=(3.5, 4))
+    fig, ax = paper_figure(width="single", height=2.6)
 
     for j, ag in enumerate(allgathers):
         sub = df[df["allgather"] == ag].set_index("batch")
@@ -53,22 +53,14 @@ def main():
 
     ax.set_xticks(x)
     ax.set_xticklabels([str(b) for b in batches])
-    ax.set_xlabel("Batch Size")
-    ax.set_ylabel("Time (us)")
-    # ax.set_title("Allgather runtime (GPUs=8)")
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
+    style_axes(ax, x_label="Batch Size", y_label="Time (us)",
+               y_zero=True)
 
-    # put legend on top
-    ax.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.15),
-        ncol=len(allgathers),
-        frameon=False,
-    )
-    plt.subplots_adjust(top=0.78)
+    style_legend(ax, loc="upper center",
+                 bbox_to_anchor=(0.5, 1.15),
+                 ncol=len(allgathers))
 
-    fig.tight_layout()
-    fig.savefig(OUT_PATH, format="pdf")
+    save_fig(fig, OUT_PATH)
     print(f"saved to {OUT_PATH.resolve()}")
 
 if __name__ == "__main__":

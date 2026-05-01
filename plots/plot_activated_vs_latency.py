@@ -27,12 +27,18 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from style import (apply_style, paper_figure, save_fig,
+                   style_axes, scatter as plot_scatter,
+                   box as plot_box)
+
+apply_style()
+
 RESULTS_DIR = Path("results/vllm_results_final")
 OUTPUT_DIR = Path("plots")
 
 DATASET_NAMES = {
     0: "InstructCoder",
-    1: "TextEdit",
+    1: "Edit_5k_char",
     2: "ShareGPT",
 }
 
@@ -188,9 +194,8 @@ def collect(results_dir, log_filename, min_batch, max_batch,
 
 
 XAXIS_LABELS = {
-    "n_active":     "activated experts (per rank · layer · batch)",
-    "local_tokens": "local_tokens received by rank "
-                    "(post-dispatch)",
+    "n_active":     "Number of activated experts",
+    "local_tokens": "Number of tokens",
     "post_pad":     "Σ_e ceil(t_e/BSM)·BSM "
                     "(post-padded fused_moe input)",
     "mc":           "mc = min(M·top_k·2, max_recv) "
@@ -212,7 +217,7 @@ COLOR_BY_LABELS = {
 METRIC_INFO = {
     # metric -> (record key, ylabel, filename tag)
     "expert_compute": ("expert_compute_us",
-                       "expert compute latency (us)\n[sum of 5 kernels]",
+                       "Expert compute latency (us)",
                        "exp"),
     "gemm":           ("gemm_us",
                        "fused_moe_kernel latency (us)\n"
@@ -267,7 +272,7 @@ def make_plot(model, dataset, records, metric, xaxis, color_by,
     xs = np.array([r[xaxis] for r in records], dtype=float)
     ys = np.array([r[rec_key] for r in records], dtype=float)
 
-    fig, ax = plt.subplots(figsize=(7.8, 5.2))
+    fig, ax = paper_figure(width="double", ratio=0.5)
     dataset_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
 
     if style == "box":
@@ -283,30 +288,30 @@ def make_plot(model, dataset, records, metric, xaxis, color_by,
             plt.close(fig)
             return
         data = [groups[k] for k in keys]
-        ax.boxplot(data, positions=keys, widths=0.6,
-                   showfliers=False, manage_ticks=False,
-                   medianprops=dict(color="#d62728", linewidth=1.4),
-                   boxprops=dict(linewidth=0.9),
-                   whiskerprops=dict(linewidth=0.9),
-                   capprops=dict(linewidth=0.9))
-        ax.set_xlim(min(keys) - 0.7, max(keys) + 0.7)
+        # Boxes at positions 1..N with width 0.5 give a fixed
+        # box:gap ratio of 1:1 regardless of N.
+        positions = list(range(1, len(keys) + 1))
+        # Box:gap ratio of 6:4 — boxes occupy 0.6 of each unit slot,
+        # leaving 0.4 between adjacent boxes.
+        plot_box(ax, data, positions=positions, widths=0.6,
+                 manage_ticks=False)
+        ax.set_xticks(positions)
+        ax.set_xticklabels([str(k) for k in keys])
+        ax.set_xlim(0.5, len(keys) + 0.5)
     else:
         if color_by != "none":
             cs = np.array([r[color_by] for r in records], dtype=float)
             sc = ax.scatter(xs, ys, c=cs, cmap="viridis",
                             s=12, alpha=0.55, edgecolor="none")
             cbar = fig.colorbar(sc, ax=ax)
-            cbar.set_label(COLOR_BY_LABELS[color_by], fontsize=9)
+            cbar.set_label(COLOR_BY_LABELS[color_by])
         else:
-            ax.scatter(xs, ys, s=10, alpha=0.25, edgecolor="none",
-                       color="#1f77b4")
+            plot_scatter(ax, xs, ys, series=0, s=10, alpha=0.25,
+                         edgecolor="none")
 
-    ax.set_xlabel(XAXIS_LABELS[xaxis])
-    ax.set_ylabel(ylabel)
-    ax.set_title(f"{model}  /  {dataset_name}")
-    ax.set_ylim(bottom=0)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    style_axes(ax,
+               x_label=XAXIS_LABELS[xaxis],
+               y_label=ylabel)
 
     safe_model = model.replace("/", "_")
     color_tag = "" if color_by == "none" or style == "box" \
@@ -316,7 +321,7 @@ def make_plot(model, dataset, records, metric, xaxis, color_by,
         f"activated_vs_latency_{metric_tag}_"
         f"x{XAXIS_TAGS[xaxis]}{color_tag}{style_tag}_"
         f"{safe_model}_{dataset_name}.pdf")
-    fig.savefig(out)
+    save_fig(fig, out)
     plt.close(fig)
     print(f"  wrote {out}  (n={len(xs)})")
 

@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 
 import matplotlib.pyplot as plt
+from style import (apply_style, save_fig, style_axes, style_legend)
+apply_style()
 
 # Filename pattern: bench_result_${NUM_GPUS}_${EP_DEGREE}_${NUM_REPLICAS}_${BATCH_SIZE}.json
 SERVER_NAME_RE = re.compile(
@@ -183,16 +185,12 @@ def plot_group(group_key, rep_to_bsdata, outdir, y_cut, gap_ratio=0.04):
         ax_bottom.plot((1 - d, 1 + d), (1 - d, 1 + d), **kw_bot)    # bottom-right
 
     # Labels & styling
-    ax_bottom.set_xlabel("Per-GPU batch size")
-    ax_bottom.set_ylabel("batch computation time (s)")
-    # fig.suptitle(
-    #     f"Avg runtime vs inner batch size y (broken y-axis at {y_cut})\n"
-    #     f"NUM_GPUS={num_gpus}, EP_DEGREE={ep_degree}, BATCH_SIZE={outer_batch_size}"
-    # )
+    style_axes(ax_bottom,
+               x_label="Per-GPU batch size",
+               y_label="batch computation time (s)")
     ax_bottom.set_xticks(x, all_y)
-    ax_bottom.grid(True, axis="y", linestyle="--", alpha=0.4)
     if has_top:
-        ax_top.grid(True, axis="y", linestyle="--", alpha=0.4)
+        style_axes(ax_top, grid_axis="y")
 
     # Single legend (dedup handles)
     handles, labels = ax_bottom.get_legend_handles_labels()
@@ -200,11 +198,11 @@ def plot_group(group_key, rep_to_bsdata, outdir, y_cut, gap_ratio=0.04):
     for h, l in zip(handles, labels):
         if l not in seen:
             seen.add(l); h_dedup.append(h); l_dedup.append(l)
-    (ax_top if has_top else ax_bottom).legend(h_dedup, l_dedup, title="Replicas", frameon=False, loc="best")
+    target_ax = ax_top if has_top else ax_bottom
+    target_ax.legend(h_dedup, l_dedup, title="Replicas")
 
     base = Path(outdir) / f"avg_runtime_y_broken_g{num_gpus}_ep{ep_degree}_bs{outer_batch_size}_cut{y_cut}"
-    base.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(f"{base}.pdf")
+    save_fig(fig, f"{base}.pdf", tight=False)
     plt.close(fig)
 
 def main():
