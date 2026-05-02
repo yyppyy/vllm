@@ -5,7 +5,7 @@
 # Same 13 positional args as bench_exp_vs_latency.sh. Differences:
 #   - Zipfian routing DISABLED (VLLM_ZIPFIAN_ROUTING=0).
 #   - Profile output goes to results/$RUN_HASH/server_tokcnt.log
-#     instead of server_explat.log.
+#     (the engine stdout/stderr still go to server_main.log).
 #   - Bench client sends prefill requests at a Poisson rate matched
 #     to the expected steady-state concurrency (Little's law,
 #     option (a)) instead of blasting all NUM_PROMPTS at once.
@@ -84,9 +84,10 @@ unset VLLM_PREFILL_BEFORE_DECODE
 export VLLM_ZIPFIAN_ROUTING=0
 export VLLM_EPLB_NUM_GROUPS=${EPLB_NUM_GROUPS}
 
-# Per-(rank, layer, batch) profile gate. Output goes to
-# server_tokcnt.log instead of server_explat.log so this run's data
-# doesn't collide with bench_exp_vs_latency.sh in the same RUN_HASH.
+# Per-(rank, layer, batch) profile gate. The in-process explat poller
+# writes records to $TOKCNT_LOG (server_tokcnt.log) so this run's
+# data sits alongside bench_exp_vs_latency.sh's server_explat.log in
+# the same RUN_HASH directory without colliding.
 READY_FILE="$RES_DIR/$RUN_HASH/tokcnt_ready"
 TOKCNT_LOG="$RES_DIR/$RUN_HASH/server_tokcnt.log"
 rm -f "$READY_FILE" "$TOKCNT_LOG"

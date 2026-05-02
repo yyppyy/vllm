@@ -2327,6 +2327,8 @@ class FusedMoE(CustomOp):
             )
             if routed_scaling_factor is not None:
                 topk_weights *= routed_scaling_factor
+            if indices_type is not None:
+                topk_ids = topk_ids.to(dtype=indices_type)
         elif custom_routing_function is None:
             topk_weights, topk_ids, token_expert_indices = fused_topk(
                 hidden_states=hidden_states,
