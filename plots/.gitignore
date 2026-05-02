@@ -34,3 +34,7 @@
 !throughput_vs_p99ttft_ernie-4-5-21b-a3b-pt_instructcoder.pdf
 !throughput_vs_p99ttft_qwen3-30b-a3b-8-128_edit_5k_char.pdf
 !throughput_vs_p99ttft_qwen3-30b-a3b-8-128_instructcoder.pdf
+!membound_cdf_ERNIE-4.5-21B-A3B-PT_Edit_5k_char.pdf
+!membound_cdf_ERNIE-4.5-21B-A3B-PT_InstructCoder.pdf
+!membound_cdf_Qwen3-30B-A3B-8-128_Edit_5k_char.pdf
+!membound_cdf_Qwen3-30B-A3B-8-128_InstructCoder.pdf
