@@ -191,15 +191,13 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
     if not ratios:
         return None
 
-    # 2x the standard panel width; ~30 % taller than STANDARD so the
-    # extra annotation row above each bar (for small segments like
-    # routing) and the inline y-axis label both fit without crowding.
+    # 2x the standard panel width; ~15 % taller than STANDARD to
+    # leave room for the two stacked legends without crowding the
+    # bars.
     fig, ax = plt.subplots(
-        figsize=(2 * STANDARD_PANEL_WIDTH, 1.30 * STANDARD_PANEL_HEIGHT))
-    # Left margin tightened (we put the y-axis label inline above
-    # the tick column instead of in the left gutter). Top margin
-    # gives room for two stacked legends.
-    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.16, top=0.82)
+        figsize=(2 * STANDARD_PANEL_WIDTH, 1.15 * STANDARD_PANEL_HEIGHT))
+    # Standard left-gutter y-axis label, two-line legend stack above.
+    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.18, top=0.80)
 
     colors = palette(len(CATEGORIES), name="tableau10")
     color_map = {c: colors[i] for i, c in enumerate(CATEGORIES)}
@@ -270,17 +268,8 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
     x_axis_max = x_max if x_max is not None else max_total * 1.18
     style_axes(ax,
                x_label="Mean per-layer latency (us)",
-               y_label=None,
+               y_label="Replication Ratio",
                x_lim=(0.0, x_axis_max))
-
-    # Inline y-axis label: replaces the standard rotated label in
-    # the left gutter with a horizontal annotation INSIDE the canvas,
-    # tucked into the empty band above the topmost row of bars (the
-    # space between the topmost bar and the top spine, freed by the
-    # widened y_lim).
-    ax.text(0.005, 0.99, "Replication Ratio",
-            transform=ax.transAxes, ha="left", va="top",
-            fontsize=plt.rcParams["axes.labelsize"])
 
     # Two legends stacked above the axes: categories (color) on the
     # top row, systems (hatch) on the bottom row. Side-by-side on the
@@ -296,13 +285,13 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
     leg1 = ax.legend(cat_handles, cat_labels,
                      ncols=len(CATEGORIES),
                      loc="upper center",
-                     bbox_to_anchor=(0.5, 1.32),
+                     bbox_to_anchor=(0.5, 1.24),
                      frameon=False)
     ax.add_artist(leg1)
     ax.legend(sys_handles, SYSTEMS,
               ncols=len(SYSTEMS),
               loc="upper center",
-              bbox_to_anchor=(0.5, 1.15),
+              bbox_to_anchor=(0.5, 1.12),
               frameon=False)
 
     ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
