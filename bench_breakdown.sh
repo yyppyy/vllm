@@ -3,8 +3,8 @@
 # 6-category latency-breakdown profile companion to
 # bench_exp_vs_latency.sh / bench_tok_cnt.sh.
 #
-# Same 13 positional args. Differences:
-#   - Zipfian routing DISABLED (VLLM_ZIPFIAN_ROUTING=0).
+# Same 13 positional args. Engine config aligned with bench_serve.sh
+# (VLLM_ZIPFIAN_ROUTING=1, same --compilation-config). Differences:
 #   - Uses the VLLM_BREAKDOWN_* env-var family (independent of the
 #     VLLM_EXP_LATENCY_* explat profile and the VLLM_DC_PROFILE
 #     dispatch-combine timestamp dump). The three profilers can run
@@ -12,8 +12,11 @@
 #     breakdown one.
 #   - Profile output goes to results/$RUN_HASH/server_breakdown.log
 #     (the engine stdout/stderr still go to server_main.log).
-#   - Bench client sends prefill requests at a Poisson rate matched
-#     to the expected steady-state concurrency (Little's law).
+#   - Single closed-loop client (all requests submitted up front,
+#     `--max-concurrency` caps in-flight set), matching bench_serve.sh
+#     — no Poisson arrival, no multi-client looping.
+#   - VLLM_DISABLE_COMPILE_CACHE=1 to bypass the schema-mismatch
+#     hazard from cached compiles built without breakdown wiring.
 #
 # Output line format (one per (rank, layer, batch) replay):
 #   Breakdown seq=N rank=R layer=L M=M
@@ -91,8 +94,8 @@ SCHED_PY="vllm/v1/core/sched/scheduler.py"
 sed -i 's|"VLLM_PREFILL_BEFORE_DECODE", "[^"]*"|"VLLM_PREFILL_BEFORE_DECODE", "0"|' "$SCHED_PY"
 unset VLLM_PREFILL_BEFORE_DECODE
 
-# Differences from bench_exp_vs_latency.sh: zipfian routing OFF.
-export VLLM_ZIPFIAN_ROUTING=0
+# Aligned with bench_serve.sh.
+export VLLM_ZIPFIAN_ROUTING=1
 export VLLM_EPLB_NUM_GROUPS=${EPLB_NUM_GROUPS}
 
 # Disable vLLM's torch.compile cache for breakdown runs. The
@@ -134,6 +137,7 @@ args=(
   --tensor-parallel-size 1
   --max-num-seqs $MAX_REQ_PER_BATCH
   --no-enable-chunked-prefill
+  --compilation-config "{\"level\": 3, \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]}"
   --max-model-len 8192
   --max-num-batched-tokens $MAX_TOKEN_PER_BATCH
   --expert-placement-strategy linear
@@ -175,18 +179,6 @@ WARMUP_PROMPTS=$((1 * NUM_PROMPTS))
 INPUT_LEN=512
 OUTPUT_LEN=512
 
-# Steady-state arrival rate (Little's law). Estimate request lifetime
-# W (sojourn time) and apply lambda = NUM_PROMPTS / W so the server
-# runs at ~NUM_PROMPTS in flight on average.
-PREFILL_RATE_PER_REQ=${PREFILL_RATE_PER_REQ:-5000}     # tok/s/req
-DECODE_RATE_PER_SEQ=${DECODE_RATE_PER_SEQ:-40}         # tok/s/seq
-W_SEC=$(python3 -c "print($INPUT_LEN / $PREFILL_RATE_PER_REQ + $OUTPUT_LEN / $DECODE_RATE_PER_SEQ)")
-REQUEST_RATE=$(python3 -c "print(round($NUM_PROMPTS / $W_SEC, 2))")
-BURSTINESS=1.0
-echo "=== Steady-state arrival: lambda=$REQUEST_RATE req/s "\
-"(NUM_PROMPTS=$NUM_PROMPTS, W=${W_SEC}s, prefill=${PREFILL_RATE_PER_REQ} tok/s, "\
-"decode=${DECODE_RATE_PER_SEQ} tok/s/seq) ==="
-
 warmup_args=(
     --model "$MODEL_DIR"
     --backend vllm
@@ -215,19 +207,18 @@ vllm bench serve "${warmup_args[@]}"
 echo "=== Warmup done; touching $READY_FILE to enable breakdown output ==="
 touch "$READY_FILE"
 
-# Steady-state client run. Poisson arrivals at lambda=REQUEST_RATE.
+# Closed-loop client run, aligned with bench_serve.sh: all
+# $NUM_PROMPTS requests are submitted up front and `--max-concurrency`
+# caps the in-flight set.
 cli_args=(
     --model "$MODEL_DIR"
     --backend vllm
-    --seed 0
     --percentile-metrics ttft,tpot,itl,e2el
     --metric-percentiles 10,20,30,40,50,95,99
     --ready-check-timeout-sec 2400
     --port "$PORT"
     --num-prompts $NUM_PROMPTS
     --max-concurrency $NUM_PROMPTS
-    --request-rate "$REQUEST_RATE"
-    --burstiness "$BURSTINESS"
 )
 if [[ "$DATASET_NAME" == "random" ]]; then
   cli_args+=( --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN )
@@ -237,7 +228,7 @@ else
   cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME")
 fi
 
-echo "=== Profile run: sending $NUM_PROMPTS Poisson(lambda=$REQUEST_RATE) requests (breakdown output enabled) ==="
+echo "=== Profile run: sending $NUM_PROMPTS requests closed-loop (breakdown output enabled) ==="
 vllm bench serve "${cli_args[@]}"
 
 # The in-process breakdown poller drains the pinned ringbuffer 30s
