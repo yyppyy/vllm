@@ -179,30 +179,35 @@ def _ratio_label(ratio: float) -> str:
     return f"{s}x"
 
 
-def plot_breakdown(per_bucket, model, dataset, out_dir):
+def plot_breakdown(per_bucket, model, dataset, out_dir,
+                   x_max: float | None = None):
     """One figure per (model, dataset). Bars are placed at integer
     y positions per replication ratio; within each ratio EP and METRO
     sit side by side, colored by category and hatched by system.
 
-    `per_bucket` is `{(ratio, system): {category: mean_us}}`."""
+    `per_bucket` is `{(ratio, system): {category: mean_us}}`. When
+    `x_max` is None the axis auto-sizes to ~1.18× the widest bar."""
     ratios = sorted({r for (r, _) in per_bucket.keys()})
     if not ratios:
         return None
 
-    # 2x the standard panel width, height unchanged. Use plt.subplots
-    # directly rather than `paper_figure(n_axes=2)` because we want one
-    # wide axis, not two side-by-side panels.
+    # 2x the standard panel width; ~30 % taller than STANDARD so the
+    # extra annotation row above each bar (for small segments like
+    # routing) and the inline y-axis label both fit without crowding.
     fig, ax = plt.subplots(
-        figsize=(2 * STANDARD_PANEL_WIDTH, STANDARD_PANEL_HEIGHT))
-    # Top margin gives room for two stacked legends above the axes
-    # (categories on row 1, EP/METRO on row 2).
-    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.20, top=0.78)
+        figsize=(2 * STANDARD_PANEL_WIDTH, 1.30 * STANDARD_PANEL_HEIGHT))
+    # Left margin tightened (we put the y-axis label inline above
+    # the tick column instead of in the left gutter). Top margin
+    # gives room for two stacked legends.
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.16, top=0.82)
 
     colors = palette(len(CATEGORIES), name="tableau10")
     color_map = {c: colors[i] for i, c in enumerate(CATEGORIES)}
 
     y = np.arange(len(ratios), dtype=float)
-    bar_height = 0.36 if len(SYSTEMS) == 2 else 0.6
+    # Tighter bars leave a vertical gap between adjacent rows so we
+    # can route leader-line annotations for small segments through it.
+    bar_height = 0.30 if len(SYSTEMS) == 2 else 0.5
 
     bar_totals: dict[tuple[float, str], float] = {}
     for ratio in ratios:
@@ -211,10 +216,14 @@ def plot_breakdown(per_bucket, model, dataset, out_dir):
             bar_totals[(ratio, sysname)] = sum(vals.values())
     max_total = max(bar_totals.values()) if bar_totals else 1.0
     label_min = max_total * 0.06
+    # Categories whose typical value is small enough to be invisible
+    # inside the bar — for these we draw an outside callout with a
+    # leader line instead of dropping the label entirely.
+    SMALL_CALLOUT_CATEGORIES = {"routing"}
 
     for j, sysname in enumerate(SYSTEMS):
-        # Stagger systems vertically around each y-tick: EP above,
-        # METRO below (j=0 -> -0.5, j=1 -> +0.5 of bar_height).
+        # Stagger systems vertically around each y-tick: EP below
+        # (j=0 -> -0.5*bar_height), METRO above (j=1 -> +0.5*bar_height).
         y_offset = (j - (len(SYSTEMS) - 1) / 2.0) * bar_height
         y_pos = y + y_offset
 
@@ -233,12 +242,40 @@ def plot_breakdown(per_bucket, model, dataset, out_dir):
                 label=lg if j == 0 else None,
             )
             for k, v in enumerate(vals):
-                if v < label_min or not present_mask[k]:
+                if not present_mask[k] or v <= 0:
                     continue
-                ax.text(left[k] + v / 2.0, y_pos[k], f"{v:.0f}",
-                        va="center", ha="center",
+                if v >= label_min:
+                    ax.text(left[k] + v / 2.0, y_pos[k], f"{v:.0f}",
+                            va="center", ha="center",
+                            fontsize=plt.rcParams["legend.fontsize"]
+                                - 1,
+                            color="white", fontweight="bold")
+                elif c in SMALL_CALLOUT_CATEGORIES:
+                    # Outside callout with a thin leader line. EP
+                    # (j=0, lower bar) gets its label below; METRO
+                    # (j=1, upper bar) gets its label above. This way
+                    # adjacent EP/METRO callouts in the same row don't
+                    # collide.
+                    seg_x = left[k] + v / 2.0
+                    if j == 1:
+                        seg_y_edge = y_pos[k] + bar_height / 2
+                        label_y = y_pos[k] + 0.45
+                        text_va = "bottom"
+                    else:
+                        seg_y_edge = y_pos[k] - bar_height / 2
+                        label_y = y_pos[k] - 0.45
+                        text_va = "top"
+                    ax.annotate(
+                        f"{v:.0f}",
+                        xy=(seg_x, seg_y_edge),
+                        xytext=(seg_x, label_y),
+                        ha="center", va=text_va,
                         fontsize=plt.rcParams["legend.fontsize"] - 1,
-                        color="white", fontweight="bold")
+                        color=color_map[c], fontweight="bold",
+                        arrowprops=dict(arrowstyle="-",
+                                         linewidth=0.5,
+                                         color=color_map[c]),
+                    )
             left += vals
 
         # Total at right end.
@@ -254,10 +291,22 @@ def plot_breakdown(per_bucket, model, dataset, out_dir):
 
     ax.set_yticks(y)
     ax.set_yticklabels([_ratio_label(r) for r in ratios])
+    # Extend y_lim so the routing callouts above the topmost row and
+    # below the bottommost row don't get clipped.
+    ax.set_ylim(-0.65, len(ratios) - 0.35)
+
+    x_axis_max = x_max if x_max is not None else max_total * 1.18
     style_axes(ax,
                x_label="Mean per-layer latency (us)",
-               y_label="Replication Ratio",
-               x_lim=(0.0, max_total * 1.18))
+               y_label=None,
+               x_lim=(0.0, x_axis_max))
+
+    # Inline y-axis label: replaces the standard rotated label in
+    # the left gutter with a horizontal annotation just above the
+    # top y-tick, freeing up the left margin.
+    ax.text(0.0, 1.02, "Replication Ratio",
+            transform=ax.transAxes, ha="left", va="bottom",
+            fontsize=plt.rcParams["axes.labelsize"])
 
     # Two legends stacked above the axes: categories (color) on the
     # top row, systems (hatch) on the bottom row. Side-by-side on the
@@ -304,6 +353,9 @@ def main() -> int:
     p.add_argument("--min-records", type=int, default=10,
                    help="Drop (replication, system) buckets with "
                         "fewer than this many records (default: 10).")
+    p.add_argument("--x-max", type=float, default=700.0,
+                   help="Upper bound of the x-axis in microseconds "
+                        "(default: 700). Set to 0 to auto-scale.")
     args = p.parse_args()
 
     try:
@@ -374,8 +426,9 @@ def main() -> int:
                   f"no bucket with >= {args.min_records} records "
                   f"in M=[{m_lo}, {m_hi}]")
             continue
+        x_max = args.x_max if args.x_max > 0 else None
         out = plot_breakdown(per_bucket, model, dataset,
-                              args.output_dir)
+                              args.output_dir, x_max=x_max)
         ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
         summary = ", ".join(
             f"{_ratio_label(r)} {s}={bucket_counts[(r, s)]}"
