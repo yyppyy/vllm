@@ -13,14 +13,14 @@ OUT_EXPERTS = Path("routing_solver_experts.pdf")
 algo_to_legend = {
     'cpu_max_flow': 'CPU Optimal',
     'gpu_max_flow': 'GPU Optimal',
-    'gpu_greedy_lock': 'METRO',
+    'gpu_greedy_lock': 'vllm-METRO',
     'eplb': 'EPLB',
 }
 
 algo_to_legend2 = {
     'cpu_max_flow': 'Optimal',
     'gpu_max_flow': 'Optimal',
-    'gpu_greedy_lock': 'METRO',
+    'gpu_greedy_lock': 'vllm-METRO',
     'eplb': 'EPLB',
 }
 

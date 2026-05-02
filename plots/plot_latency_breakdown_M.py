@@ -61,8 +61,10 @@ LEGEND_LABELS = [
     "Attention", "Gating", "Routing", "Dispatch", "Expert", "Combine",
 ]
 
-# System order maps to HATCHES[idx]: '' for EP, '///' for METRO.
-SYSTEMS = ["EP", "METRO"]
+# System order maps to HATCHES[idx]: '' for vllm-EP, '///' for
+# vllm-METRO. These strings are used both as legend labels and as
+# bucket keys (returned by `system_label`).
+SYSTEMS = ["vllm-EP", "vllm-METRO"]
 
 BREAKDOWN_RE = re.compile(
     r"Breakdown seq=(?P<seq>-?\d+) rank=(?P<rank>-?\d+) "
@@ -108,8 +110,9 @@ def model_num_experts(model_name: str) -> int | None:
 
 def system_label(cfg: dict) -> str:
     """Match `plot_throughput_latency.py`: `threshold > 0` is METRO,
-    everything else is EP."""
-    return "METRO" if cfg["threshold"] > 0 else "EP"
+    everything else is plain EP. Returned strings double as legend
+    labels — keep them in sync with `SYSTEMS`."""
+    return "vllm-METRO" if cfg["threshold"] > 0 else "vllm-EP"
 
 
 def replication_ratio(num_replicas: int, num_experts: int | None

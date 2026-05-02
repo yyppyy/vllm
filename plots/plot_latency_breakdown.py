@@ -94,7 +94,7 @@ def main():
             linewidth=1,
         )
         routing_handles.append(patch)
-        routing_labels.append("EPLB" if rid == 0 else "METRO")
+        routing_labels.append("EPLB" if rid == 0 else "vllm-METRO")
 
     # place legends above
     leg1 = ax.legend(
