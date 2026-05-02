@@ -105,7 +105,13 @@ def _ensure_py_stamps_table_locked() -> None:
 
 def _ensure_buffers_locked() -> None:
     """Allocate the singleton armed/counter/ringbuf tensors. Caller
-    must hold _init_lock."""
+    must hold _init_lock.
+
+    `device='cpu'` is required on the pinned ringbuffer because vLLM
+    pushes a CUDA device guard during model construction; without an
+    explicit device here `torch.zeros(..., pin_memory=True)` would try
+    to allocate a CUDA tensor and fail with "Only dense CPU tensors
+    can be pinned"."""
     global _armed, _counter, _ringbuf
     if _armed is None:
         _armed = torch.zeros(1, dtype=torch.int32, device='cuda')
@@ -114,6 +120,7 @@ def _ensure_buffers_locked() -> None:
     if _ringbuf is None:
         _ringbuf = torch.zeros((_N_SLOTS, SLOT_STRIDE_INT64),
                                 dtype=torch.int64,
+                                device='cpu',
                                 pin_memory=True)
 
 
