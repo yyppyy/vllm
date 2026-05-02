@@ -191,7 +191,9 @@ def plot_breakdown(per_bucket, model, dataset, out_dir):
     # wide axis, not two side-by-side panels.
     fig, ax = plt.subplots(
         figsize=(2 * STANDARD_PANEL_WIDTH, STANDARD_PANEL_HEIGHT))
-    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.20, top=0.85)
+    # Top margin gives room for two stacked legends above the axes
+    # (categories on row 1, EP/METRO on row 2).
+    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.20, top=0.78)
 
     colors = palette(len(CATEGORIES), name="tableau10")
     color_map = {c: colors[i] for i, c in enumerate(CATEGORIES)}
@@ -254,8 +256,10 @@ def plot_breakdown(per_bucket, model, dataset, out_dir):
                y_label="Replication Ratio",
                x_lim=(0.0, max_total * 1.18))
 
-    # Two legends: categories (color) above-left, systems (hatch)
-    # above-right; mirrors `plot_latency_breakdown.py`.
+    # Two legends stacked above the axes: categories (color) on the
+    # top row, systems (hatch) on the bottom row. Side-by-side on the
+    # same row is too wide for a 6-category figure and the EP/METRO
+    # box would overlap the categories on the right.
     cat_handles, cat_labels = ax.get_legend_handles_labels()
     sys_handles = [
         plt.Rectangle((0, 0), 1, 1,
@@ -266,13 +270,13 @@ def plot_breakdown(per_bucket, model, dataset, out_dir):
     leg1 = ax.legend(cat_handles, cat_labels,
                      ncols=len(CATEGORIES),
                      loc="upper center",
-                     bbox_to_anchor=(0.4, 1.18),
+                     bbox_to_anchor=(0.5, 1.32),
                      frameon=False)
     ax.add_artist(leg1)
     ax.legend(sys_handles, SYSTEMS,
               ncols=len(SYSTEMS),
               loc="upper center",
-              bbox_to_anchor=(0.92, 1.18),
+              bbox_to_anchor=(0.5, 1.15),
               frameon=False)
 
     ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
