@@ -38,3 +38,5 @@
 !membound_cdf_ERNIE-4.5-21B-A3B-PT_InstructCoder.pdf
 !membound_cdf_Qwen3-30B-A3B-8-128_Edit_5k_char.pdf
 !membound_cdf_Qwen3-30B-A3B-8-128_InstructCoder.pdf
+!latency_breakdown_M_ERNIE-4.5-21B-A3B-PT_InstructCoder.pdf
+!latency_breakdown_M_Qwen3-30B-A3B-8-128_InstructCoder.pdf
