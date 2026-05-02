@@ -116,6 +116,9 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
+    VLLM_EXP_LATENCY_PROFILE: bool = False
+    VLLM_BREAKDOWN_PROFILE: bool = False
+    VLLM_DC_PROFILE: int = 0
     Q_SCALE_CONSTANT: int = 200
     K_SCALE_CONSTANT: int = 200
     V_SCALE_CONSTANT: int = 100
@@ -1017,6 +1020,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_COMPILE_CACHE":
     lambda: bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", "0"))),
 
+    # MoE per-(rank, layer, batch) profilers. Each one mutates the
+    # compiled forward (lifts extra tensor attrs into the FX graph),
+    # so they must participate in `compute_hash()` below — otherwise
+    # a "profile=OFF" compile cache gets reused for a "profile=ON"
+    # run and inductor crashes with "too many values to unpack".
+    "VLLM_EXP_LATENCY_PROFILE":
+    lambda: bool(int(os.getenv("VLLM_EXP_LATENCY_PROFILE", "0"))),
+    "VLLM_BREAKDOWN_PROFILE":
+    lambda: bool(int(os.getenv("VLLM_BREAKDOWN_PROFILE", "0"))),
+    "VLLM_DC_PROFILE":
+    lambda: int(os.getenv("VLLM_DC_PROFILE", "0")),
+
     # If set, vllm will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
@@ -1571,6 +1586,12 @@ def compute_hash() -> str:
         "VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE",
         "VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING",
         "VLLM_USE_FBGEMM",
+        # Profilers — each toggles whether per-layer stamp tensors
+        # are lifted into the compiled forward, changing the FX
+        # graph schema. Cache must be partitioned by these.
+        "VLLM_EXP_LATENCY_PROFILE",
+        "VLLM_BREAKDOWN_PROFILE",
+        "VLLM_DC_PROFILE",
     ]
     for key in environment_variables_to_hash:
         # if this goes out of sync with environment_variables,
