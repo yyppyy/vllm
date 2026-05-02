@@ -38,7 +38,7 @@ from vllm.distributed import (get_ep_group, get_pp_group,
                               tensor_model_parallel_all_gather)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE, breakdown_runtime
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
@@ -108,6 +108,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
 
+        # Used by the breakdown profiler so the gate_start stamp lands
+        # in this layer's row of the global py-stamps table.
+        self.layer_idx = extract_layer_index(prefix)
         config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
@@ -169,6 +172,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+
+        # Breakdown profile: gate_start stamp.
+        if breakdown_runtime.is_enabled():
+            _bd_row = breakdown_runtime.get_py_stamps_row(
+                self.layer_idx)
+            torch.ops._C_explat.record_stamp(_bd_row, 2)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -298,6 +307,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
+        # Used by the breakdown profiler so the attn_start / attn_end
+        # stamps land in this layer's row of the py-stamps table.
+        self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -348,6 +360,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Breakdown profile: attn_start.
+        _bd_on = breakdown_runtime.is_enabled()
+        if _bd_on:
+            _bd_row = breakdown_runtime.get_py_stamps_row(
+                self.layer_idx)
+            torch.ops._C_explat.record_stamp(_bd_row, 0)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -359,6 +378,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+
+        # Breakdown profile: attn_end stamp (just before the MLP /
+        # MoE region begins).
+        if _bd_on:
+            torch.ops._C_explat.record_stamp(_bd_row, 1)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(

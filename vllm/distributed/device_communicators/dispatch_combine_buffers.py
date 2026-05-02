@@ -26,6 +26,14 @@ from vllm.logger import init_logger
 _DC_PROFILE_INTERVAL = int(
     os.environ.get('VLLM_DC_PROFILE', '0'))
 
+# Breakdown profiler also wants the per-step in-kernel timestamps.
+# Allocate the same GPU buffer when VLLM_BREAKDOWN_PROFILE is set,
+# even if VLLM_DC_PROFILE is 0 (the breakdown logger reads the buffer
+# GPU-side and never does host-side cudaMemcpy, so the two paths are
+# independent).
+_BREAKDOWN_PROFILE_ENABLED = int(
+    os.environ.get('VLLM_BREAKDOWN_PROFILE', '0')) != 0
+
 # Minimum M to print per-layer expert compute breakdown.
 # Only prefill batches (large M) are printed.
 _EXPERT_PROFILE_M_THRESHOLD = int(
@@ -257,7 +265,11 @@ class DispatchCombineP2PManager:
         # Gate: only print after first EPLB rebalance.
         self._profiling_after_rebalance = False
         self._raw_profiling_timestamps = None
-        if self._profiling_enabled:
+        # Allocate the in-kernel timestamp buffer if EITHER profiler
+        # wants it. The DC-printer path uses _profiling_enabled to
+        # gate its printing; the breakdown logger reads the buffer
+        # GPU-side, so it just needs the buffer to exist.
+        if self._profiling_enabled or _BREAKDOWN_PROFILE_ENABLED:
             # int64[kTotalProfileSlots] on GPU.
             ts_bytes = _TOTAL_PROFILE_SLOTS * 8
             self._raw_profiling_timestamps = (
@@ -282,10 +294,22 @@ class DispatchCombineP2PManager:
         # Wrap IPC buffers as non-owning PyTorch tensors.
         # No runtime copy needed; expert compute reads
         # directly from IPC memory.
-        # dtype_code: 0=bf16, 1=fp16, 2=int32
+        # dtype_code: 0=bf16, 1=fp16, 2=int32, 3=int64
         dtype_code = (
             0 if dtype == torch.bfloat16 else 1)
         ct = self.config_tensor  # dummy for dispatch
+        # int64 view of the profiling_timestamps buffer (if any), so the
+        # breakdown-profiler logger op can read it as a torch.Tensor.
+        self.profiling_timestamps_tensor = None
+        if self._raw_profiling_timestamps is not None:
+            self.profiling_timestamps_tensor = (
+                torch.ops._C_dispatch_combine.wrap_cuda_ptr(
+                    ct,
+                    self._raw_profiling_timestamps.value,
+                    _TOTAL_PROFILE_SLOTS, 1, 3))
+            # Squeeze to 1-D so consumers see a flat int64[37].
+            self.profiling_timestamps_tensor = (
+                self.profiling_timestamps_tensor.view(-1))
         self.dispatch_recv_tensor = (
             torch.ops._C_dispatch_combine.wrap_cuda_ptr(
                 ct, self._raw_dispatch_recv.value,

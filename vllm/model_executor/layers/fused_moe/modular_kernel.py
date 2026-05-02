@@ -9,6 +9,7 @@ from typing import Callable, Optional, Union, final
 import torch
 
 import vllm.envs as envs
+from vllm.model_executor.layers.fused_moe import breakdown_runtime
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.utils import (  # yapf: disable
     _resize_cache, count_expert_num_tokens)
@@ -928,6 +929,18 @@ class FusedMoEModularKernel(torch.nn.Module):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
+        # Breakdown profile: gate_end stamp goes here (just before the
+        # dispatch_and_route op fires inside prepare_async). The
+        # attn_start, attn_end and gate_start stamps for this layer
+        # were written by the model's DecoderLayer / MoE block forward.
+        _bd_on = breakdown_runtime.is_enabled()
+        if _bd_on:
+            _bd_layer_idx = getattr(self.prepare_finalize,
+                                     '_moe_layer_idx', 0)
+            _bd_py_stamps = breakdown_runtime.get_py_stamps_row(
+                _bd_layer_idx)
+            torch.ops._C_explat.record_stamp(_bd_py_stamps, 3)
+
         if not self.prepare_finalize.supports_async():
             # We shouldn't be running an a2a kernel that doesn't
             # support async prepare/finalize
@@ -975,6 +988,12 @@ class FusedMoEModularKernel(torch.nn.Module):
 
             (a1q, a1q_scale, expert_tokens_meta, _expert_topk_ids,
              _expert_topk_weights) = receiver()
+
+        # Breakdown profile: dispatch_end stamp (= expert_start). All
+        # dispatch / dar_compact / barrier kernels have been launched
+        # by now; this stamp closes the dispatch region.
+        if _bd_on:
+            torch.ops._C_explat.record_stamp(_bd_py_stamps, 4)
 
         # Maybe prepare gathered topk_ids and topk_weights from other EP ranks.
         topk_ids = topk_ids if _expert_topk_ids is None else _expert_topk_ids
@@ -1068,6 +1087,39 @@ class FusedMoEModularKernel(torch.nn.Module):
                     hook()
 
             receiver()
+
+        # Breakdown profile: emit one slot per (rank, layer, batch).
+        # Reads the in-kernel `profiling_timestamps` from the
+        # dispatch_combine BufferManager (37 int64 slots: 19 dar +
+        # 18 cas), the per-layer python stamps (5), and the existing
+        # explat expert stamps (6) that TritonExperts.apply wrote.
+        if _bd_on:
+            mgr = getattr(self.prepare_finalize, 'p2p_manager', None)
+            dc_stamps = (mgr.profiling_timestamps_tensor
+                          if mgr is not None else None)
+            expert_stamps = getattr(self.prepare_finalize,
+                                     '_explat_stamps', None)
+            if expert_stamps is None:
+                # explat path off — allocate a zero buffer so the
+                # logger has valid memory to read (expert_ns will be
+                # 0 if TritonExperts.apply didn't stamp).
+                expert_stamps = torch.zeros(6, dtype=torch.int64,
+                                             device='cuda')
+            if dc_stamps is not None:
+                _bd_M = getattr(self.prepare_finalize,
+                                 '_expert_M', 0)
+                _bd_rank = getattr(mgr, 'rank', 0)
+                torch.ops._C_explat.log_breakdown(
+                    int(_bd_rank),
+                    int(_bd_layer_idx),
+                    int(_bd_M),
+                    _bd_py_stamps,
+                    expert_stamps,
+                    dc_stamps,
+                    breakdown_runtime.get_armed_tensor(),
+                    breakdown_runtime.get_counter_tensor(),
+                    breakdown_runtime.get_ringbuf_tensor())
+                breakdown_runtime.ensure_poller_started()
 
         if self.shared_experts is None:
             return output

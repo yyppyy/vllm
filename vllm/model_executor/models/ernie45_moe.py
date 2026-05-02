@@ -51,6 +51,8 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.sequence import IntermediateTensors
 
+from vllm.model_executor.layers.fused_moe import breakdown_runtime
+
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
@@ -166,6 +168,12 @@ class Ernie4_5_MoeMoE(nn.Module):
         shared_output = None
         if self.has_shared_experts:
             shared_output = self.shared_experts(hidden_states)
+
+        # Breakdown profile: gate_start stamp.
+        if breakdown_runtime.is_enabled():
+            _bd_row = breakdown_runtime.get_py_stamps_row(
+                self.layer_idx)
+            torch.ops._C_explat.record_stamp(_bd_row, 2)
 
         router_logits, _ = self.gate(hidden_states)
 
@@ -344,6 +352,14 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
 
+        # Breakdown profile: attn_start (covers input_layernorm + QKV
+        # + attn + O proj + residual via the fused norm).
+        _bd_on = breakdown_runtime.is_enabled()
+        if _bd_on:
+            _bd_row = breakdown_runtime.get_py_stamps_row(
+                self.layer_idx)
+            torch.ops._C_explat.record_stamp(_bd_row, 0)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -356,6 +372,11 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+
+        # Breakdown profile: attn_end stamp (just before the MLP /
+        # MoE region begins).
+        if _bd_on:
+            torch.ops._C_explat.record_stamp(_bd_row, 1)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(

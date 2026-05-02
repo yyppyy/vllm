@@ -365,12 +365,13 @@ torch::Tensor wrap_cuda_ptr(
     torch::Tensor dummy,
     int64_t ptr, int64_t dim0, int64_t dim1,
     int64_t dtype_code) {
-  // dtype_code: 0=bf16, 1=fp16, 2=int32
+  // dtype_code: 0=bf16, 1=fp16, 2=int32, 3=int64
   at::ScalarType dtype;
   switch (dtype_code) {
     case 0: dtype = at::ScalarType::BFloat16; break;
     case 1: dtype = at::ScalarType::Half; break;
     case 2: dtype = at::ScalarType::Int; break;
+    case 3: dtype = at::ScalarType::Long; break;
     default:
       TORCH_CHECK(false,
           "wrap_cuda_ptr: unsupported dtype_code=",

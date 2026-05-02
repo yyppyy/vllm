@@ -187,5 +187,154 @@ void log_expert_tokens(int64_t rank,
       em);
 }
 
+// ---------------------------------------------------------------------
+// Breakdown logger
+// ---------------------------------------------------------------------
+//
+// log_breakdown(rank, layer_idx, M,
+//               py_stamps,        // int64[5]: attn_start, attn_end,
+//                                 //          gate_start, gate_end,
+//                                 //          dispatch_end
+//               expert_stamps,    // int64[6]: align_s/e, gemm_gu, silu,
+//                                 //          quant, gemm_dn
+//               dc_stamps,        // int64[37]: dispatch_combine
+//                                 //          profiling_timestamps
+//                                 //          (kDarNumSteps=19 +
+//                                 //           kCasNumSteps=18)
+//               armed, counter, ringbuf)
+//
+// Reads the in-kernel %globaltimer values that DC_TIMESTAMP and
+// record_stamp wrote during the layer's MoE forward, computes 6
+// per-(rank, layer, batch) deltas, and writes one ringbuffer slot.
+//
+// Slot layout (int64s):
+//   [0] seq
+//   [1] (rank low32 | layer_idx high32)
+//   [2] M (low32; high32 unused)
+//   [3] attention_ns
+//   [4] gating_ns
+//   [5] routing_ns
+//   [6] dispatch_ns
+//   [7] expert_ns
+//   [8] combine_ns
+// slot_stride_int64 = 9.
+
+namespace breakdown_constants {
+constexpr int kDarReadCounters = 0;
+constexpr int kDarScanClaim    = 4;
+constexpr int kDarEnd          = 18;
+constexpr int kCasStart        = 19 + 0;   // cas:read_counters
+constexpr int kCasEnd          = 19 + 17;  // cas:end
+}
+
+__global__ void log_breakdown_kernel(
+    int rank,
+    int layer_idx,
+    int M,
+    const int64_t* __restrict__ py_stamps,
+    const int64_t* __restrict__ expert_stamps,
+    const int64_t* __restrict__ dc_stamps,
+    const int32_t* __restrict__ armed,
+    int32_t* __restrict__ counter,
+    int64_t* __restrict__ ringbuf,
+    int n_slots,
+    int slot_stride_int64) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  if (armed[0] == 0) return;
+
+  using namespace breakdown_constants;
+
+  int seq = atomicAdd(counter, 1);
+  int slot_idx = seq % n_slots;
+  int64_t* slot = ringbuf + (int64_t)slot_idx * slot_stride_int64;
+
+  auto pos_diff = [](int64_t a, int64_t b) -> int64_t {
+    return a > b ? a - b : 0;
+  };
+
+  // Python-side category boundaries.
+  int64_t attn_start  = py_stamps[0];
+  int64_t attn_end    = py_stamps[1];
+  int64_t gate_start  = py_stamps[2];
+  int64_t gate_end    = py_stamps[3];
+  int64_t dispatch_end = py_stamps[4];
+
+  // In-kernel timestamps.
+  int64_t dar_start  = dc_stamps[kDarReadCounters];
+  int64_t dar_route  = dc_stamps[kDarScanClaim];
+  int64_t dar_end    = dc_stamps[kDarEnd];
+  (void)dar_end;  // dispatch is computed via py_stamps minus routing.
+  int64_t cas_start  = dc_stamps[kCasStart];
+  int64_t cas_end    = dc_stamps[kCasEnd];
+
+  int64_t attention_ns  = pos_diff(attn_end, attn_start);
+  int64_t gating_ns     = pos_diff(gate_end, gate_start);
+  int64_t routing_ns    = pos_diff(dar_route, dar_start);
+  int64_t dispatch_full = pos_diff(dispatch_end, gate_end);
+  int64_t dispatch_ns   = dispatch_full > routing_ns
+                          ? dispatch_full - routing_ns : 0;
+  int64_t expert_ns     = pos_diff(expert_stamps[5], expert_stamps[0]);
+  int64_t combine_ns    = pos_diff(cas_end, cas_start);
+
+  slot[0] = (int64_t)seq;
+  slot[1] = ((int64_t)(uint32_t)layer_idx << 32) |
+            ((int64_t)(uint32_t)rank);
+  slot[2] = (int64_t)(uint32_t)M;
+  slot[3] = attention_ns;
+  slot[4] = gating_ns;
+  slot[5] = routing_ns;
+  slot[6] = dispatch_ns;
+  slot[7] = expert_ns;
+  slot[8] = combine_ns;
+
+  __threadfence_system();
+}
+
+void log_breakdown(int64_t rank,
+                   int64_t layer_idx,
+                   int64_t M,
+                   torch::Tensor py_stamps,
+                   torch::Tensor expert_stamps,
+                   torch::Tensor dc_stamps,
+                   torch::Tensor armed,
+                   torch::Tensor counter,
+                   torch::Tensor ringbuf) {
+  TORCH_CHECK(py_stamps.dtype()     == at::kLong);
+  TORCH_CHECK(expert_stamps.dtype() == at::kLong);
+  TORCH_CHECK(dc_stamps.dtype()     == at::kLong);
+  TORCH_CHECK(armed.dtype()         == at::kInt);
+  TORCH_CHECK(counter.dtype()       == at::kInt);
+  TORCH_CHECK(ringbuf.dtype()       == at::kLong);
+  TORCH_CHECK(py_stamps.is_cuda());
+  TORCH_CHECK(expert_stamps.is_cuda());
+  TORCH_CHECK(dc_stamps.is_cuda());
+  TORCH_CHECK(armed.is_cuda());
+  TORCH_CHECK(counter.is_cuda());
+  TORCH_CHECK(ringbuf.is_contiguous());
+  TORCH_CHECK(ringbuf.dim() == 2);
+  TORCH_CHECK(py_stamps.numel()     == 5);
+  TORCH_CHECK(expert_stamps.numel() == 6);
+  TORCH_CHECK(dc_stamps.numel()     == 37);
+
+  int n_slots = static_cast<int>(ringbuf.size(0));
+  int slot_stride_int64 = static_cast<int>(ringbuf.size(1));
+  TORCH_CHECK(slot_stride_int64 >= 9);
+
+  const at::cuda::OptionalCUDAGuard guard(py_stamps.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  log_breakdown_kernel<<<1, 1, 0, stream>>>(
+      static_cast<int>(rank),
+      static_cast<int>(layer_idx),
+      static_cast<int>(M),
+      py_stamps.data_ptr<int64_t>(),
+      expert_stamps.data_ptr<int64_t>(),
+      dc_stamps.data_ptr<int64_t>(),
+      armed.data_ptr<int32_t>(),
+      counter.data_ptr<int32_t>(),
+      static_cast<int64_t*>(ringbuf.data_ptr()),
+      n_slots,
+      slot_stride_int64);
+}
+
 }  // namespace explat
 }  // namespace vllm

@@ -81,6 +81,15 @@ void log_expert_tokens(int64_t rank,
                        torch::Tensor counter,
                        torch::Tensor ringbuf,
                        int64_t e_max);
+void log_breakdown(int64_t rank,
+                   int64_t layer_idx,
+                   int64_t M,
+                   torch::Tensor py_stamps,
+                   torch::Tensor expert_stamps,
+                   torch::Tensor dc_stamps,
+                   torch::Tensor armed,
+                   torch::Tensor counter,
+                   torch::Tensor ringbuf);
 }  // namespace explat
 
 }  // namespace vllm
@@ -994,6 +1003,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _explat), explat) {
       "Tensor! counter, Tensor! ringbuf, int e_max) -> ()");
   explat.impl("log_expert_tokens", torch::kCUDA,
               &vllm::explat::log_expert_tokens);
+  explat.def(
+      "log_breakdown(int rank, int layer_idx, int M, "
+      "Tensor py_stamps, Tensor expert_stamps, Tensor dc_stamps, "
+      "Tensor armed, Tensor! counter, Tensor! ringbuf) -> ()");
+  explat.impl("log_breakdown", torch::kCUDA,
+              &vllm::explat::log_breakdown);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
