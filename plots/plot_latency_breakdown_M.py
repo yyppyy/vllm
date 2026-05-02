@@ -215,11 +215,6 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
             vals = per_bucket.get((ratio, sysname), {})
             bar_totals[(ratio, sysname)] = sum(vals.values())
     max_total = max(bar_totals.values()) if bar_totals else 1.0
-    label_min = max_total * 0.06
-    # Categories whose typical value is small enough to be invisible
-    # inside the bar — for these we draw an outside callout with a
-    # leader line instead of dropping the label entirely.
-    SMALL_CALLOUT_CATEGORIES = {"routing"}
 
     for j, sysname in enumerate(SYSTEMS):
         # Stagger systems vertically around each y-tick: EP below
@@ -241,41 +236,18 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
                 hatch=HATCHES[j % len(HATCHES)],
                 label=lg if j == 0 else None,
             )
+            # Always draw the in-place label for any non-zero
+            # segment, even when the segment is narrower than the
+            # text. Overflow into adjacent segments is acceptable —
+            # the segment color anchors which value belongs to which
+            # category visually.
             for k, v in enumerate(vals):
                 if not present_mask[k] or v <= 0:
                     continue
-                if v >= label_min:
-                    ax.text(left[k] + v / 2.0, y_pos[k], f"{v:.0f}",
-                            va="center", ha="center",
-                            fontsize=plt.rcParams["legend.fontsize"]
-                                - 1,
-                            color="white", fontweight="bold")
-                elif c in SMALL_CALLOUT_CATEGORIES:
-                    # Outside callout with a thin leader line. EP
-                    # (j=0, lower bar) gets its label below; METRO
-                    # (j=1, upper bar) gets its label above. This way
-                    # adjacent EP/METRO callouts in the same row don't
-                    # collide.
-                    seg_x = left[k] + v / 2.0
-                    if j == 1:
-                        seg_y_edge = y_pos[k] + bar_height / 2
-                        label_y = y_pos[k] + 0.45
-                        text_va = "bottom"
-                    else:
-                        seg_y_edge = y_pos[k] - bar_height / 2
-                        label_y = y_pos[k] - 0.45
-                        text_va = "top"
-                    ax.annotate(
-                        f"{v:.0f}",
-                        xy=(seg_x, seg_y_edge),
-                        xytext=(seg_x, label_y),
-                        ha="center", va=text_va,
+                ax.text(left[k] + v / 2.0, y_pos[k], f"{v:.0f}",
+                        va="center", ha="center",
                         fontsize=plt.rcParams["legend.fontsize"] - 1,
-                        color=color_map[c], fontweight="bold",
-                        arrowprops=dict(arrowstyle="-",
-                                         linewidth=0.5,
-                                         color=color_map[c]),
-                    )
+                        color="white", fontweight="bold")
             left += vals
 
         # Total at right end.
@@ -291,9 +263,9 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
 
     ax.set_yticks(y)
     ax.set_yticklabels([_ratio_label(r) for r in ratios])
-    # Extend y_lim so the routing callouts above the topmost row and
-    # below the bottommost row don't get clipped.
-    ax.set_ylim(-0.65, len(ratios) - 0.35)
+    # Extend y_lim slightly so the inline y-axis label has clear
+    # space above the topmost bar.
+    ax.set_ylim(-0.5, len(ratios) - 0.4)
 
     x_axis_max = x_max if x_max is not None else max_total * 1.18
     style_axes(ax,
@@ -302,10 +274,12 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
                x_lim=(0.0, x_axis_max))
 
     # Inline y-axis label: replaces the standard rotated label in
-    # the left gutter with a horizontal annotation just above the
-    # top y-tick, freeing up the left margin.
-    ax.text(0.0, 1.02, "Replication Ratio",
-            transform=ax.transAxes, ha="left", va="bottom",
+    # the left gutter with a horizontal annotation INSIDE the canvas,
+    # tucked into the empty band above the topmost row of bars (the
+    # space between the topmost bar and the top spine, freed by the
+    # widened y_lim).
+    ax.text(0.005, 0.99, "Replication Ratio",
+            transform=ax.transAxes, ha="left", va="top",
             fontsize=plt.rcParams["axes.labelsize"])
 
     # Two legends stacked above the axes: categories (color) on the
