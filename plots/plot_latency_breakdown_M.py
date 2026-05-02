@@ -284,16 +284,20 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
                        hatch=HATCHES[i % len(HATCHES)], linewidth=1)
         for i in range(len(SYSTEMS))
     ]
+    # Push the legend stack up against the figure top edge (figure
+    # top sits at ~y_axes=1.24 with the current subplots_adjust),
+    # which moves the white space from above the legends into the
+    # band between the bottom legend and the axes top.
     leg1 = ax.legend(cat_handles, cat_labels,
                      ncols=len(CATEGORIES),
                      loc="upper center",
-                     bbox_to_anchor=(0.5, 1.18),
+                     bbox_to_anchor=(0.5, 1.22),
                      frameon=False)
     ax.add_artist(leg1)
     ax.legend(sys_handles, SYSTEMS,
               ncols=len(SYSTEMS),
               loc="upper center",
-              bbox_to_anchor=(0.5, 1.06),
+              bbox_to_anchor=(0.5, 1.12),
               frameon=False)
 
     ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
