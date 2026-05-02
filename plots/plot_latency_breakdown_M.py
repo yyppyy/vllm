@@ -196,8 +196,10 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
     # bars.
     fig, ax = plt.subplots(
         figsize=(2 * STANDARD_PANEL_WIDTH, 1.15 * STANDARD_PANEL_HEIGHT))
-    # Standard left-gutter y-axis label, two-line legend stack above.
-    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.18, top=0.80)
+    # Standard left-gutter y-axis label (needs ~0.12 fraction of the
+    # 2x-wide figure width to fit the rotated text + tick labels);
+    # two-line legend stack snug against the axes top.
+    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.18, top=0.84)
 
     colors = palette(len(CATEGORIES), name="tableau10")
     color_map = {c: colors[i] for i, c in enumerate(CATEGORIES)}
@@ -285,13 +287,13 @@ def plot_breakdown(per_bucket, model, dataset, out_dir,
     leg1 = ax.legend(cat_handles, cat_labels,
                      ncols=len(CATEGORIES),
                      loc="upper center",
-                     bbox_to_anchor=(0.5, 1.24),
+                     bbox_to_anchor=(0.5, 1.18),
                      frameon=False)
     ax.add_artist(leg1)
     ax.legend(sys_handles, SYSTEMS,
               ncols=len(SYSTEMS),
               loc="upper center",
-              bbox_to_anchor=(0.5, 1.12),
+              bbox_to_anchor=(0.5, 1.06),
               frameon=False)
 
     ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
