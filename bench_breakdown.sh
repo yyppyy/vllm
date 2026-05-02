@@ -95,6 +95,17 @@ unset VLLM_PREFILL_BEFORE_DECODE
 export VLLM_ZIPFIAN_ROUTING=0
 export VLLM_EPLB_NUM_GROUPS=${EPLB_NUM_GROUPS}
 
+# Disable vLLM's torch.compile cache for breakdown runs. The
+# breakdown profiler lifts per-layer `_bd_row` tensor attrs into the
+# FX graph; a previously-cached compile (from a non-breakdown run, or
+# from an older source-code revision of the breakdown wiring) has a
+# different input arity and inductor crashes with
+#   ValueError: too many values to unpack (expected N)
+# when vLLM's outer cache hands it a stale handle. Compile-from-
+# scratch (a few minutes per engine start) is the safer default for
+# this opt-in profiling path.
+export VLLM_DISABLE_COMPILE_CACHE=1
+
 # Per-(rank, layer, batch) breakdown profile gate. The in-process poller
 # writes records to $BREAKDOWN_LOG (server_breakdown.log) — the only
 # profile log this script touches. Keep the explat / dc-profile flags
