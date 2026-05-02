@@ -226,9 +226,18 @@ def parse_dirname(dirname: str) -> dict | None:
     return None
 
 
+def _read_text(path: Path) -> str:
+    """Read a log file, transparently handling .gz."""
+    if path.suffix == ".gz":
+        import gzip
+        with gzip.open(path, "rt", errors="replace") as f:
+            return f.read()
+    return path.read_text(errors="replace")
+
+
 def parse_explat_log(path: Path):
     try:
-        text = path.read_text(errors="replace")
+        text = _read_text(path)
     except OSError:
         return
     for m in EXPLAT_RE.finditer(text):
@@ -408,9 +417,13 @@ def main() -> int:
         cfg = parse_dirname(d.name)
         if cfg is None:
             continue
+        # Plain log preferred; gzipped fallback for the very large
+        # logs that exceed GitHub's 100 MB push limit.
         log = d / "server_tokcnt.log"
         if not log.exists():
-            continue
+            log = d / "server_tokcnt.log.gz"
+            if not log.exists():
+                continue
         seen_logs += 1
         key = (cfg["model"], cfg["dataset"])
         bench_batch = cfg["batch"]
