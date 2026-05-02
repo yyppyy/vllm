@@ -76,7 +76,8 @@ _moe_stage_sums_ms: dict[str, float] = {
 # stashed on the prepare_finalize so the dispatch_combine logger op can
 # pick them up and emit one record per (rank, layer, batch). Compatible
 # with CUDA graphs.
-from vllm.model_executor.layers.fused_moe import explat_runtime  # noqa: E402
+from vllm.model_executor.layers.fused_moe import (  # noqa: E402
+    breakdown_runtime, explat_runtime)
 
 class RouterWS:
 
@@ -2019,10 +2020,14 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 return ev
             return None
 
-        # ExpLat profile: per-(rank, layer, batch) per-kernel timing
-        # via GPU %globaltimer reads. Captureable into CUDA graphs;
-        # stamps are picked up by the dispatch_combine logger op.
-        _explat_on = explat_runtime.is_enabled()
+        # ExpLat / Breakdown profile: per-(rank, layer, batch)
+        # per-kernel timing via GPU %globaltimer reads. Captureable
+        # into CUDA graphs; stamps are picked up by either the
+        # explat logger op (full per-kernel breakdown) or the
+        # breakdown log_breakdown op (only `expert_ns` = end-start).
+        # Both want the same five stamps so we share one path here.
+        _explat_on = (explat_runtime.is_enabled()
+                      or breakdown_runtime.is_enabled())
         if _explat_on:
             if not hasattr(self, '_explat_stamps'):
                 self._explat_stamps = (

@@ -615,9 +615,14 @@ class DispatchCombineP2PManager:
         data += struct.pack(
             'Q', self._raw_scatter_done_counter.value)
 
-        # profiling_timestamps (1 pointer)
+        # profiling_timestamps (1 pointer). Wired through to the
+        # kernel whenever EITHER profiler wants it — both the legacy
+        # DC printer (gated by `_profiling_enabled`) and the
+        # breakdown logger (gated by VLLM_BREAKDOWN_PROFILE) read
+        # this same buffer.
         ptr = (self._raw_profiling_timestamps.value
-               if self._profiling_enabled
+               if (self._profiling_enabled
+                   or _BREAKDOWN_PROFILE_ENABLED)
                else 0)
         data += struct.pack('Q', ptr)
 
