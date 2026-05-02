@@ -2,7 +2,7 @@
 """CDF of the fraction of MoE experts in the memory-bound regime.
 
 For each (model, dataset) pair this script reads every ExpLat record
-in `results/vllm_results_final/<run_hash>/server_explat.log` and
+in `results/vllm_results_final/<run_hash>/server_tokcnt.log` and
 emits one figure. Each (rank, layer, batch) record contributes one
 data point: the fraction of that record's local experts whose
 processed token count is below the model-specific memory-bound
@@ -254,63 +254,106 @@ def plot_cdf(per_run_records, model, dataset, threshold, out_dir,
     """One CDF line per LOG FILE (= one bench batch-size config).
 
     `per_run_records` is a dict {bench_batch: [records...]}. Each
-    record contributes one data point: the *count* of its local
-    experts whose tokens are below the threshold (absolute number,
-    not a fraction). All per-record M values inside one log are
-    merged into the same line.
+    record contributes one data point: the *fraction* of its local
+    experts whose tokens are below the threshold (count divided by
+    num_local_experts, normalized to [0, 1]). All per-record M values
+    inside one log are merged into the same line.
     """
-    counts_by_run: dict[int, list[int]] = defaultdict(list)
-    max_n_local = 0
+    fracs_by_run: dict[int, list[float]] = defaultdict(list)
     for batch, records in per_run_records.items():
         for r in records:
             n = len(r["pet"])
             if n == 0:
                 continue
-            max_n_local = max(max_n_local, n)
             cnt = sum(1 for t in r["pet"] if t < threshold)
-            counts_by_run[batch].append(cnt)
-    counts_by_run = {
-        b: vs for b, vs in counts_by_run.items()
+            fracs_by_run[batch].append(cnt / n)
+    fracs_by_run = {
+        b: vs for b, vs in fracs_by_run.items()
         if len(vs) >= min_per_line
     }
-    if not counts_by_run:
+    if not fracs_by_run:
         return None
 
     fig, ax = paper_figure()
-    batches = sorted(counts_by_run.keys())
+    # Tight margins: log-scale y tick labels ("0.001"…) are wider
+    # than the linear set the global PANEL_MARGINS were tuned for, so
+    # left needs a small bump from 0.17, but otherwise pull the axes
+    # close to the canvas edge.
+    fig.subplots_adjust(left=0.19, right=0.99,
+                         bottom=0.19, top=0.97)
+    batches = sorted(fracs_by_run.keys())
     colors = palette(len(batches), name="tableau10")
-    first_positive = max_n_local
     smallest_y = 100.0
+    # Per-batch fraction of records where ALL local experts are
+    # memory-bound (= the size of the CDF's step at x=1.0). Used to
+    # draw a reference line per batch.
+    all_bound_frac: dict[int, float] = {}
     for i, b in enumerate(batches):
-        vals = sorted(counts_by_run[b])
+        vals = sorted(fracs_by_run[b])
         n = len(vals)
         x = np.array(vals, dtype=float)
         y = np.arange(1, n + 1) / n * 100.0
-        first_positive = min(first_positive, x[0])
         smallest_y = min(smallest_y, y[0])
-        # Anchor the right end at max_n_local (every record is at most
-        # `n_local_experts` memory-bound).
-        x = np.concatenate((x, [float(max_n_local)]))
+        n_all = int(np.sum(x >= 1.0 - 1e-9))
+        all_bound_frac[b] = n_all / n if n else 0.0
+        # Anchor the right end at 1.0 (every record is at most
+        # 100 % memory-bound).
+        x = np.concatenate((x, [1.0]))
         y = np.concatenate((y, [100.0]))
         ax.plot(x, y, drawstyle="steps-post",
                 label=f"B={b}", color=colors[i],
                 linewidth=2.0)
 
-    # Start x-axis near the first non-zero point on any line, with a
-    # tiny margin so the leftmost step is visible.
-    x_left = max(0, first_positive - 1)
+    # Fixed ticks at 0, 0.2, 0.4, 0.6, 0.8, 1.0 so all CDFs share a
+    # uniform x-axis regardless of where the data starts rising.
+    xticks = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([f"{t:.1f}" for t in xticks])
     # Log y so the small-CDF region (where lines slowly rise from 0)
-    # is legible even when most of the mass is jammed at the right
-    # near max_n_local.
+    # is legible even when most of the mass is jammed near 1.0.
     y_bottom = 10 ** np.floor(np.log10(max(smallest_y, 1e-3)))
     style_axes(
         ax,
-        x_label="Memory-bound experts (count)",
+        x_label="Memory-bound experts (fraction)",
         y_label="CDF (%)",
-        x_lim=(x_left, max_n_local),
+        x_lim=(0.0, 1.0),
         y_lim=(y_bottom, 100),
         y_log=True,
     )
+    # Keep the rightmost x-tick label inside the canvas (default
+    # center alignment makes it spill past the figure edge).
+    xtl = ax.get_xticklabels()
+    if xtl:
+        xtl[0].set_horizontalalignment("left")
+        xtl[-1].set_horizontalalignment("right")
+
+    # Reference lines: for each batch, draw a horizontal dotted line
+    # at the CDF level just before its final jump to 100 %. The gap
+    # from that line up to the top of the plot is the fraction of
+    # records where every local expert is memory-bound. We annotate
+    # each line with a short percentage; labels are staggered
+    # horizontally so multiple batches with close y_pre don't collide.
+    eligible = [(i, b) for i, b in enumerate(batches)
+                if 0.0 < all_bound_frac[b] < 1.0
+                and (1.0 - all_bound_frac[b]) * 100.0 > y_bottom]
+    if eligible:
+        # Reserve x-axis space [0.04, 0.96] in axes-fraction for the
+        # row of percentage labels.
+        x_lo, x_hi = 0.04, 0.96
+        n_lab = len(eligible)
+        x_step = (x_hi - x_lo) / max(n_lab, 1)
+        for slot, (i, b) in enumerate(eligible):
+            frac_all = all_bound_frac[b]
+            y_pre = (1.0 - frac_all) * 100.0
+            ax.axhline(y_pre, color=colors[i], linestyle=":",
+                       linewidth=0.9, alpha=0.7, zorder=1)
+            x_pos = x_lo + slot * x_step
+            ax.text(x_pos, y_pre, f"{frac_all * 100:.1f}%",
+                    color=colors[i],
+                    fontsize=plt.rcParams["legend.fontsize"],
+                    va="bottom", ha="left",
+                    transform=ax.get_yaxis_transform())
+
     style_legend(ax, loc="lower right")
 
     ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
@@ -365,7 +408,7 @@ def main() -> int:
         cfg = parse_dirname(d.name)
         if cfg is None:
             continue
-        log = d / "server_explat.log"
+        log = d / "server_tokcnt.log"
         if not log.exists():
             continue
         seen_logs += 1

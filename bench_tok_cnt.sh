@@ -84,10 +84,9 @@ unset VLLM_PREFILL_BEFORE_DECODE
 export VLLM_ZIPFIAN_ROUTING=0
 export VLLM_EPLB_NUM_GROUPS=${EPLB_NUM_GROUPS}
 
-# Per-(rank, layer, batch) profile gate. The in-process explat poller
-# writes records to $TOKCNT_LOG (server_tokcnt.log) so this run's
-# data sits alongside bench_exp_vs_latency.sh's server_explat.log in
-# the same RUN_HASH directory without colliding.
+# Per-(rank, layer, batch) profile gate. The in-process poller writes
+# records to $TOKCNT_LOG (server_tokcnt.log) — the only profile log
+# this script touches.
 READY_FILE="$RES_DIR/$RUN_HASH/tokcnt_ready"
 TOKCNT_LOG="$RES_DIR/$RUN_HASH/server_tokcnt.log"
 rm -f "$READY_FILE" "$TOKCNT_LOG"
@@ -181,7 +180,7 @@ if [[ "$DATASET_NAME" == "random" ]]; then
 elif [[ "$DATASET_NAME" == "sharegpt" ]]; then
   warmup_args+=( --dataset-name sharegpt --dataset-path ./datasets/ShareGPT_V3_unfiltered_cleaned_split.json --sharegpt-output-len $OUTPUT_LEN )
 else
-  warmup_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" --hf-output-len $OUTPUT_LEN )
+  warmup_args+=( --dataset-name hf --dataset-path "$DATASET_NAME")
 fi
 
 echo "=== Warmup: sending $WARMUP_PROMPTS requests (no profile output) ==="
@@ -212,7 +211,7 @@ if [[ "$DATASET_NAME" == "random" ]]; then
 elif [[ "$DATASET_NAME" == "sharegpt" ]]; then
   cli_args+=( --dataset-name sharegpt --dataset-path ./datasets/ShareGPT_V3_unfiltered_cleaned_split.json --sharegpt-output-len $OUTPUT_LEN )
 else
-  cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME" --hf-output-len $OUTPUT_LEN )
+  cli_args+=( --dataset-name hf --dataset-path "$DATASET_NAME")
 fi
 
 echo "=== Profile run: sending $NUM_PROMPTS Poisson(lambda=$REQUEST_RATE) requests (token-count output enabled) ==="
