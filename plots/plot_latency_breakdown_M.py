@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Per-(rank, layer, batch) MoE latency breakdown — mean across the
-selected M (per-replay batch) range.
+selected M (per-replay batch) range, grouped by replication ratio.
 
 Input: `server_breakdown.log` files emitted by `bench_breakdown.sh`.
 Each line has the form
@@ -8,11 +8,13 @@ Each line has the form
     Breakdown seq=N rank=R layer=L M=M attention_ns=X gating_ns=Y
               routing_ns=Z dispatch_ns=A expert_ns=B combine_ns=C
 
-For each (model, dataset) pair, the script averages the six categories
-across every record whose `M` falls in `--m-range` (default 24..32
-inclusive) and draws one horizontal stacked bar per M, mirroring
-`plots/latency_breakdown.pdf` but using the project-standard `style.py`
-helpers.
+For each (model, dataset) pair, every record with `M` in `--m-range`
+(default 24..32 inclusive) — across **all** batch-size configs — is
+bucketed by the run's NUM_REPLICAS (the 4th positional arg of
+`bench_breakdown.sh`, i.e. `num_redundant_experts`). One horizontal
+stacked bar is drawn per replication ratio, mirroring
+`plots/latency_breakdown.pdf` but driven straight off the breakdown log
+and using the project-standard `style.py` helpers.
 """
 import argparse
 import gzip
@@ -56,7 +58,13 @@ BREAKDOWN_RE = re.compile(
 
 def parse_dirname(dirname: str) -> dict | None:
     """Same `RUN_HASH` schema as `bench_breakdown.sh` /
-    `bench_tok_cnt.sh`. Returns `None` for unrelated directories."""
+    `bench_tok_cnt.sh`. Returns `None` for unrelated directories.
+
+    Group layout:
+      1=NUM_GPUS, 2=EP_DEGREE, 3=USE_EP, 4=NUM_REPLICAS,
+      5=BATCH_SIZE, 6=MEM_BOUND_ROUTING, 7=DATASET (int id),
+      8=USE_PROFILER, 9=MEM_BOUND_ROUTING_THRES, 10=MODEL_NAME,
+      11=EPLB_NUM_GROUPS (optional)."""
     for backend in ("allgather_reducescatter", "dispatch_combine"):
         m = re.match(
             r"^(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_"
@@ -69,6 +77,7 @@ def parse_dirname(dirname: str) -> dict | None:
                 "model": m.group(10),
                 "dataset": int(m.group(7)),
                 "batch": int(m.group(5)),
+                "num_replicas": int(m.group(4)),
             }
     return None
 
@@ -99,50 +108,57 @@ def parse_breakdown_log(path: Path):
         }
 
 
-def aggregate_means(records, m_lo: int, m_hi: int):
-    """Return ({M: {category: mean_us}}, {M: count}) for every M in
-    [m_lo, m_hi] that has at least one record."""
-    sums: dict[int, dict[str, float]] = defaultdict(
-        lambda: {c: 0.0 for c in CATEGORIES})
-    counts: dict[int, int] = defaultdict(int)
-    for r in records:
-        M = r["M"]
-        if not (m_lo <= M <= m_hi):
-            continue
-        counts[M] += 1
-        for c in CATEGORIES:
-            sums[M][c] += r[c]
-    means = {}
-    for M, n in counts.items():
-        means[M] = {c: sums[M][c] / n / 1e3 for c in CATEGORIES}  # us
-    return means, dict(counts)
+def aggregate_means(records_by_repl, m_lo, m_hi):
+    """Bucket records by NUM_REPLICAS and average each category in us.
+
+    `records_by_repl` is `{num_replicas: [record, ...]}`. Records whose
+    `M` falls outside `[m_lo, m_hi]` are dropped. Returns
+    `({num_replicas: {category: mean_us}}, {num_replicas: count})`."""
+    means: dict[int, dict[str, float]] = {}
+    counts: dict[int, int] = {}
+    for nr, recs in records_by_repl.items():
+        sums = {c: 0.0 for c in CATEGORIES}
+        n = 0
+        for r in recs:
+            if not (m_lo <= r["M"] <= m_hi):
+                continue
+            n += 1
+            for c in CATEGORIES:
+                sums[c] += r[c]
+        if n > 0:
+            means[nr] = {c: sums[c] / n / 1e3 for c in CATEGORIES}
+            counts[nr] = n
+    return means, counts
 
 
-def plot_breakdown(means, model, dataset, out_dir):
-    """One horizontal stacked bar per M; one segment per category."""
-    Ms = sorted(means.keys())
-    if not Ms:
+def plot_breakdown(means, model, dataset, out_dir,
+                   tag: str | None = None):
+    """One horizontal stacked bar per replication ratio; one segment
+    per category. `tag` overrides the filename suffix when set (used by
+    the single-log code path)."""
+    repls = sorted(means.keys())
+    if not repls:
         return None
 
     fig, ax = paper_figure()
-    fig.subplots_adjust(left=0.18, right=0.98, bottom=0.20, top=0.85)
+    fig.subplots_adjust(left=0.20, right=0.98, bottom=0.20, top=0.85)
 
     colors = palette(len(CATEGORIES), name="tableau10")
     color_map = {c: colors[i] for i, c in enumerate(CATEGORIES)}
 
-    y = np.arange(len(Ms), dtype=float)
+    y = np.arange(len(repls), dtype=float)
     bar_height = 0.6
 
     # Annotation rule: only label segments that occupy at least 6% of
     # the widest bar so the slim ones (gating / routing) don't get a
     # number jammed inside.
-    bar_totals = [sum(means[M].values()) for M in Ms]
+    bar_totals = [sum(means[r].values()) for r in repls]
     max_total = max(bar_totals) if bar_totals else 1.0
     label_min = max_total * 0.06
 
-    left = np.zeros(len(Ms), dtype=float)
+    left = np.zeros(len(repls), dtype=float)
     for c, lg in zip(CATEGORIES, LEGEND_LABELS):
-        vals = np.array([means[M][c] for M in Ms], dtype=float)
+        vals = np.array([means[r][c] for r in repls], dtype=float)
         ax.barh(y, vals, bar_height, left=left,
                 color=color_map[c], edgecolor="black", linewidth=0.6,
                 label=lg)
@@ -164,18 +180,21 @@ def plot_breakdown(means, model, dataset, out_dir):
                 fontweight="bold")
 
     ax.set_yticks(y)
-    ax.set_yticklabels([str(M) for M in Ms])
+    ax.set_yticklabels([str(r) for r in repls])
     style_axes(ax,
                x_label="Mean per-layer latency (us)",
-               y_label="M (per-replay batch)",
+               y_label="Replication Ratio",
                x_lim=(0.0, max_total * 1.18))
 
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.20),
               ncol=3, frameon=False)
 
-    ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
-    safe_model = model.replace("/", "_")
-    out = out_dir / f"latency_breakdown_M_{safe_model}_{ds_name}.pdf"
+    if tag is not None:
+        out = out_dir / f"latency_breakdown_M_{tag}.pdf"
+    else:
+        ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
+        safe_model = model.replace("/", "_")
+        out = out_dir / f"latency_breakdown_M_{safe_model}_{ds_name}.pdf"
     save_fig(fig, out)
     plt.close(fig)
     return out
@@ -193,12 +212,12 @@ def main() -> int:
     p.add_argument("--m-range", type=str, default="24-32",
                    help="Inclusive M range, e.g. '24-32' (default).")
     p.add_argument("--log", type=Path, default=None,
-                   help="Optional: a single breakdown log file. When "
-                        "set, --results-dir is ignored and the figure "
-                        "is named 'latency_breakdown_M_<stem>.pdf'.")
+                   help="Optional: a single breakdown log file. NUM_"
+                        "REPLICAS is parsed from the parent dir name "
+                        "if present, else falls back to 0.")
     p.add_argument("--min-records", type=int, default=10,
-                   help="Drop M values with fewer than this many "
-                        "records (default: 10).")
+                   help="Drop replication buckets with fewer than this "
+                        "many records (default: 10).")
     args = p.parse_args()
 
     try:
@@ -213,32 +232,34 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.log is not None:
+        cfg = parse_dirname(args.log.parent.name) or {}
+        nr = cfg.get("num_replicas", 0)
         records = list(parse_breakdown_log(args.log))
         if not records:
-            print(f"No Breakdown records in {args.log}", file=sys.stderr)
+            print(f"No Breakdown records in {args.log}",
+                  file=sys.stderr)
             return 1
-        means, counts = aggregate_means(records, m_lo, m_hi)
-        means = {M: v for M, v in means.items()
-                 if counts[M] >= args.min_records}
+        means, counts = aggregate_means({nr: records}, m_lo, m_hi)
+        means = {r: v for r, v in means.items()
+                 if counts[r] >= args.min_records}
         if not means:
-            print(f"No M in [{m_lo}, {m_hi}] with "
-                  f">= {args.min_records} records in {args.log}",
+            print(f"No records in M=[{m_lo}, {m_hi}] with "
+                  f">= {args.min_records} samples in {args.log}",
                   file=sys.stderr)
             return 1
         stem = args.log.name.replace(".log.gz", "").replace(".log", "")
-        out = args.output_dir / f"latency_breakdown_M_{stem}.pdf"
-        # Reuse plot_breakdown by giving it placeholder model/dataset
-        # and then renaming the file.
-        tmp = plot_breakdown(means, model=stem, dataset=-1,
-                             out_dir=args.output_dir)
-        if tmp is not None and tmp != out:
-            tmp.rename(out)
-        if out.exists():
-            print(f"wrote {out}  (M={sorted(means.keys())}, "
-                  f"records={[counts[M] for M in sorted(means)]})")
+        out = plot_breakdown(means, model="", dataset=-1,
+                             out_dir=args.output_dir, tag=stem)
+        if out is not None:
+            print(f"wrote {out}  (replications={sorted(means.keys())}, "
+                  f"records={[counts[r] for r in sorted(means)]})")
         return 0
 
-    grouped: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    # Two-level grouping:
+    #   key1 = (model, dataset) -> figure
+    #   key2 = num_replicas -> bar
+    grouped: dict[tuple[str, int], dict[int, list[dict]]] = defaultdict(
+        lambda: defaultdict(list))
     seen = 0
     for d in sorted(args.results_dir.iterdir()):
         if not d.is_dir():
@@ -253,30 +274,33 @@ def main() -> int:
                 continue
         seen += 1
         key = (cfg["model"], cfg["dataset"])
+        nr = cfg["num_replicas"]
         for rec in parse_breakdown_log(log):
-            grouped[key].append(rec)
+            grouped[key][nr].append(rec)
     if not grouped:
         print(f"No Breakdown records under {args.results_dir}",
               file=sys.stderr)
         return 1
     print(f"Parsed {seen} log files into {len(grouped)} "
-          f"(model, dataset) groups; M range [{m_lo}, {m_hi}]")
+          f"(model, dataset) groups; M range [{m_lo}, {m_hi}]; "
+          f"all batch sizes merged")
 
-    for (model, dataset), records in sorted(grouped.items()):
-        means, counts = aggregate_means(records, m_lo, m_hi)
-        means = {M: v for M, v in means.items()
-                 if counts[M] >= args.min_records}
+    for (model, dataset), per_repl in sorted(grouped.items()):
+        means, counts = aggregate_means(per_repl, m_lo, m_hi)
+        means = {r: v for r, v in means.items()
+                 if counts[r] >= args.min_records}
         if not means:
             print(f"  {model} / "
                   f"{DATASET_NAMES.get(dataset, dataset)}: "
-                  f"no M in range with >= {args.min_records} records")
+                  f"no replication bucket with >= {args.min_records} "
+                  f"records in M=[{m_lo}, {m_hi}]")
             continue
         out = plot_breakdown(means, model, dataset, args.output_dir)
         ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
-        Ms = sorted(means.keys())
-        n_each = [counts[M] for M in Ms]
+        repls = sorted(means.keys())
+        n_each = [counts[r] for r in repls]
         print(f"  {model} / {ds_name}: "
-              f"M={Ms}, records={n_each} -> {out}")
+              f"replications={repls}, records={n_each} -> {out}")
     return 0
 
 
