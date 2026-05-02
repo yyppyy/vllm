@@ -224,7 +224,10 @@ constexpr int kDarReadCounters = 0;
 constexpr int kDarScanClaim    = 4;
 constexpr int kDarEnd          = 18;
 constexpr int kCasStart        = 19 + 0;   // cas:read_counters
-constexpr int kCasEnd          = 19 + 17;  // cas:end
+// `cas:end` lives at slot 16; slot 17 (`cas:?`) is reserved and
+// never written by combine_and_scatter_kernel — reading it yields
+// zero, which used to make combine_ns always 0.
+constexpr int kCasEnd          = 19 + 16;  // cas:end
 }
 
 __global__ void log_breakdown_kernel(
