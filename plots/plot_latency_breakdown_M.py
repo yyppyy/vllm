@@ -164,10 +164,15 @@ def aggregate_means(records, m_lo: int, m_hi: int):
 
 
 def _ratio_label(ratio: float) -> str:
-    """`1.5x`-style label, integer-clean when the ratio is whole."""
+    """`1.5x`-style label, integer-clean when the ratio is whole.
+
+    Uses 6 decimal places before stripping trailing zeros so clean
+    rationals like 1.125 (= 1 + 16/128) and 1.375 (= 1 + 48/128) are
+    rendered exactly instead of being rounded to 1.13 / 1.38.
+    """
     if abs(ratio - round(ratio)) < 1e-6:
         return f"{int(round(ratio))}.0x"
-    s = f"{ratio:.2f}".rstrip("0").rstrip(".")
+    s = f"{ratio:.6f}".rstrip("0").rstrip(".")
     return f"{s}x"
 
 
