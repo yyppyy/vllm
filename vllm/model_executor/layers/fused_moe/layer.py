@@ -2106,6 +2106,13 @@ class FusedMoE(CustomOp):
         # dispatch_combine + EPLB.
         self._maybe_init_integrated_routing()
 
+        # Populate the breakdown-profile cache on prepare_finalize so
+        # the compiled forward path can read tensors directly without
+        # touching `breakdown_runtime`'s lock-protected lazy allocators.
+        # Runs from non-compiled init code (engine startup), so the
+        # one-shot `init()` call here is safe.
+        self._maybe_init_breakdown_cache()
+
     def _maybe_init_integrated_routing(self):
         """Init/update integrated routing on p2p_manager.
 
@@ -2198,6 +2205,46 @@ class FusedMoE(CustomOp):
 
         pf.expert_load_view = self.expert_load_view
         pf._moe_layer_idx = self._moe_layer_idx
+
+    def _maybe_init_breakdown_cache(self):
+        """Cache every tensor the breakdown profiler reads in the
+        compiled forward (`modular_kernel.forward`) onto this layer's
+        prepare_finalize. Runs once per (layer, EPLB rebalance) from
+        non-compiled init code, so it is the only place the
+        lock-protected `breakdown_runtime.init()` is allowed to fire."""
+        from vllm.model_executor.layers.fused_moe import (
+            breakdown_runtime)
+        if not breakdown_runtime.is_enabled():
+            return
+        pf = self._get_prepare_finalize()
+        if pf is None:
+            return
+
+        breakdown_runtime.init()
+        breakdown_runtime.ensure_poller_started()
+
+        pf._bd_on = True
+        pf._bd_row = breakdown_runtime.get_py_stamps_row(
+            self._moe_layer_idx)
+        pf._bd_armed = breakdown_runtime.get_armed_tensor()
+        pf._bd_counter = breakdown_runtime.get_counter_tensor()
+        pf._bd_ringbuf = breakdown_runtime.get_ringbuf_tensor()
+
+        # dispatch_combine in-kernel timestamps. Optional — if the
+        # backend doesn't expose them we leave the attr as None and
+        # the compiled forward skips the log_breakdown op.
+        mgr = getattr(pf, 'p2p_manager', None)
+        pf._bd_rank = getattr(mgr, 'rank', 0)
+        pf._bd_dc_stamps = (
+            getattr(mgr, 'profiling_timestamps_tensor', None)
+            if mgr is not None else None)
+        # Pre-allocate a zero buffer once so the compiled forward
+        # has a valid CUDA tensor to fall back to when the explat
+        # path is off (TritonExperts.apply hasn't stamped this layer).
+        if not hasattr(pf, '_bd_expert_stamps_zero'):
+            import torch as _torch  # local to avoid hot-path overhead
+            pf._bd_expert_stamps_zero = _torch.zeros(
+                6, dtype=_torch.int64, device='cuda')
 
     @staticmethod
     def _dedup_ltp_by_rank(

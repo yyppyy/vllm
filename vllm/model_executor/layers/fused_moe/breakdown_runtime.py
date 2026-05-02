@@ -93,34 +93,14 @@ def is_enabled() -> bool:
     return _ENABLED
 
 
-def get_py_stamps_row(layer_idx: int) -> torch.Tensor:
-    """Return the int64[5] view of the global py-stamps table for
-    `layer_idx`. The table is lazily allocated once at the configured
-    maximum size; layers all share it through stable views, which
-    means CUDA-graph captures are stable.
-
-    The same row is hit by:
-      * the attention block (`record_stamp(row, 0)` and
-        `record_stamp(row, 1)`)
-      * the MoE block (`record_stamp(row, 2)` for gate_start)
-      * `modular_kernel.forward` (`record_stamp(row, 3)` for gate_end
-        and `record_stamp(row, 4)` for dispatch_end, then
-        `log_breakdown(... row ...)`).
-    Stream ordering ensures `log_breakdown` reads the layer's writes
-    before the next layer overwrites them.
-    """
+def _ensure_py_stamps_table_locked() -> None:
+    """Allocate the int64[max_layers, 5] py-stamps table. Caller must
+    hold `_init_lock`."""
     global _py_stamps_table
-    with _init_lock:
-        if _py_stamps_table is None:
-            _py_stamps_table = torch.zeros(
-                (_PY_STAMPS_MAX_LAYERS, PY_STAMPS_LEN),
-                dtype=torch.int64, device='cuda')
-        if layer_idx >= _py_stamps_table.size(0):
-            raise RuntimeError(
-                f"breakdown profiler: layer_idx={layer_idx} exceeds "
-                f"pre-allocated row count {_PY_STAMPS_MAX_LAYERS}; "
-                f"bump _PY_STAMPS_MAX_LAYERS in breakdown_runtime.py")
-    return _py_stamps_table[layer_idx]
+    if _py_stamps_table is None:
+        _py_stamps_table = torch.zeros(
+            (_PY_STAMPS_MAX_LAYERS, PY_STAMPS_LEN),
+            dtype=torch.int64, device='cuda')
 
 
 def _ensure_buffers_locked() -> None:
@@ -137,22 +117,69 @@ def _ensure_buffers_locked() -> None:
                                 pin_memory=True)
 
 
-def get_armed_tensor() -> torch.Tensor:
+def init() -> None:
+    """One-shot, idempotent allocation of every GPU/pinned tensor the
+    breakdown profiler needs (py_stamps table + armed/counter/ringbuf).
+    Must be called from non-compiled code (the lock here cannot be
+    traced by Dynamo). After this returns, every getter below is
+    lock-free and Dynamo-safe."""
+    if not is_enabled():
+        return
     with _init_lock:
+        _ensure_py_stamps_table_locked()
         _ensure_buffers_locked()
-    return _armed  # type: ignore[return-value]
+
+
+def get_py_stamps_row(layer_idx: int) -> torch.Tensor:
+    """Return the int64[5] view of the global py-stamps table for
+    `layer_idx`. Lock-free; assumes `init()` was called from a
+    non-compiled context (e.g. the model layer's `__init__`).
+
+    The same row is hit by:
+      * the attention block (`record_stamp(row, 0)` and
+        `record_stamp(row, 1)`)
+      * the MoE block (`record_stamp(row, 2)` for gate_start)
+      * `modular_kernel.forward` (`record_stamp(row, 3)` for gate_end
+        and `record_stamp(row, 4)` for dispatch_end, then
+        `log_breakdown(... row ...)`).
+    Stream ordering ensures `log_breakdown` reads the layer's writes
+    before the next layer overwrites them.
+    """
+    if _py_stamps_table is None:
+        raise RuntimeError(
+            "breakdown profiler: get_py_stamps_row() called before "
+            "init(). Call breakdown_runtime.init() once from "
+            "non-compiled code before the first compiled forward.")
+    if layer_idx >= _py_stamps_table.size(0):
+        raise RuntimeError(
+            f"breakdown profiler: layer_idx={layer_idx} exceeds "
+            f"pre-allocated row count {_PY_STAMPS_MAX_LAYERS}; "
+            f"bump _PY_STAMPS_MAX_LAYERS in breakdown_runtime.py")
+    return _py_stamps_table[layer_idx]
+
+
+def get_armed_tensor() -> torch.Tensor:
+    if _armed is None:
+        raise RuntimeError(
+            "breakdown profiler: get_armed_tensor() called before "
+            "init().")
+    return _armed
 
 
 def get_counter_tensor() -> torch.Tensor:
-    with _init_lock:
-        _ensure_buffers_locked()
-    return _counter  # type: ignore[return-value]
+    if _counter is None:
+        raise RuntimeError(
+            "breakdown profiler: get_counter_tensor() called before "
+            "init().")
+    return _counter
 
 
 def get_ringbuf_tensor() -> torch.Tensor:
-    with _init_lock:
-        _ensure_buffers_locked()
-    return _ringbuf  # type: ignore[return-value]
+    if _ringbuf is None:
+        raise RuntimeError(
+            "breakdown profiler: get_ringbuf_tensor() called before "
+            "init().")
+    return _ringbuf
 
 
 def _format_slot(buf_row: torch.Tensor) -> Optional[str]:

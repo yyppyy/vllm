@@ -110,6 +110,15 @@ class Ernie4_5_MoeMoE(nn.Module):
 
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
+        # Resolve the breakdown py-stamps row in __init__ (non-compiled
+        # path) so the compiled forward never touches the lock-protected
+        # lazy allocator inside `get_py_stamps_row`.
+        self._bd_on = breakdown_runtime.is_enabled()
+        if self._bd_on:
+            breakdown_runtime.init()
+            self._bd_row = breakdown_runtime.get_py_stamps_row(layer_idx)
+        else:
+            self._bd_row = None
         self.tp_size = get_tensor_model_parallel_world_size()
         self.has_shared_experts = (getattr(config, "moe_num_shared_experts", 0)
                                    > 0)
@@ -170,10 +179,8 @@ class Ernie4_5_MoeMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
 
         # Breakdown profile: gate_start stamp.
-        if breakdown_runtime.is_enabled():
-            _bd_row = breakdown_runtime.get_py_stamps_row(
-                self.layer_idx)
-            torch.ops._C_explat.record_stamp(_bd_row, 2)
+        if self._bd_on:
+            torch.ops._C_explat.record_stamp(self._bd_row, 2)
 
         router_logits, _ = self.gate(hidden_states)
 
@@ -316,6 +323,15 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
 
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
+        # Resolve the breakdown py-stamps row in __init__ (non-compiled
+        # path) so the compiled forward never touches the lock-protected
+        # lazy allocator inside `get_py_stamps_row`.
+        self._bd_on = breakdown_runtime.is_enabled()
+        if self._bd_on:
+            breakdown_runtime.init()
+            self._bd_row = breakdown_runtime.get_py_stamps_row(layer_idx)
+        else:
+            self._bd_row = None
 
         # MoE
         moe_num_experts = getattr(config, "moe_num_experts", 0)
@@ -354,11 +370,8 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
 
         # Breakdown profile: attn_start (covers input_layernorm + QKV
         # + attn + O proj + residual via the fused norm).
-        _bd_on = breakdown_runtime.is_enabled()
-        if _bd_on:
-            _bd_row = breakdown_runtime.get_py_stamps_row(
-                self.layer_idx)
-            torch.ops._C_explat.record_stamp(_bd_row, 0)
+        if self._bd_on:
+            torch.ops._C_explat.record_stamp(self._bd_row, 0)
 
         # Self Attention
         if residual is None:
@@ -375,8 +388,8 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
 
         # Breakdown profile: attn_end stamp (just before the MLP /
         # MoE region begins).
-        if _bd_on:
-            torch.ops._C_explat.record_stamp(_bd_row, 1)
+        if self._bd_on:
+            torch.ops._C_explat.record_stamp(self._bd_row, 1)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
