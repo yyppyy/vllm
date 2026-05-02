@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Per-(rank, layer, batch) MoE latency breakdown — mean across the
-selected M (per-replay batch) range, grouped by replication ratio.
+selected M (per-replay batch) range, grouped by replication ratio with
+EP and METRO bars side by side.
 
 Input: `server_breakdown.log` files emitted by `bench_breakdown.sh`.
 Each line has the form
@@ -8,13 +9,19 @@ Each line has the form
     Breakdown seq=N rank=R layer=L M=M attention_ns=X gating_ns=Y
               routing_ns=Z dispatch_ns=A expert_ns=B combine_ns=C
 
-For each (model, dataset) pair, every record with `M` in `--m-range`
-(default 24..32 inclusive) — across **all** batch-size configs — is
-bucketed by the run's NUM_REPLICAS (the 4th positional arg of
-`bench_breakdown.sh`, i.e. `num_redundant_experts`). One horizontal
-stacked bar is drawn per replication ratio, mirroring
-`plots/latency_breakdown.pdf` but driven straight off the breakdown log
-and using the project-standard `style.py` helpers.
+For each (model, dataset) pair the script writes one figure that
+mirrors `plots/latency_breakdown.pdf`:
+
+  * y-axis = replication ratio (1.0 + NUM_REPLICAS / num_experts);
+  * for every replication ratio, **EP** and **METRO** stacked bars
+    are drawn side by side (hatch distinguishes them, color marks
+    category);
+  * EP vs METRO is decided by the run's `MEM_BOUND_ROUTING_THRES`
+    (10th positional arg / `_threshold` in the dirname): `>0` -> METRO,
+    `0` -> EP. Same convention as `plot_throughput_latency.py`.
+
+Records from every batch-size config that share the same
+(num_replicas, system) are merged together.
 """
 import argparse
 import gzip
@@ -26,8 +33,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from style import (apply_style, paper_figure, palette, save_fig,
-                   style_axes)
+from style import (HATCHES, STANDARD_PANEL_HEIGHT, STANDARD_PANEL_WIDTH,
+                   apply_style, palette, save_fig, style_axes)
 
 apply_style()
 
@@ -40,12 +47,22 @@ DATASET_NAMES = {
     2: "ShareGPT",
 }
 
+# Models with no `-{topk}-{num_experts}` suffix in the model name need
+# a hardcoded num_experts so we can compute replication *ratio*.
+KNOWN_NUM_EXPERTS = {
+    "Qwen3-30B-A3B": 128,
+    "ERNIE-4.5-21B-A3B-PT": 64,
+}
+
 CATEGORIES = [
     "attention", "gating", "routing", "dispatch", "expert", "combine",
 ]
 LEGEND_LABELS = [
     "Attention", "Gating", "Routing", "Dispatch", "Expert", "Combine",
 ]
+
+# System order maps to HATCHES[idx]: '' for EP, '///' for METRO.
+SYSTEMS = ["EP", "METRO"]
 
 BREAKDOWN_RE = re.compile(
     r"Breakdown seq=(?P<seq>-?\d+) rank=(?P<rank>-?\d+) "
@@ -57,14 +74,8 @@ BREAKDOWN_RE = re.compile(
 
 
 def parse_dirname(dirname: str) -> dict | None:
-    """Same `RUN_HASH` schema as `bench_breakdown.sh` /
-    `bench_tok_cnt.sh`. Returns `None` for unrelated directories.
-
-    Group layout:
-      1=NUM_GPUS, 2=EP_DEGREE, 3=USE_EP, 4=NUM_REPLICAS,
-      5=BATCH_SIZE, 6=MEM_BOUND_ROUTING, 7=DATASET (int id),
-      8=USE_PROFILER, 9=MEM_BOUND_ROUTING_THRES, 10=MODEL_NAME,
-      11=EPLB_NUM_GROUPS (optional)."""
+    """Same `RUN_HASH` schema as `bench_breakdown.sh`. Group layout
+    matches `plot_throughput_latency.py.parse_dirname`."""
     for backend in ("allgather_reducescatter", "dispatch_combine"):
         m = re.match(
             r"^(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_"
@@ -74,12 +85,40 @@ def parse_dirname(dirname: str) -> dict | None:
         )
         if m:
             return {
-                "model": m.group(10),
-                "dataset": int(m.group(7)),
-                "batch": int(m.group(5)),
+                "use_ep":       int(m.group(3)),
                 "num_replicas": int(m.group(4)),
+                "batch":        int(m.group(5)),
+                "routing":      int(m.group(6)),
+                "backend":      backend,
+                "dataset":      int(m.group(7)),
+                "threshold":    int(m.group(9)),
+                "model":        m.group(10),
             }
     return None
+
+
+def model_num_experts(model_name: str) -> int | None:
+    """Extract num_experts from `...-{topk}-{num_experts}`; otherwise
+    fall back to `KNOWN_NUM_EXPERTS`."""
+    m = re.search(r"-(\d+)-(\d+)$", model_name or "")
+    if m:
+        return int(m.group(2))
+    return KNOWN_NUM_EXPERTS.get(model_name)
+
+
+def system_label(cfg: dict) -> str:
+    """Match `plot_throughput_latency.py`: `threshold > 0` is METRO,
+    everything else is EP."""
+    return "METRO" if cfg["threshold"] > 0 else "EP"
+
+
+def replication_ratio(num_replicas: int, num_experts: int | None
+                       ) -> float | None:
+    """`(num_experts + num_replicas) / num_experts`. Returns `None`
+    when `num_experts` is unknown."""
+    if num_experts is None or num_experts <= 0:
+        return None
+    return (num_experts + num_replicas) / num_experts
 
 
 def _read_text(path: Path) -> str:
@@ -108,93 +147,132 @@ def parse_breakdown_log(path: Path):
         }
 
 
-def aggregate_means(records_by_repl, m_lo, m_hi):
-    """Bucket records by NUM_REPLICAS and average each category in us.
-
-    `records_by_repl` is `{num_replicas: [record, ...]}`. Records whose
-    `M` falls outside `[m_lo, m_hi]` are dropped. Returns
-    `({num_replicas: {category: mean_us}}, {num_replicas: count})`."""
-    means: dict[int, dict[str, float]] = {}
-    counts: dict[int, int] = {}
-    for nr, recs in records_by_repl.items():
-        sums = {c: 0.0 for c in CATEGORIES}
-        n = 0
-        for r in recs:
-            if not (m_lo <= r["M"] <= m_hi):
-                continue
-            n += 1
-            for c in CATEGORIES:
-                sums[c] += r[c]
-        if n > 0:
-            means[nr] = {c: sums[c] / n / 1e3 for c in CATEGORIES}
-            counts[nr] = n
-    return means, counts
+def aggregate_means(records, m_lo: int, m_hi: int):
+    """Merge every record in [m_lo, m_hi] into a single per-category
+    mean (us)."""
+    sums = {c: 0.0 for c in CATEGORIES}
+    n = 0
+    for r in records:
+        if not (m_lo <= r["M"] <= m_hi):
+            continue
+        n += 1
+        for c in CATEGORIES:
+            sums[c] += r[c]
+    if n == 0:
+        return None, 0
+    return {c: sums[c] / n / 1e3 for c in CATEGORIES}, n
 
 
-def plot_breakdown(means, model, dataset, out_dir,
-                   tag: str | None = None):
-    """One horizontal stacked bar per replication ratio; one segment
-    per category. `tag` overrides the filename suffix when set (used by
-    the single-log code path)."""
-    repls = sorted(means.keys())
-    if not repls:
+def _ratio_label(ratio: float) -> str:
+    """`1.5x`-style label, integer-clean when the ratio is whole."""
+    if abs(ratio - round(ratio)) < 1e-6:
+        return f"{int(round(ratio))}.0x"
+    s = f"{ratio:.2f}".rstrip("0").rstrip(".")
+    return f"{s}x"
+
+
+def plot_breakdown(per_bucket, model, dataset, out_dir):
+    """One figure per (model, dataset). Bars are placed at integer
+    y positions per replication ratio; within each ratio EP and METRO
+    sit side by side, colored by category and hatched by system.
+
+    `per_bucket` is `{(ratio, system): {category: mean_us}}`."""
+    ratios = sorted({r for (r, _) in per_bucket.keys()})
+    if not ratios:
         return None
 
-    fig, ax = paper_figure()
-    fig.subplots_adjust(left=0.20, right=0.98, bottom=0.20, top=0.85)
+    # 2x the standard panel width, height unchanged. Use plt.subplots
+    # directly rather than `paper_figure(n_axes=2)` because we want one
+    # wide axis, not two side-by-side panels.
+    fig, ax = plt.subplots(
+        figsize=(2 * STANDARD_PANEL_WIDTH, STANDARD_PANEL_HEIGHT))
+    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.20, top=0.85)
 
     colors = palette(len(CATEGORIES), name="tableau10")
     color_map = {c: colors[i] for i, c in enumerate(CATEGORIES)}
 
-    y = np.arange(len(repls), dtype=float)
-    bar_height = 0.6
+    y = np.arange(len(ratios), dtype=float)
+    bar_height = 0.36 if len(SYSTEMS) == 2 else 0.6
 
-    # Annotation rule: only label segments that occupy at least 6% of
-    # the widest bar so the slim ones (gating / routing) don't get a
-    # number jammed inside.
-    bar_totals = [sum(means[r].values()) for r in repls]
-    max_total = max(bar_totals) if bar_totals else 1.0
+    bar_totals: dict[tuple[float, str], float] = {}
+    for ratio in ratios:
+        for sysname in SYSTEMS:
+            vals = per_bucket.get((ratio, sysname), {})
+            bar_totals[(ratio, sysname)] = sum(vals.values())
+    max_total = max(bar_totals.values()) if bar_totals else 1.0
     label_min = max_total * 0.06
 
-    left = np.zeros(len(repls), dtype=float)
-    for c, lg in zip(CATEGORIES, LEGEND_LABELS):
-        vals = np.array([means[r][c] for r in repls], dtype=float)
-        ax.barh(y, vals, bar_height, left=left,
-                color=color_map[c], edgecolor="black", linewidth=0.6,
-                label=lg)
-        for k, v in enumerate(vals):
-            if v < label_min:
-                continue
-            ax.text(left[k] + v / 2.0, y[k], f"{v:.0f}",
-                    va="center", ha="center",
-                    fontsize=plt.rcParams["legend.fontsize"] - 1,
-                    color="white", fontweight="bold")
-        left += vals
+    for j, sysname in enumerate(SYSTEMS):
+        # Stagger systems vertically around each y-tick: EP above,
+        # METRO below (j=0 -> -0.5, j=1 -> +0.5 of bar_height).
+        y_offset = (j - (len(SYSTEMS) - 1) / 2.0) * bar_height
+        y_pos = y + y_offset
 
-    # Total at the right end of each bar.
-    for k, total in enumerate(bar_totals):
-        ax.text(total + max_total * 0.01, y[k],
-                f"{total:.0f}",
-                va="center", ha="left",
-                fontsize=plt.rcParams["legend.fontsize"] - 1,
-                fontweight="bold")
+        present_mask = np.array(
+            [(ratio, sysname) in per_bucket for ratio in ratios])
+        left = np.zeros(len(ratios), dtype=float)
+        for c, lg in zip(CATEGORIES, LEGEND_LABELS):
+            vals = np.array(
+                [per_bucket.get((ratio, sysname), {}).get(c, 0.0)
+                 for ratio in ratios],
+                dtype=float)
+            ax.barh(
+                y_pos, vals, bar_height, left=left,
+                color=color_map[c], edgecolor="black", linewidth=0.6,
+                hatch=HATCHES[j % len(HATCHES)],
+                label=lg if j == 0 else None,
+            )
+            for k, v in enumerate(vals):
+                if v < label_min or not present_mask[k]:
+                    continue
+                ax.text(left[k] + v / 2.0, y_pos[k], f"{v:.0f}",
+                        va="center", ha="center",
+                        fontsize=plt.rcParams["legend.fontsize"] - 1,
+                        color="white", fontweight="bold")
+            left += vals
+
+        # Total at right end.
+        for k, ratio in enumerate(ratios):
+            if not present_mask[k]:
+                continue
+            total = bar_totals[(ratio, sysname)]
+            ax.text(total + max_total * 0.005, y_pos[k],
+                    f"{total:.0f}",
+                    va="center", ha="left",
+                    fontsize=plt.rcParams["legend.fontsize"] - 1,
+                    fontweight="bold")
 
     ax.set_yticks(y)
-    ax.set_yticklabels([str(r) for r in repls])
+    ax.set_yticklabels([_ratio_label(r) for r in ratios])
     style_axes(ax,
                x_label="Mean per-layer latency (us)",
                y_label="Replication Ratio",
                x_lim=(0.0, max_total * 1.18))
 
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.20),
-              ncol=3, frameon=False)
+    # Two legends: categories (color) above-left, systems (hatch)
+    # above-right; mirrors `plot_latency_breakdown.py`.
+    cat_handles, cat_labels = ax.get_legend_handles_labels()
+    sys_handles = [
+        plt.Rectangle((0, 0), 1, 1,
+                       facecolor="white", edgecolor="black",
+                       hatch=HATCHES[i % len(HATCHES)], linewidth=1)
+        for i in range(len(SYSTEMS))
+    ]
+    leg1 = ax.legend(cat_handles, cat_labels,
+                     ncols=len(CATEGORIES),
+                     loc="upper center",
+                     bbox_to_anchor=(0.4, 1.18),
+                     frameon=False)
+    ax.add_artist(leg1)
+    ax.legend(sys_handles, SYSTEMS,
+              ncols=len(SYSTEMS),
+              loc="upper center",
+              bbox_to_anchor=(0.92, 1.18),
+              frameon=False)
 
-    if tag is not None:
-        out = out_dir / f"latency_breakdown_M_{tag}.pdf"
-    else:
-        ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
-        safe_model = model.replace("/", "_")
-        out = out_dir / f"latency_breakdown_M_{safe_model}_{ds_name}.pdf"
+    ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
+    safe_model = model.replace("/", "_")
+    out = out_dir / f"latency_breakdown_M_{safe_model}_{ds_name}.pdf"
     save_fig(fig, out)
     plt.close(fig)
     return out
@@ -211,13 +289,9 @@ def main() -> int:
     p.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     p.add_argument("--m-range", type=str, default="24-32",
                    help="Inclusive M range, e.g. '24-32' (default).")
-    p.add_argument("--log", type=Path, default=None,
-                   help="Optional: a single breakdown log file. NUM_"
-                        "REPLICAS is parsed from the parent dir name "
-                        "if present, else falls back to 0.")
     p.add_argument("--min-records", type=int, default=10,
-                   help="Drop replication buckets with fewer than this "
-                        "many records (default: 10).")
+                   help="Drop (replication, system) buckets with "
+                        "fewer than this many records (default: 10).")
     args = p.parse_args()
 
     try:
@@ -231,36 +305,15 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.log is not None:
-        cfg = parse_dirname(args.log.parent.name) or {}
-        nr = cfg.get("num_replicas", 0)
-        records = list(parse_breakdown_log(args.log))
-        if not records:
-            print(f"No Breakdown records in {args.log}",
-                  file=sys.stderr)
-            return 1
-        means, counts = aggregate_means({nr: records}, m_lo, m_hi)
-        means = {r: v for r, v in means.items()
-                 if counts[r] >= args.min_records}
-        if not means:
-            print(f"No records in M=[{m_lo}, {m_hi}] with "
-                  f">= {args.min_records} samples in {args.log}",
-                  file=sys.stderr)
-            return 1
-        stem = args.log.name.replace(".log.gz", "").replace(".log", "")
-        out = plot_breakdown(means, model="", dataset=-1,
-                             out_dir=args.output_dir, tag=stem)
-        if out is not None:
-            print(f"wrote {out}  (replications={sorted(means.keys())}, "
-                  f"records={[counts[r] for r in sorted(means)]})")
-        return 0
-
-    # Two-level grouping:
+    # Three-level grouping:
     #   key1 = (model, dataset) -> figure
-    #   key2 = num_replicas -> bar
-    grouped: dict[tuple[str, int], dict[int, list[dict]]] = defaultdict(
-        lambda: defaultdict(list))
+    #   key2 = (replication_ratio, system)  -> bar
+    #   value = list of records (any batch-size config)
+    grouped: dict[tuple[str, int],
+                  dict[tuple[float, str], list[dict]]] = defaultdict(
+                      lambda: defaultdict(list))
     seen = 0
+    skipped_unknown_model: set[str] = set()
     for d in sorted(args.results_dir.iterdir()):
         if not d.is_dir():
             continue
@@ -272,35 +325,50 @@ def main() -> int:
             log = d / "server_breakdown.log.gz"
             if not log.exists():
                 continue
+        ne = model_num_experts(cfg["model"])
+        if ne is None:
+            skipped_unknown_model.add(cfg["model"])
+            continue
+        ratio = replication_ratio(cfg["num_replicas"], ne)
+        sysname = system_label(cfg)
         seen += 1
         key = (cfg["model"], cfg["dataset"])
-        nr = cfg["num_replicas"]
         for rec in parse_breakdown_log(log):
-            grouped[key][nr].append(rec)
+            grouped[key][(ratio, sysname)].append(rec)
     if not grouped:
         print(f"No Breakdown records under {args.results_dir}",
               file=sys.stderr)
+        if skipped_unknown_model:
+            print(f"  (skipped models with unknown num_experts: "
+                  f"{sorted(skipped_unknown_model)}; add to "
+                  f"KNOWN_NUM_EXPERTS or include the topk/experts "
+                  f"suffix in the model name)", file=sys.stderr)
         return 1
     print(f"Parsed {seen} log files into {len(grouped)} "
           f"(model, dataset) groups; M range [{m_lo}, {m_hi}]; "
           f"all batch sizes merged")
 
-    for (model, dataset), per_repl in sorted(grouped.items()):
-        means, counts = aggregate_means(per_repl, m_lo, m_hi)
-        means = {r: v for r, v in means.items()
-                 if counts[r] >= args.min_records}
-        if not means:
+    for (model, dataset), buckets in sorted(grouped.items()):
+        per_bucket = {}
+        bucket_counts = {}
+        for k, recs in buckets.items():
+            means, n = aggregate_means(recs, m_lo, m_hi)
+            if means is not None and n >= args.min_records:
+                per_bucket[k] = means
+                bucket_counts[k] = n
+        if not per_bucket:
             print(f"  {model} / "
                   f"{DATASET_NAMES.get(dataset, dataset)}: "
-                  f"no replication bucket with >= {args.min_records} "
-                  f"records in M=[{m_lo}, {m_hi}]")
+                  f"no bucket with >= {args.min_records} records "
+                  f"in M=[{m_lo}, {m_hi}]")
             continue
-        out = plot_breakdown(means, model, dataset, args.output_dir)
+        out = plot_breakdown(per_bucket, model, dataset,
+                              args.output_dir)
         ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
-        repls = sorted(means.keys())
-        n_each = [counts[r] for r in repls]
-        print(f"  {model} / {ds_name}: "
-              f"replications={repls}, records={n_each} -> {out}")
+        summary = ", ".join(
+            f"{_ratio_label(r)} {s}={bucket_counts[(r, s)]}"
+            for (r, s) in sorted(per_bucket.keys()))
+        print(f"  {model} / {ds_name}: [{summary}] -> {out}")
     return 0
 
 
