@@ -47,6 +47,14 @@ DATASET_NAMES = {
     2: "ShareGPT",
 }
 
+# Per-(model, dataset_id) x-axis upper bound override in microseconds.
+# Falls back to the `--x-max` CLI default (700) when the key isn't
+# listed; set in absolute terms here so the matched figure renders
+# the same x range every time.
+X_MAX_OVERRIDES: dict[tuple[str, int], float] = {
+    ("Qwen3-30B-A3B-8-128", 0): 550.0,  # InstructCoder
+}
+
 # Models with no `-{topk}-{num_experts}` suffix in the model name need
 # a hardcoded num_experts so we can compute replication *ratio*.
 KNOWN_NUM_EXPERTS = {
@@ -395,7 +403,9 @@ def main() -> int:
                   f"no bucket with >= {args.min_records} records "
                   f"in M=[{m_lo}, {m_hi}]")
             continue
-        x_max = args.x_max if args.x_max > 0 else None
+        x_max = X_MAX_OVERRIDES.get(
+            (model, dataset),
+            args.x_max if args.x_max > 0 else None)
         out = plot_breakdown(per_bucket, model, dataset,
                               args.output_dir, x_max=x_max)
         ds_name = DATASET_NAMES.get(dataset, f"dataset{dataset}")
