@@ -120,6 +120,190 @@ Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
 - [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
 - [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
 
+## Benchmarking & Profiling Pipelines (research fork)
+
+This fork ships four bench scripts at the repo root and a matching set of
+plotting scripts under `plots/`. Each bench script launches a
+`vllm serve` engine, drives a load against it, drops one or more
+result files into `results/vllm_results_final/<RUN_HASH>/`, and shuts
+the engine down cleanly. The plotting scripts then sweep that
+directory and emit PDFs into `plots/`. The four scripts share a
+single 13-positional-arg signature so the same invocation can be
+re-run under a different profiler simply by swapping the script name.
+
+### One-time setup
+
+```bash
+./setup.sh                       # build C++/CUDA extensions, create venv
+./download_models.sh             # populates ./models/<MODEL_NAME>/
+./download_datasets.sh           # populates ./datasets/
+```
+
+### Common positional arguments
+
+All four bench scripts accept the same 13 positional args (the 10th —
+`USE_PROFILER` — is honored only by `bench_serve.sh`; the other three
+ignore it for signature parity):
+
+| # | Name | Meaning |
+| - | ---- | ------- |
+| 1 | `NUM_GPUS` | total GPU count visible to the engine |
+| 2 | `EP_DEGREE` | data-parallel size (= EP world size when `USE_EP=1`) |
+| 3 | `USE_EP` | 1 = expert parallel via dispatch_combine; 0 = TP via allgather |
+| 4 | `NUM_REPLICAS` | EPLB `num_redundant_experts` |
+| 5 | `BATCH_SIZE` | per-GPU `--max-num-seqs`; total prompts = `BATCH_SIZE × NUM_GPUS` |
+| 6 | `MEM_BOUND_ROUTING` | 0=off, 1/2/3=routing-mode variants (sets `VLLM_PREFILL_ROUTING_MODE`) |
+| 7 | `ALLTOALL_BACKEND` | `dispatch_combine` or `allgather_reducescatter` |
+| 8 | `DATASET` | numeric id baked into the run hash (0=InstructCoder, 1=Edit_5k_char, 2=ShareGPT) |
+| 9 | `DATASET_NAME` | actual dataset selector — `random`, `sharegpt`, or an HF dataset path |
+| 10 | `USE_PROFILER` | nsys gate — only `bench_serve.sh` uses it; others ignore |
+| 11 | `MEM_BOUND_ROUTING_THRES` | METRO discriminator: `>0` = vllm-METRO, `0` = vllm-EP |
+| 12 | `MODEL_NAME` | dir name under `./models/` |
+| 13 | `EPLB_NUM_GROUPS` | EPLB grouping factor (default 1) |
+
+The `RUN_HASH` is `${1}_${2}_${3}_${4}_${5}_${6}_${7}_${8}_${10}_${11}_${12}_g${13}`.
+
+### `bench_serve.sh` → throughput-vs-latency
+
+The main throughput / TTFT / TPOT bench. Multi-client closed-loop
+sweep (≥128 prompts total) with `bench_result_<idx>.json` per client.
+Optionally wraps `vllm serve` in `nsys profile` when `USE_PROFILER>0`.
+
+```bash
+# Qwen3 30B / 8 GPUs / EP / 64 redundant experts / batch 32 / METRO routing
+./bench_serve.sh 8 8 1 64 32 2 dispatch_combine 0 likaixin/InstructCoder \
+                 0 256 Qwen3-30B-A3B-8-128 1
+```
+
+Outputs:
+
+- `results/vllm_results_final/<RUN_HASH>/bench_result_*.json`
+- `results/vllm_results_final/<RUN_HASH>/server.log` (engine stdout)
+- `results/vllm_results_final/<RUN_HASH>/profile.nsys-rep` (only if `USE_PROFILER=1`)
+
+Plot:
+
+```bash
+python3 plots/plot_throughput_latency.py
+# -> plots/throughput_vs_p99{tpot,ttft}_<model>_<dataset>.pdf
+```
+
+`plot_throughput_latency.py` discriminates four series per `(model, dataset)`
+figure: TP, vllm-EP 1.0x, vllm-EP 1.5x, vllm-METRO 1.5x — derived from
+the `(USE_EP, NUM_REPLICAS, ALLTOALL_BACKEND, MEM_BOUND_ROUTING_THRES)`
+tuple parsed out of `RUN_HASH`.
+
+### `bench_exp_vs_latency.sh` → per-kernel ExpLat profile
+
+Same engine config as `bench_serve.sh` but with
+`VLLM_EXP_LATENCY_PROFILE=1` and a sentinel-file gate so the warmup +
+graph-capture passes produce no records. The in-process poller dumps
+the pinned ringbuffer to disk 35 s after the bench finishes.
+
+```bash
+./bench_exp_vs_latency.sh 8 8 1 64 32 2 dispatch_combine 0 \
+                          likaixin/InstructCoder 0 256 \
+                          Qwen3-30B-A3B-8-128 1
+```
+
+Outputs:
+
+- `results/vllm_results_final/<RUN_HASH>/server_explat.log` — one
+  `ExpLat seq=… rank=… layer=… M=… num_local_experts=… align_ns=…
+  gemm_gu_ns=… silu_ns=… quant_ns=… gemm_dn_ns=…
+  per_expert_tokens=[…]` line per (rank, layer, batch) replay.
+- `results/vllm_results_final/<RUN_HASH>/server_main.log`
+
+Plot:
+
+```bash
+python3 plots/plot_activated_vs_latency.py
+# -> plots/activated_vs_latency_exp_xlt_box_<model>_<dataset>.pdf
+# -> plots/activated_vs_latency_exp_xnact_box_<model>_<dataset>.pdf
+```
+
+`plot_activated_vs_latency.py` scatters number-of-activated-experts
+against MoE-kernel latency, one figure per `(model, dataset)`.
+
+### `bench_tok_cnt.sh` → per-expert token-count profile
+
+Reuses the ExpLat infrastructure but flips `VLLM_ZIPFIAN_ROUTING=0`
+and uses a Poisson-arrival client (Little's law steady state). Output
+log has the same format as `server_explat.log` — the parser focuses
+on the `per_expert_tokens` field for the memory-bound CDF.
+
+```bash
+./bench_tok_cnt.sh 8 8 1 64 32 2 dispatch_combine 0 \
+                   likaixin/InstructCoder 0 256 \
+                   Qwen3-30B-A3B-8-128 1
+```
+
+Outputs:
+
+- `results/vllm_results_final/<RUN_HASH>/server_tokcnt.log` (or
+  `.log.gz` for runs that exceed GitHub's 100 MB push limit — the
+  plotting script reads either)
+
+Plot:
+
+```bash
+python3 plots/plot_membound_cdf.py --gpu A100_40GB
+# -> plots/membound_cdf_<model>_<dataset>.pdf
+```
+
+For each `(model, dataset)` the script computes a per-record
+"fraction of local experts that are memory-bound" using a roofline
+threshold derived from the model's HF config and the `--gpu` preset,
+then draws one CDF line per bench batch-size config. Pass
+`--block-m 0 --block-n 0` to disable the SRAM-tile cap and use the
+GPU compute ridge alone.
+
+### `bench_breakdown.sh` → 6-category latency breakdown
+
+Captureable %globaltimer reads inside `dispatch_and_route_kernel` /
+`combine_and_scatter_kernel` plus python-side `record_stamp` ops at
+the attention / MoE boundaries. The single closed-loop client matches
+`bench_serve.sh` (no Poisson, no looping). Disables the
+torch.compile cache (`VLLM_DISABLE_COMPILE_CACHE=1`) since the
+breakdown profiler lifts extra tensor attrs into the FX graph and a
+stale cache from a non-breakdown run would crash inductor.
+
+```bash
+./bench_breakdown.sh 8 8 1 64 32 2 dispatch_combine 0 \
+                     likaixin/InstructCoder 0 256 \
+                     Qwen3-30B-A3B-8-128 1
+```
+
+Outputs:
+
+- `results/vllm_results_final/<RUN_HASH>/server_breakdown.log` —
+  one `Breakdown seq=… rank=… layer=… M=…
+  attention_ns=… gating_ns=… routing_ns=… dispatch_ns=…
+  expert_ns=… combine_ns=…` line per (rank, layer, batch).
+- `results/vllm_results_final/<RUN_HASH>/server_main.log`
+
+Plot:
+
+```bash
+python3 plots/plot_latency_breakdown_M.py            # default --x-max 700, --m-range 24-32
+# -> plots/latency_breakdown_M_<model>_<dataset>.pdf
+```
+
+`plot_latency_breakdown_M.py` averages each of the six categories
+across every record whose per-replay `M` falls in `--m-range`
+(default `24-32`), buckets by replication ratio
+`(num_experts + NUM_REPLICAS) / num_experts`, and draws horizontal
+stacked bars with vllm-EP and vllm-METRO side by side. Per-figure
+x-axis caps are kept in `X_MAX_OVERRIDES` at the top of the script.
+
+### Sweep helpers
+
+`bench_serve_8GPU.sh` and `log_bench_serve.sh` are loop wrappers that
+invoke `bench_serve.sh` over a parameter sweep (replication ratio,
+batch size, dataset). `style.py` under `plots/` defines the unified
+publication-style palette, font, and 3.2 × 2.4 in panel size that all
+plotting scripts inherit via `apply_style()` + `paper_figure()`.
+
 ## Contributing
 
 We welcome and value any contributions and collaborations.
