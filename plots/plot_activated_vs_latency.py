@@ -294,7 +294,7 @@ def make_plot(model, dataset, records, metric, xaxis, color_by,
         # Box:gap ratio of 6:4 — boxes occupy 0.6 of each unit slot,
         # leaving 0.4 between adjacent boxes.
         plot_box(ax, data, positions=positions, widths=0.6,
-                 manage_ticks=False)
+                 manage_ticks=False, whis=(0, 100))
         ax.set_xticks(positions)
         ax.set_xticklabels([str(k) for k in keys])
         ax.set_xlim(0.5, len(keys) + 0.5)
