@@ -61,15 +61,15 @@ def build_configs(replicas_15x):
             "color": cold[0],
             "marker": "o",
         },
-        # vllm-EP 1.0x: use_ep=1, 0 rep, dispatch_combine
+        # vllm-EPLB 1.0x: use_ep=1, 0 rep, dispatch_combine
         (1, 0, "dispatch_combine", 0): {
-            "label": "vllm-EP 1.0x",
+            "label": "vllm-EPLB 1.0x",
             "color": cold[1],
             "marker": "s",
         },
-        # vllm-EP 1.5x: use_ep=1, replicas_15x rep, threshold=0
+        # vllm-EPLB 1.5x: use_ep=1, replicas_15x rep, threshold=0
         (1, replicas_15x, "dispatch_combine", 0): {
-            "label": "vllm-EP 1.5x",
+            "label": "vllm-EPLB 1.5x",
             "color": cold[2],
             "marker": "^",
         },
