@@ -228,6 +228,14 @@ constexpr int kCasStart        = 19 + 0;   // cas:read_counters
 // never written by combine_and_scatter_kernel — reading it yields
 // zero, which used to make combine_ns always 0.
 constexpr int kCasEnd          = 19 + 16;  // cas:end
+// Per-step dar timestamps. dispatch_ns lumps together the NVLink
+// writes, the cross-rank p2p barrier and Algorithm 1; only the
+// per-slot deltas can separate them. Written at slot[kDarDeltaBase..]
+// when the ring buffer is wide enough (slot_stride_int64 >= 27), so
+// an older Python side that still passes 9 keeps working.
+constexpr int kDarSteps        = 19;       // dar:read_counters .. dar:end
+constexpr int kDarDeltaCount   = kDarSteps - 1;   // 18 adjacent deltas
+constexpr int kDarDeltaBase    = 9;
 }
 
 __global__ void log_breakdown_kernel(
@@ -289,6 +297,15 @@ __global__ void log_breakdown_kernel(
   slot[6] = dispatch_ns;
   slot[7] = expert_ns;
   slot[8] = combine_ns;
+
+  // Optional per-step dar deltas (see kDarDeltaBase). Guarded so a
+  // stride-9 caller never writes past its slot.
+  if (slot_stride_int64 >= kDarDeltaBase + kDarDeltaCount) {
+    for (int i = 0; i < kDarDeltaCount; i++) {
+      slot[kDarDeltaBase + i] =
+          pos_diff(dc_stamps[i + 1], dc_stamps[i]);
+    }
+  }
 
   __threadfence_system();
 }

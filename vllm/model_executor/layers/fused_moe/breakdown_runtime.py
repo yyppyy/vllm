@@ -46,7 +46,12 @@ logger = init_logger(__name__)
 #   int64 combine_ns                     [8]
 # ---------------------------------------------------------------------
 
-SLOT_STRIDE_INT64 = 9
+# 9 base fields + 18 adjacent dar-step deltas (see kDarDeltaBase in
+# csrc/explat_logger.cu). The extra fields separate the p2p barrier
+# from the NVLink writes and Algorithm 1 inside dispatch_ns.
+DAR_DELTA_BASE = 9
+DAR_DELTA_COUNT = 18
+SLOT_STRIDE_INT64 = DAR_DELTA_BASE + DAR_DELTA_COUNT
 PY_STAMPS_LEN = 5  # attn_start, attn_end, gate_start, gate_end, dispatch_end
 
 # Pre-allocated rows so the attention block, MoE block, and
@@ -207,12 +212,17 @@ def _format_slot(buf_row: torch.Tensor) -> Optional[str]:
     dispatch_ns = int(buf_row[6].item())
     expert_ns = int(buf_row[7].item())
     combine_ns = int(buf_row[8].item())
-    return (
+    line = (
         f"Breakdown seq={seq} rank={rank} layer={layer} M={M} "
         f"attention_ns={attention_ns} gating_ns={gating_ns} "
         f"routing_ns={routing_ns} dispatch_ns={dispatch_ns} "
         f"expert_ns={expert_ns} combine_ns={combine_ns}"
     )
+    if buf_row.numel() >= DAR_DELTA_BASE + DAR_DELTA_COUNT:
+        deltas = [int(buf_row[DAR_DELTA_BASE + i].item())
+                  for i in range(DAR_DELTA_COUNT)]
+        line += " dar=[" + ",".join(str(d) for d in deltas) + "]"
+    return line
 
 
 def _drain_and_write(last_seen: int) -> int:
