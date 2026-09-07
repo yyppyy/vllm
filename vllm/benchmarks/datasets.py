@@ -946,8 +946,20 @@ class ShareGPTDataset(BenchmarkDataset):
             entry for entry in self.data
             if "conversations" in entry and len(entry["conversations"]) >= 2
         ]
-        random.seed(self.random_seed)
-        random.shuffle(self.data)
+        if os.environ.get("VLLM_SHAREGPT_LONGEST", "0") == "1":
+            # Prefill-heavy variant. The Blazedit sets used for that role
+            # (edit_5k_char / edit_10k_char) have only 96 / 90 rows, so every
+            # batch size oversamples them; repeated prompts then hit the
+            # prefix cache and skip prefill entirely, which makes TTFT
+            # measure cache hit rate. ShareGPT has ~94k rows with a very wide
+            # length distribution, so taking the longest N gives real long
+            # prompts and never needs oversampling. Deterministic like the
+            # shuffle it replaces.
+            self.data.sort(
+                key=lambda e: -len(e["conversations"][0]["value"]))
+        else:
+            random.seed(self.random_seed)
+            random.shuffle(self.data)
 
     def sample(
         self,
