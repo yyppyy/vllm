@@ -458,8 +458,14 @@ void dispatch_and_route(
     // and signals flag. No shared memory arrays.
     phase_c_bytes = 0;
   } else if (routing_mode == 0) {
+    // +2*NL*mr for s_l2p_rank / s_l2p_slot: Pass 2's greedy loop is
+    // single-threaded and used to recompute phys/epr per iteration.
+    // sm_80 has no integer divide, so each one expands to a
+    // MUFU.RCP + I2F/F2I + IMAD.WIDE correction sequence. Hoisting it
+    // into the parallel preload turns ~2*nm serial divides into
+    // NL*mr divides spread across the block.
     phase_c_bytes = static_cast<size_t>(
-        (3 * NL + NL * mr + ws + NL + 1)
+        (3 * NL + 3 * NL * mr + ws + NL + 1)
         * sizeof(int32_t));
   } else {
     phase_c_bytes = static_cast<size_t>(

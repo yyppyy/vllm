@@ -2319,11 +2319,15 @@ __global__ void dispatch_and_route_kernel(
     int32_t* s_multi_experts = nullptr;   // [NL]
     int32_t* s_num_multi = nullptr;       // [1]
 
+    int32_t* s_l2p_rank = nullptr;        // [NL*mr] mode 0 only
+    int32_t* s_l2p_slot = nullptr;        // [NL*mr] mode 0 only
     if (routing_mode == 0) {
       routing_sel = base_ptr;             // [NL]
       rank_active = routing_sel + NL;     // [ws]
       s_multi_experts = rank_active + ws; // [NL]
       s_num_multi = s_multi_experts + NL; // [1]
+      s_l2p_rank = s_num_multi + 1;       // [NL*mr]
+      s_l2p_slot = s_l2p_rank + NL * max_rep;
     } else {
       section_routing = base_ptr;                 // [ws*NL]
       s_section_counts = section_routing + ws*NL; // [ws*NL]
@@ -2358,6 +2362,16 @@ __global__ void dispatch_and_route_kernel(
     }
     // Mode-specific init.
     if (routing_mode == 0) {
+      // Precompute rank/slot for every replica so Pass 2's serial
+      // greedy never divides. Same values, computed in parallel.
+      for (int32_t i = threadIdx.x;
+           i < NL * max_rep;
+           i += blockDim.x) {
+        const int32_t phys = s_l2p_map[i];
+        const int32_t r = phys / epr;
+        s_l2p_rank[i] = r;
+        s_l2p_slot[i] = phys - r * epr;
+      }
       for (int32_t e = threadIdx.x; e < NL;
            e += blockDim.x) {
         routing_sel[e] = -1;
@@ -2456,11 +2470,11 @@ __global__ void dispatch_and_route_kernel(
           int32_t best_cost = INT_MAX;
           int32_t best_slot = INT_MAX;
           for (int32_t i = 0; i < rc; i++) {
-            const int32_t phys =
-                s_l2p_map[e * max_rep + i];
-            const int32_t r = phys / epr;
+            const int32_t li = e * max_rep + i;
+            const int32_t phys = s_l2p_map[li];
+            const int32_t r = s_l2p_rank[li];
             const int32_t c = rank_active[r];
-            const int32_t slot = phys - r * epr;
+            const int32_t slot = s_l2p_slot[li];
             const bool better =
                 (c < best_cost)
                 || (c == best_cost && slot < best_slot)
