@@ -218,3 +218,15 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 # Ignore ep_kernels_workspace folder
 ep_kernels_workspace/
+
+# Locally materialised by download_models.sh / download_datasets.sh and the
+# bench scripts. models/ is ~98 GB, datasets/ ~642 MB, results/ ~11 GB.
+# results/vllm_results_final/ stays tracked: it is the archived data the
+# paper's figures were computed from.
+/models/
+/datasets/
+/results/*
+!/results/vllm_results_final/
+
+# Local Chinese-language notes, not for the repository.
+METRO_CHANGES_zh.md
