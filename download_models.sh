@@ -10,7 +10,10 @@ download_model() {
         echo "Model already exists at $local_dir, skipping download."
     else
         echo "Downloading $model_name to $local_dir ..."
-        huggingface-cli download "$model_name" --local-dir "$local_dir"
+        # Della's resolver hands out unreachable CloudFront edges for
+        # huggingface.co; tools/net/hf_get.py re-resolves via 8.8.8.8.
+        (cd tools/net && python3 hf_get.py "$model_name" \
+            "$(cd "$OLDPWD" && pwd)/$local_dir")
     fi
 }
 

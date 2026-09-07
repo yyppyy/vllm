@@ -11,7 +11,7 @@ if [ -f "$SHAREGPT_FILE" ]; then
 else
     echo "Downloading ShareGPT dataset..."
     pip install -q huggingface_hub
-    huggingface-cli download anon8231489123/ShareGPT_Vicuna_unfiltered \
+    hf download anon8231489123/ShareGPT_Vicuna_unfiltered \
         --repo-type dataset \
         --include "ShareGPT_V3_unfiltered_cleaned_split.json" \
         --local-dir "$DATASET_DIR"
