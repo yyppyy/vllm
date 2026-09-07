@@ -230,3 +230,6 @@ ep_kernels_workspace/
 
 # Local Chinese-language notes, not for the repository.
 METRO_CHANGES_zh.md
+
+# Slurm job stdout/stderr. Run artifacts, regenerated on every submission.
+slurm/logs/

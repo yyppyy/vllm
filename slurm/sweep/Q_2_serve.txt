@@ -1,0 +1,6 @@
+bench_serve.sh 8 8 1 0 32 2 dispatch_combine 2 sharegpt 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 32 2 dispatch_combine 2 sharegpt 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 32 2 dispatch_combine 2 sharegpt 0 256 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 0 64 2 dispatch_combine 2 sharegpt 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 64 2 dispatch_combine 2 sharegpt 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 64 2 dispatch_combine 2 sharegpt 0 256 Qwen3-30B-A3B-8-128 1

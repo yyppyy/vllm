@@ -1,0 +1,8 @@
+bench_breakdown.sh 8 8 1 8 32 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_breakdown.sh 8 8 1 8 32 2 dispatch_combine 0 likaixin/InstructCoder 0 256 ERNIE-4.5-21B-A3B-PT 1
+bench_breakdown.sh 8 8 1 16 32 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_breakdown.sh 8 8 1 16 32 2 dispatch_combine 0 likaixin/InstructCoder 0 256 ERNIE-4.5-21B-A3B-PT 1
+bench_breakdown.sh 8 8 1 24 32 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_breakdown.sh 8 8 1 24 32 2 dispatch_combine 0 likaixin/InstructCoder 0 256 ERNIE-4.5-21B-A3B-PT 1
+bench_breakdown.sh 8 8 1 32 32 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_breakdown.sh 8 8 1 32 32 2 dispatch_combine 0 likaixin/InstructCoder 0 256 ERNIE-4.5-21B-A3B-PT 1

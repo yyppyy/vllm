@@ -1,0 +1,15 @@
+bench_serve.sh 8 8 1 0 4 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 4 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 4 2 dispatch_combine 1 vdaita/edit_5k_char 0 256 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 0 8 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 8 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 8 2 dispatch_combine 1 vdaita/edit_5k_char 0 256 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 0 16 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 16 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 16 2 dispatch_combine 1 vdaita/edit_5k_char 0 256 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 0 32 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 32 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 32 2 dispatch_combine 1 vdaita/edit_5k_char 0 256 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 0 64 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 64 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_serve.sh 8 8 1 64 64 2 dispatch_combine 1 vdaita/edit_5k_char 0 256 Qwen3-30B-A3B-8-128 1

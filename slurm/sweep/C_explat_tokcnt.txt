@@ -1,0 +1,16 @@
+bench_exp_vs_latency.sh 8 8 1 32 32 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_exp_vs_latency.sh 8 8 1 32 32 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_exp_vs_latency.sh 8 8 1 64 32 2 dispatch_combine 0 likaixin/InstructCoder 0 0 Qwen3-30B-A3B-8-128 1
+bench_exp_vs_latency.sh 8 8 1 64 32 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_tok_cnt.sh 8 8 1 32 16 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_tok_cnt.sh 8 8 1 32 16 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_tok_cnt.sh 8 8 1 32 4 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_tok_cnt.sh 8 8 1 32 4 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_tok_cnt.sh 8 8 1 32 64 2 dispatch_combine 0 likaixin/InstructCoder 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_tok_cnt.sh 8 8 1 32 64 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 ERNIE-4.5-21B-A3B-PT 1
+bench_tok_cnt.sh 8 8 1 64 16 2 dispatch_combine 0 likaixin/InstructCoder 0 0 Qwen3-30B-A3B-8-128 1
+bench_tok_cnt.sh 8 8 1 64 16 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_tok_cnt.sh 8 8 1 64 4 2 dispatch_combine 0 likaixin/InstructCoder 0 0 Qwen3-30B-A3B-8-128 1
+bench_tok_cnt.sh 8 8 1 64 4 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
+bench_tok_cnt.sh 8 8 1 64 64 2 dispatch_combine 0 likaixin/InstructCoder 0 0 Qwen3-30B-A3B-8-128 1
+bench_tok_cnt.sh 8 8 1 64 64 2 dispatch_combine 1 vdaita/edit_5k_char 0 0 Qwen3-30B-A3B-8-128 1
